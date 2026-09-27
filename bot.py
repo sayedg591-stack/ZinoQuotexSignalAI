@@ -4,8 +4,7 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -64,10 +63,13 @@ gemini = genai.Client(
 
 
 # =========================================================
-# ALGERIA TIMEZONE
+# SIGNAL TIMEZONE
+# UTC-3
 # =========================================================
 
-ALGERIA_TZ = ZoneInfo("Africa/Algiers")
+SIGNAL_TZ = timezone(
+    timedelta(hours=-3)
+)
 
 
 # =========================================================
@@ -79,11 +81,14 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         if self.path == "/health":
+
             self.send_response(200)
+
             self.send_header(
                 "Content-Type",
                 "text/plain; charset=utf-8"
             )
+
             self.end_headers()
 
             self.wfile.write(
@@ -93,10 +98,12 @@ class HealthHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8"
         )
+
         self.end_headers()
 
         self.wfile.write(
@@ -156,8 +163,9 @@ async def start(
     await update.message.reply_text(
         "🎓 ZinoProSignalAI\n\n"
         "📸 أرسل Screenshot للشارت.\n\n"
-        "⚡ سيتم تحليل الشارت "
-        "وإعطاؤك الإشارة."
+        "⚡ سيتم تحليل الشارت وإعطاؤك "
+        "الاتجاه + وقت الدخول + سعر الدخول "
+        "+ مستوى الإلغاء."
     )
 
 
@@ -166,33 +174,57 @@ async def start(
 # =========================================================
 
 ANALYSIS_PROMPT = """
-أنت محرك التحليل الفني الرئيسي لبوت
-ZinoProSignalAI.
+أنت محرك تحليل فني متقدم لبوت ZinoProSignalAI.
 
-حلل Screenshot الخاصة بشارت Quotex.
+مهمتك تحليل Screenshot حقيقية لشارت Quotex
+وإنتاج اتجاه واحد فقط:
 
-لا تعتمد على التخمين فقط.
-اقرأ الصورة بصرياً وركز على آخر حركة سعرية
-والشموع الأخيرة والبنية السعرية.
+UP
+أو
+DOWN
 
-استخرج قدر الإمكان:
+لا تعتمد على مؤشر واحد.
 
-- اسم الزوج
-- الفريم
-- السعر الحالي
-- اتجاه السوق
-- الشموع الأخيرة
-- القمم والقيعان
-- الاختراقات
-- السيولة
-- الزخم
-- المؤشرات الظاهرة
+الأولوية للتحليل بهذا الترتيب:
 
-========================================
-SIGNAL SCORE
-========================================
+1. Market Structure
+2. Candle Close / Open
+3. Highs / Lows
+4. Breakout
+5. Liquidity Sweep
+6. Momentum
+7. Candle Confirmation
+8. RSI
+9. Oscillators
+10. Moving Averages
 
-نظام النقاط الكلي = 18 نقطة.
+==================================================
+قاعدة مهمة جداً
+==================================================
+
+لا تجعل UP افتراضياً.
+
+لا تجعل DOWN افتراضياً.
+
+احسب الأدلة لصالح UP والأدلة لصالح DOWN
+بشكل منفصل.
+
+بعد ذلك اختر الاتجاه الذي لديه الأدلة الأقوى.
+
+إذا كان هناك تعادل، استخدم:
+
+Market Structure
+ثم Candle Close
+ثم Breakout
+ثم Momentum
+
+لتحديد الاتجاه.
+
+==================================================
+SCORING
+==================================================
+
+المجموع الأقصى = 18 نقطة.
 
 Structure       = 2
 Breakout        = 2
@@ -201,197 +233,282 @@ Momentum        = 2
 Candle          = 2
 RSI             = 1
 Summary         = 2
-Oscillators     = 2
-Moving Averages = 2
+Oscillators     = 3
+Moving Averages = 3
 
-المجموع = 18/18.
+TOTAL = 18
 
-========================================
-IMPORTANT
-========================================
+لكل عامل:
 
-احسب UP و DOWN بشكل منفصل.
+UP يحصل على نقاط إذا كانت الأدلة تدعم UP.
 
-لا تجعل UP هو الاتجاه الافتراضي.
+DOWN يحصل على نقاط إذا كانت الأدلة تدعم DOWN.
 
-لا تجعل DOWN هو الاتجاه الافتراضي.
+لا تعطِ نقاطاً لمجرد التخمين.
 
-إذا كانت الأدلة هابطة:
-اجعل DOWN يحصل على النقاط المناسبة.
+إذا كان المؤشر غير ظاهر في الصورة:
+اجعل نقاطه 0.
 
-إذا كانت الأدلة صاعدة:
-اجعل UP يحصل على النقاط المناسبة.
+==================================================
+MARKET STRUCTURE
+==================================================
 
-إذا كان عامل معين غير ظاهر في الصورة،
-لا تخترع قراءة دقيقة له.
-استخدم فقط ما يمكن استنتاجه من الصورة.
-
-========================================
-STRUCTURE
-========================================
-
-راقب:
+افحص:
 
 Higher High
 Higher Low
 Lower High
 Lower Low
 
-وكذلك:
+و:
 
 Break of Structure
 Change of Character
-Support break
-Resistance break
 
-========================================
+إذا كان السعر يصنع Lower High + Lower Low
+فهذه أدلة لصالح DOWN.
+
+إذا كان السعر يصنع Higher High + Higher Low
+فهذه أدلة لصالح UP.
+
+==================================================
+CANDLE CLOSE
+==================================================
+
+ركز بشكل خاص على:
+
+آخر شمعة مغلقة.
+
+لا تعتمد فقط على لون شمعة لم تغلق.
+
+افحص:
+
+Open
+Close
+Body
+Upper Wick
+Lower Wick
+Strong Close
+Weak Close
+
+إغلاق قوي فوق مستوى مهم:
+دليل UP.
+
+إغلاق قوي تحت مستوى مهم:
+دليل DOWN.
+
+==================================================
 BREAKOUT
-========================================
+==================================================
 
 ميز بين:
 
 True Breakout
 Fake Breakout
-Breakout + Confirmation
+Breakout Confirmation
 
-========================================
+الكسر الحقيقي يحتاج إغلاقاً واضحاً
+وليس مجرد Wick.
+
+إذا حدث Breakout ثم رجوع سريع داخل المستوى:
+قد يكون Fake Breakout.
+
+==================================================
 LIQUIDITY
-========================================
+==================================================
 
-راقب:
+افحص:
 
-Liquidity sweep
-High sweep
-Low sweep
-Rejection after sweep
+High Sweep
+Low Sweep
+Liquidity Sweep
+Rejection
 
-========================================
+مثال:
+
+السعر يأخذ قاعاً سابقاً ثم يغلق فوقه
+مع رفض واضح:
+قد يكون دليلاً لصالح UP.
+
+السعر يأخذ قمة سابقة ثم يغلق تحتها
+مع رفض واضح:
+قد يكون دليلاً لصالح DOWN.
+
+==================================================
 MOMENTUM
-========================================
+==================================================
 
-استخدم الزخم الظاهر في الشارت
-وADX إذا كان موجوداً.
+افحص قوة الحركة:
 
-========================================
-CANDLE
-========================================
+Strong bullish candles
+Strong bearish candles
+Consecutive candles
+Body size
+Wicks
 
-راقب:
+وADX إذا كان ظاهراً.
+
+==================================================
+CANDLE PATTERNS
+==================================================
+
+افحص:
 
 Bullish Engulfing
 Bearish Engulfing
 Hammer
+Shooting Star
 Pin Bar
-Strong close
-Weak close
-Long wick
-Candle continuation
+Strong Close
+Weak Close
+Continuation
 
-========================================
+لا تعتبر Pattern صحيحاً إذا لم يكن واضحاً
+في الصورة.
+
+==================================================
 RSI
-========================================
+==================================================
 
-إذا كان RSI ظاهر:
+إذا كان RSI ظاهراً:
 
-Overbought
-Oversold
 Above 50
 Below 50
-Divergence إذا كان واضحاً
+Overbought
+Oversold
+Divergence
 
-========================================
-SUMMARY
-========================================
+لا تخترع قيمة RSI إذا لم تكن واضحة.
 
-Summary يجب أن يمثل الصورة العامة
-للتحليل وليس مؤشراً جديداً.
-
-========================================
+==================================================
 OSCILLATORS
-========================================
+==================================================
 
-حلل المؤشرات المتذبذبة الظاهرة،
-مثل RSI أو MACD أو Stochastic.
+حلل فقط المؤشرات المتذبذبة الظاهرة.
 
-لا تخترع مؤشرات غير موجودة.
+مثل:
 
-========================================
+RSI
+MACD
+Stochastic
+
+إذا لم يظهر المؤشر:
+لا تخترع قراءة.
+
+==================================================
 MOVING AVERAGES
-========================================
+==================================================
 
 إذا كانت Moving Averages ظاهرة:
-حلل:
 
 السعر فوق/تحت المتوسطات
 اتجاه المتوسطات
-تقاطع المتوسطات
-ترتيب المتوسطات
+Cross
+Alignment
 
-لا تخترع قيمة رقمية غير ظاهرة.
+لا تخترع أرقام المتوسطات.
 
-========================================
-ENTRY
-========================================
+==================================================
+ENTRY DELAY
+==================================================
 
-حدد Entry Delay:
+اختر فقط:
 
-0 دقيقة
-أو
-1 دقيقة
-أو
-2 دقيقة
+0
+1
+2
 
-اختَر حسب وضع السوق.
+إذا كانت الحركة جاهزة:
+0
 
-إذا كان هناك انتظار لتأكيد شمعة،
-يمكن اختيار 1 أو 2 دقيقة.
+إذا كان يحتاج تأكيد:
+1
 
-========================================
+إذا كان يحتاج تأكيد أقوى:
+2
+
+لا تستخدم أكثر من دقيقتين.
+
+==================================================
 ENTRY PRICE
-========================================
+==================================================
 
-حدد سعر الدخول من السعر الظاهر
-أو من منطقة الدخول المنطقية الظاهرة.
+حدد سعر الدخول من السعر الظاهر في الصورة
+أو من أقرب سعر منطقي للدخول.
 
-========================================
+لا تضف أرقاماً عشوائية.
+
+==================================================
 CANCELLATION
-========================================
+==================================================
 
-للـ UP:
+إذا كان الاتجاه UP:
 
-الإلغاء يكون إذا أغلقت شمعة
-تحت مستوى الإلغاء.
+cancellation_price يجب أن يكون مستوى
+أسفل منطقة الدخول/البنية المهمة.
 
-للـ DOWN:
+الإلغاء:
+إذا أغلقت شمعة تحت هذا المستوى.
 
-الإلغاء يكون إذا أغلقت شمعة
-فوق مستوى الإلغاء.
+إذا كان الاتجاه DOWN:
 
-يجب أن يكون المستوى منطقياً بالنسبة
-للبنية السعرية الأخيرة.
+cancellation_price يجب أن يكون مستوى
+فوق منطقة الدخول/البنية المهمة.
 
-========================================
+الإلغاء:
+إذا أغلقت شمعة فوق هذا المستوى.
+
+==================================================
 CONFIDENCE
-========================================
+==================================================
 
-Confidence تعبر عن قوة توافق العوامل
-الموجودة في الصورة.
+Confidence ليست ضماناً للفوز.
 
-لا تضع 90% أو 95% لمجرد إعطاء رقم كبير.
+اجعلها تعكس قوة توافق الأدلة.
 
-========================================
+قوة منخفضة:
+50-60
+
+قوة متوسطة:
+61-72
+
+قوة جيدة:
+73-82
+
+قوة قوية:
+83-90
+
+لا تضع 90+ إلا إذا كانت الأدلة
+متعددة وواضحة جداً.
+
+==================================================
+IMPORTANT
+==================================================
+
+لا تستخدم Support/Resistance كقسم مستقل
+في النتيجة النهائية.
+
+لا تضف مؤشرات غير موجودة.
+
+لا تخترع أسعاراً غير ظاهرة.
+
+لا تخترع اسم الزوج.
+
+لا تخترع الفريم.
+
+==================================================
 OUTPUT
-========================================
+==================================================
 
 أرجع JSON فقط.
 
-لا تضع Markdown.
+لا Markdown.
 
-لا تضع ```json.
+لا ```json.
 
-لا تضع أي نص قبل أو بعد JSON.
+لا نص قبل JSON.
 
-الشكل المطلوب:
+استخدم هذا الشكل:
 
 {
   "asset": "",
@@ -405,14 +522,24 @@ OUTPUT
   "entry_delay_minutes": 0,
 
   "entry_price": "",
-
   "cancellation_price": "",
 
   "up_score": 0,
-
   "down_score": 0,
 
-  "scores": {
+  "up_scores": {
+    "structure": 0,
+    "breakout": 0,
+    "liquidity": 0,
+    "momentum": 0,
+    "candle": 0,
+    "rsi": 0,
+    "summary": 0,
+    "oscillators": 0,
+    "moving_averages": 0
+  },
+
+  "down_scores": {
     "structure": 0,
     "breakout": 0,
     "liquidity": 0,
@@ -462,7 +589,86 @@ def clean_json(text):
 
 
 # =========================================================
-# GEMINI ANALYSIS
+# SAFE INTEGER
+# =========================================================
+
+def safe_int(value, default=0):
+
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+# =========================================================
+# CLAMP SCORE
+# =========================================================
+
+def clamp_score(value, maximum):
+
+    value = safe_int(value)
+
+    if value < 0:
+        return 0
+
+    if value > maximum:
+        return maximum
+
+    return value
+
+
+# =========================================================
+# SCORE LIMITS
+# =========================================================
+
+SCORE_LIMITS = {
+    "structure": 2,
+    "breakout": 2,
+    "liquidity": 1,
+    "momentum": 2,
+    "candle": 2,
+    "rsi": 1,
+    "summary": 2,
+    "oscillators": 3,
+    "moving_averages": 3,
+}
+
+
+# =========================================================
+# NORMALIZE SCORES
+# =========================================================
+
+def normalize_scores(raw_scores):
+
+    if not isinstance(raw_scores, dict):
+        raw_scores = {}
+
+    result = {}
+
+    for name, maximum in SCORE_LIMITS.items():
+
+        result[name] = clamp_score(
+            raw_scores.get(name, 0),
+            maximum
+        )
+
+    return result
+
+
+# =========================================================
+# TOTAL SCORE
+# =========================================================
+
+def calculate_total(scores):
+
+    return sum(
+        safe_int(scores.get(name, 0))
+        for name in SCORE_LIMITS
+    )
+
+
+# =========================================================
+# ANALYSIS
 # =========================================================
 
 async def analyze_chart(image_bytes):
@@ -477,7 +683,7 @@ async def analyze_chart(image_bytes):
             ANALYSIS_PROMPT
         ],
         config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.05,
             response_mime_type="application/json"
         )
     )
@@ -491,11 +697,145 @@ async def analyze_chart(image_bytes):
 
     text = clean_json(text)
 
-    return json.loads(text)
+    data = json.loads(text)
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Gemini response is not an object"
+        )
+
+    # =====================================================
+    # NORMALIZE UP / DOWN SCORES
+    # =====================================================
+
+    up_scores = normalize_scores(
+        data.get("up_scores", {})
+    )
+
+    down_scores = normalize_scores(
+        data.get("down_scores", {})
+    )
+
+    up_total = calculate_total(
+        up_scores
+    )
+
+    down_total = calculate_total(
+        down_scores
+    )
+
+    # =====================================================
+    # FORCE SCORE VALUES FROM COMPONENTS
+    # =====================================================
+
+    data["up_scores"] = up_scores
+    data["down_scores"] = down_scores
+
+    data["up_score"] = up_total
+    data["down_score"] = down_total
+
+    # =====================================================
+    # DIRECTION
+    # =====================================================
+
+    direction = str(
+        data.get("direction", "")
+    ).upper()
+
+    if direction not in ("UP", "DOWN"):
+
+        if up_total > down_total:
+            direction = "UP"
+
+        elif down_total > up_total:
+            direction = "DOWN"
+
+        else:
+            direction = "UP"
+
+    # =====================================================
+    # DO NOT ALLOW GEMINI TO IGNORE SCORE DIFFERENCE
+    # =====================================================
+
+    score_difference = abs(
+        up_total - down_total
+    )
+
+    if score_difference >= 3:
+
+        if up_total > down_total:
+            direction = "UP"
+        else:
+            direction = "DOWN"
+
+    elif score_difference >= 1:
+
+        if up_total > down_total:
+            direction = "UP"
+        else:
+            direction = "DOWN"
+
+    data["direction"] = direction
+
+    # =====================================================
+    # CONFIDENCE
+    # =====================================================
+
+    confidence = safe_int(
+        data.get("confidence", 50)
+    )
+
+    if confidence < 50:
+        confidence = 50
+
+    if confidence > 90:
+        confidence = 90
+
+    # Stronger score agreement increases confidence.
+    if score_difference >= 7:
+        confidence = max(
+            confidence,
+            82
+        )
+
+    elif score_difference >= 5:
+        confidence = max(
+            confidence,
+            76
+        )
+
+    elif score_difference >= 3:
+        confidence = max(
+            confidence,
+            68
+        )
+
+    data["confidence"] = confidence
+
+    # =====================================================
+    # ENTRY DELAY
+    # =====================================================
+
+    delay = safe_int(
+        data.get(
+            "entry_delay_minutes",
+            1
+        )
+    )
+
+    if delay < 0:
+        delay = 0
+
+    if delay > 2:
+        delay = 2
+
+    data["entry_delay_minutes"] = delay
+
+    return data
 
 
 # =========================================================
-# NUMBER FORMAT
+# PRICE FORMAT
 # =========================================================
 
 def clean_price(value):
@@ -503,9 +843,12 @@ def clean_price(value):
     if value is None:
         return "N/A"
 
-    value = str(value).strip()
+    text = str(value).strip()
 
-    return value
+    if not text:
+        return "N/A"
+
+    return text
 
 
 # =========================================================
@@ -537,63 +880,30 @@ def format_signal(data):
             "إذا أغلقت شمعة فوق"
         )
 
-    scores = data.get(
-        "scores",
-        {}
+    up_scores = normalize_scores(
+        data.get("up_scores", {})
     )
 
-    structure = int(
-        scores.get("structure", 0)
+    down_scores = normalize_scores(
+        data.get("down_scores", {})
     )
 
-    breakout = int(
-        scores.get("breakout", 0)
+    up_total = calculate_total(
+        up_scores
     )
 
-    liquidity = int(
-        scores.get("liquidity", 0)
+    down_total = calculate_total(
+        down_scores
     )
 
-    momentum = int(
-        scores.get("momentum", 0)
-    )
+    # =====================================================
+    # ENTRY TIME UTC-3
+    # =====================================================
 
-    candle = int(
-        scores.get("candle", 0)
-    )
-
-    rsi = int(
-        scores.get("rsi", 0)
-    )
-
-    summary = int(
-        scores.get("summary", 0)
-    )
-
-    oscillators = int(
-        scores.get("oscillators", 0)
-    )
-
-    moving_averages = int(
-        scores.get("moving_averages", 0)
-    )
-
-    total = (
-        structure
-        + breakout
-        + liquidity
-        + momentum
-        + candle
-        + rsi
-        + summary
-        + oscillators
-        + moving_averages
-    )
-
-    delay = int(
+    delay = safe_int(
         data.get(
             "entry_delay_minutes",
-            0
+            1
         )
     )
 
@@ -603,22 +913,8 @@ def format_signal(data):
     if delay > 2:
         delay = 2
 
-    # =====================================================
-    # ALGERIA ENTRY TIME
-    # =====================================================
-    #
-    # Example:
-    # Current time = 08:58:xx
-    #
-    # delay = 1 -> 08:59
-    # delay = 2 -> 09:00
-    #
-    # We first remove seconds, then add the delay.
-    # This guarantees that 1 minute means the next minute.
-    # =====================================================
-
     now = datetime.now(
-        ALGERIA_TZ
+        SIGNAL_TZ
     )
 
     current_minute = now.replace(
@@ -636,276 +932,25 @@ def format_signal(data):
     )
 
     if delay == 0:
-
         entry_label = "الآن"
 
     elif delay == 1:
-
         entry_label = "بعد 1 دقيقة"
 
     else:
-
         entry_label = "بعد 2 دقيقة"
+
+    # =====================================================
+    # ANALYSIS
+    # =====================================================
 
     analysis = data.get(
         "analysis",
         {}
     )
 
-    up_score = int(
-        data.get(
-            "up_score",
-            0
-        )
-    )
-
-    down_score = int(
-        data.get(
-            "down_score",
-            0
-        )
-    )
-
-    return (
-        "🎓 ZinoProSignalAI\n\n"
-
-        f"🎯 Confidence: "
-        f"{data.get('confidence', 0)}%\n"
-
-        f"📊 {data.get('asset', 'Unknown')}"
-        f" · ⏱ {data.get('timeframe', 'Unknown')}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"{icon} القرار: {direction}\n\n"
-
-        f"📊 UP Score: {up_score}/18\n"
-        f"📊 DOWN Score: {down_score}/18\n\n"
-
-        f"🕐 الدخول: {entry_label}\n"
-        f"⏰ وقت الدخول: {entry_time_text}\n\n"
-
-        f"💵 سعر الدخول: "
-        f"{clean_price(data.get('entry_price'))}\n"
-
-        f"🛑 إلغاء {cancel_text} "
-        f"{clean_price(data.get('cancellation_price'))}\n\n"
-
-        "📊 SIGNAL SCORE\n"
-
-        f"Structure          {structure}/2\n"
-        f"Breakout           {breakout}/2\n"
-        f"Liquidity          {liquidity}/1\n"
-        f"Momentum           {momentum}/2\n"
-        f"Candle             {candle}/2\n"
-        f"RSI                {rsi}/1\n"
-        f"Summary            {summary}/2\n"
-        f"Oscillators        {oscillators}/2\n"
-        f"Moving Averages    {moving_averages}/2\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"TOTAL              {total}/18\n\n"
-
-        "📌 ANALYSIS\n"
-
-        f"Structure: "
-        f"{analysis.get('structure', '')}\n"
-
-        f"Breakout: "
-        f"{analysis.get('breakout', '')}\n"
-
-        f"Liquidity: "
-        f"{analysis.get('liquidity', '')}\n"
-
-        f"Momentum: "
-        f"{analysis.get('momentum', '')}\n"
-
-        f"Candle: "
-        f"{analysis.get('candle', '')}\n"
-
-        f"RSI: "
-        f"{analysis.get('rsi', '')}\n"
-
-        f"Summary: "
-        f"{analysis.get('summary', '')}\n"
-
-        f"Oscillators: "
-        f"{analysis.get('oscillators', '')}\n"
-
-        f"Moving Averages: "
-        f"{analysis.get('moving_averages', '')}\n\n"
-
-        f"📝 السبب:\n"
-        f"{data.get('reason', '')}"
-    )
-
-
-# =========================================================
-# PHOTO HANDLER
-# =========================================================
-
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "⛔ هذا البوت خاص."
-        )
-
-        return
-
-    status = await update.message.reply_text(
-        "🔎 جاري تحليل الشارت..."
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        telegram_file = (
-            await context.bot.get_file(
-                photo.file_id
-            )
-        )
-
-        image_buffer = io.BytesIO()
-
-        await telegram_file.download_to_memory(
-            image_buffer
-        )
-
-        image_bytes = (
-            image_buffer.getvalue()
-        )
-
-        logger.info(
-            "Screenshot received: %s bytes",
-            len(image_bytes)
-        )
-
-        data = await analyze_chart(
-            image_bytes
-        )
-
-        signal = format_signal(
-            data
-        )
-
-        await status.edit_text(
-            signal
-        )
-
-        logger.info(
-            "Signal generated: %s",
-            data.get("direction")
-        )
-
-    except json.JSONDecodeError:
-
-        logger.exception(
-            "Invalid JSON from Gemini"
-        )
-
-        await status.edit_text(
-            "⚠️ Gemini أرسل نتيجة غير صالحة.\n"
-            "أعد إرسال Screenshot."
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Analysis error"
-        )
-
-        await status.edit_text(
-            "⚠️ حدث خطأ أثناء تحليل الشارت.\n\n"
-            f"{str(error)[:500]}"
-        )
-
-
-# =========================================================
-# ERROR HANDLER
-# =========================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    logger.error(
-        "Unhandled error: %s",
-        context.error,
-        exc_info=context.error
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    health_thread = threading.Thread(
-        target=start_health_server,
-        daemon=True
-    )
-
-    health_thread.start()
-
-    logger.info(
-        "ZinoProSignalAI starting..."
-    )
-
-    logger.info(
-        "Gemini model: %s",
-        GEMINI_MODEL
-    )
-
-    logger.info(
-        "Render port: %s",
-        PORT
-    )
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo_handler
-        )
-    )
-
-    app.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "Telegram application starting..."
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# =========================================================
-# RUN
-# =========================================================
-
-if __name__ == "__main__":
-    main()
+    if not isinstance(analysis, dict):
+        analysis = {}
+
+    confidence = safe_int(
+        data.get("
