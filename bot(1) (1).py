@@ -73,9 +73,7 @@ api_key=GEMINI_API_KEY
 
 # =========================================================
 
-SIGNAL_TZ = timezone(
-timedelta(hours=1)
-)
+SIGNAL_TZ = timezone(timedelta(hours=1))
 
 # =========================================================
 
@@ -87,7 +85,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 ```
 def do_GET(self):
-
     try:
         if self.path == "/health":
             body = b"ZinoProSignalAI is running"
@@ -116,52 +113,38 @@ def do_GET(self):
         self.wfile.write(body)
 
     except Exception:
-        logger.exception(
-            "Health request error"
-        )
+        logger.exception("Health request error")
 
 def log_message(self, format, *args):
     return
 ```
 
-def start_health_server():
+def create_health_server():
+"""
+Create and bind the server BEFORE Telegram starts.
+This is important for Render Web Service port detection.
+"""
 
 ```
+server = ThreadingHTTPServer(
+    ("0.0.0.0", PORT),
+    HealthHandler
+)
+
+logger.info("==================================================")
+logger.info("HEALTH SERVER STARTED")
+logger.info("Listening on 0.0.0.0:%s", PORT)
+logger.info("Health endpoint: /health")
+logger.info("==================================================")
+
+return server
+```
+
+def start_health_server(server):
 try:
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    logger.info(
-        "HEALTH SERVER STARTED"
-    )
-
-    logger.info(
-        "Listening on 0.0.0.0:%s",
-        PORT
-    )
-
-    logger.info(
-        "Health endpoint: /health"
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    server.serve_forever()
-
+server.serve_forever()
 except Exception:
-    logger.exception(
-        "FAILED TO START HEALTH SERVER"
-    )
-```
+logger.exception("Health server stopped")
 
 # =========================================================
 
@@ -170,11 +153,10 @@ except Exception:
 # =========================================================
 
 def is_owner(update: Update):
+if not update.effective_user:
+return False
 
 ```
-if not update.effective_user:
-    return False
-
 return update.effective_user.id == OWNER_ID
 ```
 
@@ -199,13 +181,14 @@ if not is_owner(update):
 
     return
 
-await update.message.reply_text(
-    "🎓 ZinoProSignalAI\n\n"
-    "📸 أرسل Screenshot للشارت.\n\n"
-    "⚡ سيتم تحليل الشارت مباشرة "
-    "وإعطاؤك الاتجاه ووقت الدخول "
-    "وسعر الدخول ومستوى الإلغاء."
-)
+if update.message:
+    await update.message.reply_text(
+        "🎓 ZinoProSignalAI\n\n"
+        "📸 أرسل Screenshot للشارت.\n\n"
+        "⚡ سيتم تحليل الشارت مباشرة "
+        "وإعطاؤك الاتجاه ووقت الدخول "
+        "وسعر الدخول ومستوى الإلغاء."
+    )
 ```
 
 # =========================================================
@@ -224,6 +207,9 @@ ANALYSIS_PROMPT = """
 UP
 أو
 DOWN
+
+لا تستخدم NO SIGNAL.
+لا تستخدم WAIT.
 
 لا تعتمد على مؤشر واحد.
 
@@ -278,6 +264,8 @@ Moving Averages = 3
 TOTAL = 18
 
 لكل عامل، احسب نقاط UP ونقاط DOWN بشكل مستقل.
+
+لا تعطِ النقاط القصوى إلا عندما تكون الأدلة واضحة.
 
 ==================================================
 STRUCTURE
@@ -392,6 +380,8 @@ RSI
 MACD
 Stochastic
 
+إذا لم تكن ظاهرة، لا تخترعها.
+
 ==================================================
 MOVING AVERAGES
 ===============
@@ -426,7 +416,7 @@ Breakout
 ENTRY
 =====
 
-اختر:
+اختر فقط:
 
 0 دقيقة
 أو
@@ -486,6 +476,22 @@ Confidence تعبر عن قوة توافق الأدلة.
 83-90 = قوي
 
 لا تتجاوز 90.
+
+==================================================
+IMPORTANT FINAL CHECK
+=====================
+
+قبل إخراج JSON:
+
+1. direction يجب أن يكون UP أو DOWN فقط.
+2. entry_delay_minutes يجب أن يكون 0 أو 1 أو 2.
+3. confidence بين 50 و90.
+4. up_scores مجموعها لا يتجاوز 18.
+5. down_scores مجموعها لا يتجاوز 18.
+6. لا تخترع RSI أو ADX أو Keltner أو Moving Average إذا لم تظهر.
+7. entry_price يجب أن يكون رقماً أو قيمة سعرية واضحة.
+8. cancellation_price يجب أن يكون منطقياً بالنسبة للاتجاه.
+9. أرجع JSON صالح فقط.
 
 ==================================================
 OUTPUT
@@ -718,5 +724,454 @@ up_scores = normalize_scores(
 )
 
 down_scores = normalize_scores(
-    data.get("down
+    data.get("down_scores", {})
+)
+
+data["up_scores"] = up_scores
+data["down_scores"] = down_scores
+
+up_total = total_score(up_scores)
+down_total = total_score(down_scores)
+
+# =====================================================
+# DIRECTION
+# =====================================================
+
+direction = str(
+    data.get("direction", "")
+).upper().strip()
+
+if direction not in ("UP", "DOWN"):
+
+    if up_total >= down_total:
+        direction = "UP"
+    else:
+        direction = "DOWN"
+
+data["direction"] = direction
+
+# =====================================================
+# CONFIDENCE
+# =====================================================
+
+confidence = safe_int(
+    data.get("confidence", 0)
+)
+
+if confidence < 50:
+    confidence = 50
+
+if confidence > 90:
+    confidence = 90
+
+data["confidence"] = confidence
+
+# =====================================================
+# ENTRY DELAY
+# =====================================================
+
+delay = safe_int(
+    data.get("entry_delay_minutes", 1),
+    1
+)
+
+if delay < 0:
+    delay = 0
+
+if delay > 2:
+    delay = 2
+
+data["entry_delay_minutes"] = delay
+
+# =====================================================
+# TEXT FIELDS
+# =====================================================
+
+data["asset"] = str(
+    data.get("asset", "Unknown")
+).strip()
+
+data["timeframe"] = str(
+    data.get("timeframe", "Unknown")
+).strip()
+
+data["current_price"] = str(
+    data.get("current_price", "")
+).strip()
+
+data["entry_price"] = str(
+    data.get("entry_price", "")
+).strip()
+
+data["cancellation_price"] = str(
+    data.get("cancellation_price", "")
+).strip()
+
+data["reason"] = str(
+    data.get("reason", "")
+).strip()
+
+analysis = data.get(
+    "analysis",
+    {}
+)
+
+if not isinstance(analysis, dict):
+    analysis = {}
+
+normalized_analysis = {}
+
+for key in [
+    "structure",
+    "breakout",
+    "liquidity",
+    "momentum",
+    "candle",
+    "rsi",
+    "summary",
+    "oscillators",
+    "moving_averages",
+]:
+
+    normalized_analysis[key] = str(
+        analysis.get(key, "")
+    ).strip()
+
+data["analysis"] = normalized_analysis
+
+# =====================================================
+# LOG
+# =====================================================
+
+logger.info(
+    "Analysis: %s | UP=%s/18 | DOWN=%s/18 | confidence=%s | delay=%s",
+    direction,
+    up_total,
+    down_total,
+    confidence,
+    delay
+)
+
+return data
 ```
+
+# =========================================================
+
+# ENTRY TIME
+
+# =========================================================
+
+def calculate_entry_time(received_at, delay_minutes):
+
+```
+"""
+Telegram receipt time is used as the reference.
+Entry is aligned to the next minute/candle.
+"""
+
+base = received_at.astimezone(
+    SIGNAL_TZ
+)
+
+next_minute = (
+    base.replace(
+        second=0,
+        microsecond=0
+    )
+    + timedelta(minutes=1)
+)
+
+if delay_minutes > 0:
+    next_minute += timedelta(
+        minutes=delay_minutes
+    )
+
+return next_minute
+```
+
+# =========================================================
+
+# FORMAT SIGNAL
+
+# =========================================================
+
+def format_signal(data, received_at):
+
+```
+direction = data["direction"]
+
+if direction == "UP":
+    direction_text = "🟢 UP"
+    cancel_text = (
+        f"🚫 إلغاء إذا أغلقت شمعة تحت "
+        f"{data['cancellation_price']}"
+    )
+else:
+    direction_text = "🔴 DOWN"
+    cancel_text = (
+        f"🚫 إلغاء إذا أغلقت شمعة فوق "
+        f"{data['cancellation_price']}"
+    )
+
+up_total = total_score(
+    data["up_scores"]
+)
+
+down_total = total_score(
+    data["down_scores"]
+)
+
+entry_time = calculate_entry_time(
+    received_at,
+    data["entry_delay_minutes"]
+)
+
+time_text = entry_time.strftime(
+    "%H:%M"
+)
+
+delay = data["entry_delay_minutes"]
+
+if delay == 0:
+    delay_text = "الشمعة القادمة"
+elif delay == 1:
+    delay_text = "بعد 1 دقيقة"
+else:
+    delay_text = f"بعد {delay} دقائق"
+
+analysis = data["analysis"]
+
+message = (
+    "🎓 ZinoProSignalAI\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    f"📊 الأصل: {data['asset']}\n"
+    f"⏱️ الفريم: {data['timeframe']}\n"
+    f"🎯 الاتجاه: {direction_text}\n"
+    f"🔥 الثقة: {data['confidence']}%\n"
+    "\n"
+    f"🟢 UP: {up_total}/18\n"
+    f"🔴 DOWN: {down_total}/18\n"
+    "\n"
+    f"⏳ الدخول: {delay_text}\n"
+    f"🕐 الوقت: {time_text} الجزائر\n"
+    f"💰 سعر الدخول: {data['entry_price']}\n"
+    f"{cancel_text}\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "📋 التحليل\n"
+    f"• Structure: {analysis['structure']}\n"
+    f"• Breakout: {analysis['breakout']}\n"
+    f"• Liquidity: {analysis['liquidity']}\n"
+    f"• Momentum: {analysis['momentum']}\n"
+    f"• Candle: {analysis['candle']}\n"
+    f"• RSI: {analysis['rsi']}\n"
+    f"• Summary: {analysis['summary']}\n"
+    f"• Oscillators: {analysis['oscillators']}\n"
+    f"• Moving Averages: {analysis['moving_averages']}\n"
+    "\n"
+    f"💡 السبب: {data['reason']}"
+)
+
+return message
+```
+
+# =========================================================
+
+# PHOTO HANDLER
+
+# =========================================================
+
+async def handle_photo(
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
+):
+
+```
+if not is_owner(update):
+
+    if update.message:
+        await update.message.reply_text(
+            "⛔ هذا البوت خاص."
+        )
+
+    return
+
+if not update.message:
+    return
+
+processing_message = await update.message.reply_text(
+    "🔎 جاري تحليل الشارت..."
+)
+
+# مهم:
+# نأخذ وقت الاستلام قبل انتظار Gemini
+# حتى لا يتأثر وقت الدخول بزمن التحليل.
+received_at = datetime.now(
+    SIGNAL_TZ
+)
+
+try:
+
+    photo = update.message.photo[-1]
+
+    file = await context.bot.get_file(
+        photo.file_id
+    )
+
+    image_buffer = io.BytesIO()
+
+    await file.download_to_memory(
+        image_buffer
+    )
+
+    image_bytes = image_buffer.getvalue()
+
+    if not image_bytes:
+        raise RuntimeError(
+            "Empty image"
+        )
+
+    logger.info(
+        "Screenshot received: %s bytes",
+        len(image_bytes)
+    )
+
+    data = await analyze_chart(
+        image_bytes
+    )
+
+    signal_message = format_signal(
+        data,
+        received_at
+    )
+
+    await processing_message.edit_text(
+        signal_message
+    )
+
+except Exception as error:
+
+    logger.exception(
+        "Screenshot analysis failed"
+    )
+
+    try:
+
+        await processing_message.edit_text(
+            "❌ حدث خطأ أثناء تحليل الشارت.\n\n"
+            f"التفاصيل: {str(error)[:500]}"
+        )
+
+    except Exception:
+        pass
+```
+
+# =========================================================
+
+# ERROR HANDLER
+
+# =========================================================
+
+async def error_handler(
+update: object,
+context: ContextTypes.DEFAULT_TYPE
+):
+
+```
+logger.error(
+    "Telegram error: %s",
+    context.error
+)
+```
+
+# =========================================================
+
+# MAIN
+
+# =========================================================
+
+def main():
+
+```
+logger.info("Starting ZinoProSignalAI...")
+logger.info("Render PORT=%s", PORT)
+logger.info("Gemini model=%s", GEMINI_MODEL)
+
+# -----------------------------------------------------
+# Create/bind HTTP server FIRST.
+# This makes Render detect the port immediately.
+# -----------------------------------------------------
+
+health_server = create_health_server()
+
+health_thread = threading.Thread(
+    target=start_health_server,
+    args=(health_server,),
+    daemon=True,
+    name="HealthServer"
+)
+
+health_thread.start()
+
+# -----------------------------------------------------
+# Telegram application
+# -----------------------------------------------------
+
+application = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .build()
+)
+
+application.add_handler(
+    CommandHandler(
+        "start",
+        start
+    )
+)
+
+application.add_handler(
+    MessageHandler(
+        filters.PHOTO,
+        handle_photo
+    )
+)
+
+application.add_error_handler(
+    error_handler
+)
+
+logger.info(
+    "Telegram application starting..."
+)
+
+try:
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+finally:
+
+    logger.info(
+        "Stopping health server..."
+    )
+
+    try:
+        health_server.shutdown()
+        health_server.server_close()
+    except Exception:
+        pass
+
+    logger.info(
+        "ZinoProSignalAI stopped."
+    )
+```
+
+# =========================================================
+
+# RUN
+
+# =========================================================
+
+if **name** == "**main**":
+main()
