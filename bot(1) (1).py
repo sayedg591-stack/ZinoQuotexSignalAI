@@ -7,19 +7,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+Application,
+CommandHandler,
+MessageHandler,
+ContextTypes,
+filters,
 )
 
 from google import genai
 from google.genai import types
 
-
 # =========================================================
+
 # SETTINGS
+
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,54 +31,68 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+raise RuntimeError("BOT_TOKEN is missing")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing")
+raise RuntimeError("GEMINI_API_KEY is missing")
 
 if not OWNER_ID:
-    raise RuntimeError("OWNER_ID is missing")
+raise RuntimeError("OWNER_ID is missing")
 
+try:
 OWNER_ID = int(OWNER_ID)
-
+except ValueError:
+raise RuntimeError("OWNER_ID must be an integer")
 
 # =========================================================
+
 # LOGGING
+
 # =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+format="%(asctime)s - %(levelname)s - %(message)s",
+level=logging.INFO,
 )
 
 logger = logging.getLogger("ZinoProSignalAI")
 
-
 # =========================================================
+
 # GEMINI
+
 # =========================================================
 
 gemini = genai.Client(
-    api_key=GEMINI_API_KEY
+api_key=GEMINI_API_KEY
 )
 
-
 # =========================================================
-# ALGERIA TIME (UTC+1)
+
+# ALGERIA TIME UTC+1
+
 # =========================================================
 
 SIGNAL_TZ = timezone(
-    timedelta(hours=1)
+timedelta(hours=1)
 )
 
-
 # =========================================================
-# HEALTH SERVER
+
+# HEALTH SERVER FOR RENDER
+
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
+```
+def do_GET(self):
+
+    try:
+        if self.path == "/health":
+            body = b"ZinoProSignalAI is running"
+        else:
+            body = b"ZinoProSignalAI"
 
         self.send_response(200)
 
@@ -86,22 +101,33 @@ class HealthHandler(BaseHTTPRequestHandler):
             "text/plain; charset=utf-8"
         )
 
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+
+        self.send_header(
+            "Connection",
+            "close"
+        )
+
         self.end_headers()
 
-        if self.path == "/health":
-            self.wfile.write(
-                b"ZinoProSignalAI is running"
-            )
-        else:
-            self.wfile.write(
-                b"ZinoProSignalAI"
-            )
+        self.wfile.write(body)
 
-    def log_message(self, format, *args):
-        return
+    except Exception:
+        logger.exception(
+            "Health request error"
+        )
 
+def log_message(self, format, *args):
+    return
+```
 
 def start_health_server():
+
+```
+try:
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", PORT),
@@ -109,53 +135,83 @@ def start_health_server():
     )
 
     logger.info(
-        "Health server running on port %s",
+        "=================================================="
+    )
+
+    logger.info(
+        "HEALTH SERVER STARTED"
+    )
+
+    logger.info(
+        "Listening on 0.0.0.0:%s",
         PORT
+    )
+
+    logger.info(
+        "Health endpoint: /health"
+    )
+
+    logger.info(
+        "=================================================="
     )
 
     server.serve_forever()
 
+except Exception:
+    logger.exception(
+        "FAILED TO START HEALTH SERVER"
+    )
+```
 
 # =========================================================
-# OWNER
+
+# OWNER CHECK
+
 # =========================================================
 
 def is_owner(update: Update):
 
-    if not update.effective_user:
-        return False
+```
+if not update.effective_user:
+    return False
 
-    return update.effective_user.id == OWNER_ID
-
+return update.effective_user.id == OWNER_ID
+```
 
 # =========================================================
-# START
+
+# START COMMAND
+
 # =========================================================
 
 async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+```
+if not is_owner(update):
 
+    if update.message:
         await update.message.reply_text(
             "⛔ هذا البوت خاص."
         )
 
-        return
+    return
 
-    await update.message.reply_text(
-        "🎓 ZinoProSignalAI\n\n"
-        "📸 أرسل Screenshot للشارت.\n\n"
-        "⚡ سيتم تحليل الشارت وإعطاؤك "
-        "الاتجاه ووقت الدخول وسعر الدخول "
-        "ومستوى الإلغاء."
-    )
-
+await update.message.reply_text(
+    "🎓 ZinoProSignalAI\n\n"
+    "📸 أرسل Screenshot للشارت.\n\n"
+    "⚡ سيتم تحليل الشارت مباشرة "
+    "وإعطاؤك الاتجاه ووقت الدخول "
+    "وسعر الدخول ومستوى الإلغاء."
+)
+```
 
 # =========================================================
+
 # ANALYSIS PROMPT
+
 # =========================================================
 
 ANALYSIS_PROMPT = """
@@ -186,7 +242,7 @@ DOWN
 
 ==================================================
 IMPORTANT
-==================================================
+=========
 
 لا تجعل UP افتراضياً.
 
@@ -205,7 +261,7 @@ IMPORTANT
 
 ==================================================
 SCORING
-==================================================
+=======
 
 المجموع الأقصى = 18 نقطة.
 
@@ -225,7 +281,7 @@ TOTAL = 18
 
 ==================================================
 STRUCTURE
-==================================================
+=========
 
 راقب:
 
@@ -244,7 +300,7 @@ Lower High + Lower Low
 
 ==================================================
 CANDLE
-==================================================
+======
 
 ركز على آخر شمعة مغلقة.
 
@@ -270,7 +326,7 @@ Continuation
 
 ==================================================
 BREAKOUT
-==================================================
+========
 
 ميز بين:
 
@@ -282,7 +338,7 @@ Breakout Confirmation
 
 ==================================================
 LIQUIDITY
-==================================================
+=========
 
 راقب:
 
@@ -299,7 +355,7 @@ Sweep لقمة ثم إغلاق تحتها
 
 ==================================================
 MOMENTUM
-==================================================
+========
 
 افحص:
 
@@ -312,7 +368,7 @@ Wicks
 
 ==================================================
 RSI
-==================================================
+===
 
 إذا كان RSI ظاهراً:
 
@@ -326,7 +382,7 @@ Divergence
 
 ==================================================
 OSCILLATORS
-==================================================
+===========
 
 حلل المؤشرات الظاهرة فقط.
 
@@ -338,7 +394,7 @@ Stochastic
 
 ==================================================
 MOVING AVERAGES
-==================================================
+===============
 
 إذا كانت ظاهرة:
 
@@ -351,7 +407,7 @@ Alignment
 
 ==================================================
 KELTNER / ADX
-==================================================
+=============
 
 إذا كان Keltner Channel ظاهراً:
 راقب:
@@ -368,7 +424,7 @@ Breakout
 
 ==================================================
 ENTRY
-==================================================
+=====
 
 اختر:
 
@@ -389,7 +445,7 @@ ENTRY
 
 ==================================================
 ENTRY PRICE
-==================================================
+===========
 
 استخدم السعر الظاهر في الصورة
 أو أقرب سعر منطقي للدخول.
@@ -398,7 +454,7 @@ ENTRY PRICE
 
 ==================================================
 CANCELLATION
-==================================================
+============
 
 UP:
 
@@ -416,7 +472,7 @@ cancellation_price يكون فوق الدخول
 
 ==================================================
 CONFIDENCE
-==================================================
+==========
 
 Confidence تعبر عن قوة توافق الأدلة.
 
@@ -433,7 +489,7 @@ Confidence تعبر عن قوة توافق الأدلة.
 
 ==================================================
 OUTPUT
-==================================================
+======
 
 أرجع JSON فقط.
 
@@ -446,660 +502,221 @@ OUTPUT
 الشكل:
 
 {
-  "asset": "",
-  "timeframe": "",
-  "current_price": "",
-  "direction": "UP",
-  "confidence": 0,
-  "entry_delay_minutes": 1,
-  "entry_price": "",
-  "cancellation_price": "",
+"asset": "",
+"timeframe": "",
+"current_price": "",
+"direction": "UP",
+"confidence": 0,
+"entry_delay_minutes": 1,
+"entry_price": "",
+"cancellation_price": "",
 
-  "up_scores": {
-    "structure": 0,
-    "breakout": 0,
-    "liquidity": 0,
-    "momentum": 0,
-    "candle": 0,
-    "rsi": 0,
-    "summary": 0,
-    "oscillators": 0,
-    "moving_averages": 0
-  },
+"up_scores": {
+"structure": 0,
+"breakout": 0,
+"liquidity": 0,
+"momentum": 0,
+"candle": 0,
+"rsi": 0,
+"summary": 0,
+"oscillators": 0,
+"moving_averages": 0
+},
 
-  "down_scores": {
-    "structure": 0,
-    "breakout": 0,
-    "liquidity": 0,
-    "momentum": 0,
-    "candle": 0,
-    "rsi": 0,
-    "summary": 0,
-    "oscillators": 0,
-    "moving_averages": 0
-  },
+"down_scores": {
+"structure": 0,
+"breakout": 0,
+"liquidity": 0,
+"momentum": 0,
+"candle": 0,
+"rsi": 0,
+"summary": 0,
+"oscillators": 0,
+"moving_averages": 0
+},
 
-  "analysis": {
-    "structure": "",
-    "breakout": "",
-    "liquidity": "",
-    "momentum": "",
-    "candle": "",
-    "rsi": "",
-    "summary": "",
-    "oscillators": "",
-    "moving_averages": ""
-  },
+"analysis": {
+"structure": "",
+"breakout": "",
+"liquidity": "",
+"momentum": "",
+"candle": "",
+"rsi": "",
+"summary": "",
+"oscillators": "",
+"moving_averages": ""
+},
 
-  "reason": ""
+"reason": ""
 }
 """
 
-
 # =========================================================
+
 # JSON CLEANER
+
 # =========================================================
 
 def clean_json(text):
 
-    text = text.strip()
+````
+if not text:
+    return ""
 
-    if text.startswith("```json"):
-        text = text[7:]
+text = text.strip()
 
-    elif text.startswith("```"):
-        text = text[3:]
+if text.startswith("```json"):
+    text = text[7:]
 
-    if text.endswith("```"):
-        text = text[:-3]
+elif text.startswith("```"):
+    text = text[3:]
 
-    return text.strip()
+if text.endswith("```"):
+    text = text[:-3]
 
+return text.strip()
+````
 
 # =========================================================
+
 # SAFE INTEGER
+
 # =========================================================
 
 def safe_int(value, default=0):
 
-    try:
-        return int(float(value))
-    except Exception:
-        return default
-
+```
+try:
+    return int(float(value))
+except Exception:
+    return default
+```
 
 # =========================================================
+
 # SCORE LIMITS
+
 # =========================================================
 
 SCORE_LIMITS = {
-    "structure": 2,
-    "breakout": 2,
-    "liquidity": 1,
-    "momentum": 2,
-    "candle": 2,
-    "rsi": 1,
-    "summary": 2,
-    "oscillators": 3,
-    "moving_averages": 3,
+"structure": 2,
+"breakout": 2,
+"liquidity": 1,
+"momentum": 2,
+"candle": 2,
+"rsi": 1,
+"summary": 2,
+"oscillators": 3,
+"moving_averages": 3,
 }
 
-
 # =========================================================
-# NORMALIZE SCORE
+
+# NORMALIZE SCORES
+
 # =========================================================
 
 def normalize_scores(scores):
 
-    if not isinstance(scores, dict):
-        scores = {}
+```
+if not isinstance(scores, dict):
+    scores = {}
 
-    result = {}
+result = {}
 
-    for name, maximum in SCORE_LIMITS.items():
+for name, maximum in SCORE_LIMITS.items():
 
-        value = safe_int(
-            scores.get(name, 0)
-        )
+    value = safe_int(
+        scores.get(name, 0)
+    )
 
-        if value < 0:
-            value = 0
+    if value < 0:
+        value = 0
 
-        if value > maximum:
-            value = maximum
+    if value > maximum:
+        value = maximum
 
-        result[name] = value
+    result[name] = value
 
-    return result
-
+return result
+```
 
 # =========================================================
-# TOTAL
+
+# TOTAL SCORE
+
 # =========================================================
 
 def total_score(scores):
 
-    return sum(
-        scores.get(name, 0)
-        for name in SCORE_LIMITS
-    )
-
+```
+return sum(
+    scores.get(name, 0)
+    for name in SCORE_LIMITS
+)
+```
 
 # =========================================================
+
 # GEMINI ANALYSIS
+
 # =========================================================
 
 async def analyze_chart(image_bytes):
 
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type="image/jpeg"
-            ),
-            ANALYSIS_PROMPT
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.05,
-            response_mime_type="application/json"
-        )
+```
+response = gemini.models.generate_content(
+    model=GEMINI_MODEL,
+    contents=[
+        types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg"
+        ),
+        ANALYSIS_PROMPT
+    ],
+    config=types.GenerateContentConfig(
+        temperature=0.05,
+        response_mime_type="application/json"
+    )
+)
+
+if not response.text:
+    raise RuntimeError(
+        "Gemini returned an empty response"
     )
 
-    if not response.text:
-        raise RuntimeError(
-            "Gemini returned an empty response"
-        )
+raw_text = clean_json(
+    response.text
+)
+
+try:
 
     data = json.loads(
-        clean_json(response.text)
+        raw_text
     )
 
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "Invalid Gemini response"
-        )
-
-    # =====================================================
-    # SCORES
-    # =====================================================
-
-    up_scores = normalize_scores(
-        data.get("up_scores", {})
-    )
-
-    down_scores = normalize_scores(
-        data.get("down_scores", {})
-    )
-
-    up_total = total_score(
-        up_scores
-    )
-
-    down_total = total_score(
-        down_scores
-    )
-
-    data["up_scores"] = up_scores
-    data["down_scores"] = down_scores
-
-    # =====================================================
-    # DIRECTION
-    # =====================================================
-
-    if up_total > down_total:
-        direction = "UP"
-
-    elif down_total > up_total:
-        direction = "DOWN"
-
-    else:
-
-        direction = str(
-            data.get("direction", "UP")
-        ).upper()
-
-        if direction not in ("UP", "DOWN"):
-            direction = "UP"
-
-    data["direction"] = direction
-
-    # =====================================================
-    # CONFIDENCE
-    # =====================================================
-
-    confidence = safe_int(
-        data.get("confidence", 50)
-    )
-
-    if confidence < 50:
-        confidence = 50
-
-    if confidence > 90:
-        confidence = 90
-
-    difference = abs(
-        up_total - down_total
-    )
-
-    if difference >= 7:
-        confidence = max(
-            confidence,
-            82
-        )
-
-    elif difference >= 5:
-        confidence = max(
-            confidence,
-            76
-        )
-
-    elif difference >= 3:
-        confidence = max(
-            confidence,
-            68
-        )
-
-    data["confidence"] = confidence
-
-    # =====================================================
-    # ENTRY DELAY
-    # =====================================================
-
-    delay = safe_int(
-        data.get(
-            "entry_delay_minutes",
-            1
-        )
-    )
-
-    if delay < 0:
-        delay = 0
-
-    if delay > 2:
-        delay = 2
-
-    data["entry_delay_minutes"] = delay
-
-    return data
-
-
-# =========================================================
-# PRICE
-# =========================================================
-
-def clean_price(value):
-
-    if value is None:
-        return "N/A"
-
-    value = str(value).strip()
-
-    if not value:
-        return "N/A"
-
-    return value
-
-
-# =========================================================
-# FORMAT SIGNAL
-# =========================================================
-
-def format_signal(data, received_at=None):
-
-    direction = str(
-        data.get("direction", "UP")
-    ).upper()
-
-    if direction not in ("UP", "DOWN"):
-        direction = "UP"
-
-    if direction == "UP":
-        icon = "🟢"
-        cancel_text = "إذا أغلقت شمعة تحت"
-    else:
-        icon = "🔴"
-        cancel_text = "إذا أغلقت شمعة فوق"
-
-    up_scores = normalize_scores(
-        data.get("up_scores", {})
-    )
-
-    down_scores = normalize_scores(
-        data.get("down_scores", {})
-    )
-
-    up_total = total_score(
-        up_scores
-    )
-
-    down_total = total_score(
-        down_scores
-    )
-
-    delay = safe_int(
-        data.get(
-            "entry_delay_minutes",
-            1
-        )
-    )
-
-    if delay < 0:
-        delay = 0
-
-    if delay > 2:
-        delay = 2
-
-    # IMPORTANT:
-    # Entry time is calculated from the moment Telegram received the screenshot,
-    # NOT from the clock/time visible inside the screenshot and NOT from the
-    # moment Gemini finishes the analysis.
-    if received_at is None:
-        received_at = datetime.now(SIGNAL_TZ)
-    elif received_at.tzinfo is None:
-        received_at = received_at.replace(tzinfo=SIGNAL_TZ)
-    else:
-        received_at = received_at.astimezone(SIGNAL_TZ)
-
-    # Always use the next minute as the earliest possible entry.
-    # delay=1 -> next minute, delay=2 -> two minutes ahead.
-    # delay=0 is kept as "now" by the model, but since the screenshot has
-    # already been received, the earliest safe minute is still the next minute.
-    minutes_ahead = max(delay, 1)
-
-    entry_time = (
-        received_at.replace(
-            second=0,
-            microsecond=0
-        )
-        + timedelta(minutes=minutes_ahead)
-    )
-
-    entry_time_text = (
-        entry_time.strftime("%H:%M")
-    )
-
-    if delay == 0:
-        entry_label = "الآن"
-    elif delay == 1:
-        entry_label = "بعد 1 دقيقة"
-    else:
-        entry_label = "بعد 2 دقيقة"
-
-    analysis = data.get(
-        "analysis",
-        {}
-    )
-
-    if not isinstance(analysis, dict):
-        analysis = {}
-
-    confidence = safe_int(
-        data.get("confidence", 50)
-    )
-
-    return (
-        "🎓 ZinoProSignalAI\n\n"
-
-        f"{icon} SIGNAL: {direction}\n"
-        f"🎯 Confidence: {confidence}%\n\n"
-
-        f"📊 {data.get('asset', 'Unknown')}"
-        f" · ⏱ {data.get('timeframe', 'Unknown')}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"📈 UP Score: {up_total}/18\n"
-        f"📉 DOWN Score: {down_total}/18\n\n"
-
-        f"🕐 الدخول: {entry_label}\n"
-        f"⏰ وقت الدخول الجزائر: {entry_time_text}\n\n"
-
-        f"💵 سعر الدخول: "
-        f"{clean_price(data.get('entry_price'))}\n"
-
-        f"🛑 إلغاء {cancel_text} "
-        f"{clean_price(data.get('cancellation_price'))}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 SIGNAL SCORE\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        "🟢 UP\n"
-        f"Structure: {up_scores['structure']}/2\n"
-        f"Breakout: {up_scores['breakout']}/2\n"
-        f"Liquidity: {up_scores['liquidity']}/1\n"
-        f"Momentum: {up_scores['momentum']}/2\n"
-        f"Candle: {up_scores['candle']}/2\n"
-        f"RSI: {up_scores['rsi']}/1\n"
-        f"Summary: {up_scores['summary']}/2\n"
-        f"Oscillators: {up_scores['oscillators']}/3\n"
-        f"Moving Averages: "
-        f"{up_scores['moving_averages']}/3\n"
-        f"TOTAL: {up_total}/18\n\n"
-
-        "🔴 DOWN\n"
-        f"Structure: {down_scores['structure']}/2\n"
-        f"Breakout: {down_scores['breakout']}/2\n"
-        f"Liquidity: {down_scores['liquidity']}/1\n"
-        f"Momentum: {down_scores['momentum']}/2\n"
-        f"Candle: {down_scores['candle']}/2\n"
-        f"RSI: {down_scores['rsi']}/1\n"
-        f"Summary: {down_scores['summary']}/2\n"
-        f"Oscillators: {down_scores['oscillators']}/3\n"
-        f"Moving Averages: "
-        f"{down_scores['moving_averages']}/3\n"
-        f"TOTAL: {down_total}/18\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📌 ANALYSIS\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"Structure: "
-        f"{analysis.get('structure', '')}\n\n"
-
-        f"Breakout: "
-        f"{analysis.get('breakout', '')}\n\n"
-
-        f"Liquidity: "
-        f"{analysis.get('liquidity', '')}\n\n"
-
-        f"Momentum: "
-        f"{analysis.get('momentum', '')}\n\n"
-
-        f"Candle: "
-        f"{analysis.get('candle', '')}\n\n"
-
-        f"RSI: "
-        f"{analysis.get('rsi', '')}\n\n"
-
-        f"Summary: "
-        f"{analysis.get('summary', '')}\n\n"
-
-        f"Oscillators: "
-        f"{analysis.get('oscillators', '')}\n\n"
-
-        f"Moving Averages: "
-        f"{analysis.get('moving_averages', '')}\n\n"
-
-        f"📝 السبب:\n"
-        f"{data.get('reason', '')}"
-    )
-
-
-# =========================================================
-# PHOTO HANDLER
-# =========================================================
-
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "⛔ هذا البوت خاص."
-        )
-
-        return
-
-    # Record the exact Telegram message receipt time BEFORE Gemini analysis.
-    # This timestamp is the only reference used to calculate entry time.
-    received_at = datetime.now(SIGNAL_TZ)
-
-    status = await update.message.reply_text(
-        "🔎 جاري تحليل الشارت..."
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        telegram_file = (
-            await context.bot.get_file(
-                photo.file_id
-            )
-        )
-
-        image_buffer = io.BytesIO()
-
-        await telegram_file.download_to_memory(
-            image_buffer
-        )
-
-        image_bytes = (
-            image_buffer.getvalue()
-        )
-
-        logger.info(
-            "Screenshot received: %s bytes",
-            len(image_bytes)
-        )
-
-        data = await analyze_chart(
-            image_bytes
-        )
-
-        signal = format_signal(
-            data,
-            received_at=received_at
-        )
-
-        await status.edit_text(
-            signal
-        )
-
-        logger.info(
-            "SIGNAL=%s UP=%s DOWN=%s CONF=%s",
-            data.get("direction"),
-            total_score(data.get("up_scores", {})),
-            total_score(data.get("down_scores", {})),
-            data.get("confidence")
-        )
-
-    except json.JSONDecodeError:
-
-        logger.exception(
-            "Invalid JSON from Gemini"
-        )
-
-        await status.edit_text(
-            "⚠️ Gemini أرسل نتيجة غير صالحة.\n"
-            "أعد إرسال Screenshot."
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Analysis error"
-        )
-
-        await status.edit_text(
-            "⚠️ حدث خطأ أثناء تحليل الشارت.\n\n"
-            f"{str(error)[:500]}"
-        )
-
-
-# =========================================================
-# ERROR HANDLER
-# =========================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
+except json.JSONDecodeError as error:
 
     logger.error(
-        "Unhandled error: %s",
-        context.error,
-        exc_info=context.error
+        "Gemini invalid JSON: %s",
+        raw_text[:2000]
     )
 
+    raise error
 
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    health_thread = threading.Thread(
-        target=start_health_server,
-        daemon=True
+if not isinstance(data, dict):
+    raise RuntimeError(
+        "Invalid Gemini response"
     )
 
-    health_thread.start()
+# =====================================================
+# SCORES
+# =====================================================
 
-    logger.info(
-        "ZinoProSignalAI starting..."
-    )
+up_scores = normalize_scores(
+    data.get("up_scores", {})
+)
 
-    logger.info(
-        "Gemini model: %s",
-        GEMINI_MODEL
-    )
-
-    logger.info(
-        "Render port: %s",
-        PORT
-    )
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo_handler
-        )
-    )
-
-    app.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "Telegram application starting..."
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# =========================================================
-# RUN
-# =========================================================
-
-if __name__ == "__main__":
-    main()
+down_scores = normalize_scores(
+    data.get("down
+```
