@@ -1,12 +1,11 @@
-````python
 import os
 import io
 import json
 import logging
-import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -15,30 +14,19 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# SETTINGS
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_ID = os.getenv("OWNER_ID")
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
-
-PORT = int(
-    os.getenv("PORT", "10000")
-)
-
-
-# ============================================================
-# ENVIRONMENT CHECK
-# ============================================================
+OWNER_ID_RAW = os.getenv("OWNER_ID")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -46,11 +34,11 @@ if not BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-if not OWNER_ID:
+if not OWNER_ID_RAW:
     raise RuntimeError("OWNER_ID is missing")
 
 try:
-    OWNER_ID = int(OWNER_ID)
+    OWNER_ID = int(OWNER_ID_RAW)
 except ValueError:
     raise RuntimeError("OWNER_ID must be an integer")
 
@@ -60,31 +48,26 @@ except ValueError:
 # ============================================================
 
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger(
-    "ZinoProSignalAI"
-)
+logger = logging.getLogger("ZinoProSignalAI")
 
 
 # ============================================================
-# GEMINI CLIENT
+# GEMINI
 # ============================================================
 
-gemini = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ============================================================
-# ALGERIA TIME
+# STATS
 # ============================================================
 
-ALGERIA_TZ = timezone(
-    timedelta(hours=1)
-)
+wins = 0
+losses = 0
 
 
 # ============================================================
@@ -94,1336 +77,489 @@ ALGERIA_TZ = timezone(
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ZinoProSignalAI is running")
 
-        try:
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
 
-            if self.path == "/health":
-                body = (
-                    b"ZinoProSignalAI is running"
-                )
-            else:
-                body = b"ZinoProSignalAI"
-
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain; charset=utf-8"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.send_header(
-                "Connection",
-                "close"
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
-
-        except Exception:
-
-            logger.exception(
-                "Health request error"
-            )
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
+    def log_message(self, format, *args):
         return
 
 
-def create_health_server():
-
-    logger.info(
-        "Creating HTTP health server..."
-    )
-
-    logger.info(
-        "Binding 0.0.0.0:%s",
-        PORT
-    )
+def start_web_server():
+    port = int(os.getenv("PORT", "10000"))
 
     server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
-        HealthHandler
+        ("0.0.0.0", port),
+        HealthHandler,
     )
 
-    logger.info(
-        "=================================================="
-    )
+    logger.info("Health server started on port %s", port)
 
-    logger.info(
-        "HEALTH SERVER STARTED"
-    )
-
-    logger.info(
-        "Listening on 0.0.0.0:%s",
-        PORT
-    )
-
-    logger.info(
-        "Health endpoint: /health"
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    return server
-
-
-def run_health_server(
-    server
-):
-
-    try:
-
-        server.serve_forever(
-            poll_interval=0.5
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Health server stopped"
-        )
+    server.serve_forever()
 
 
 # ============================================================
 # OWNER CHECK
 # ============================================================
 
-def is_owner(
-    update: Update
-):
-
+def is_owner(update: Update) -> bool:
     if not update.effective_user:
         return False
 
-    return (
-        update.effective_user.id
-        == OWNER_ID
+    return update.effective_user.id == OWNER_ID
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        await update.message.reply_text(
+            "❌ هذا البوت خاص."
+        )
+        return
+
+    await update.message.reply_text(
+        "🎓 ZinoProSignalAI\n\n"
+        "أرسل صورة شارت Quotex مباشرة.\n"
+        "سيتم تحليل الصورة وإرسال الإشارة تلقائيًا.\n\n"
+        "📊 الأوامر:\n"
+        "/stats - الإحصائيات\n"
+        "/reset - تصفير الإحصائيات"
     )
 
 
 # ============================================================
-# START COMMAND
+# STATS
 # ============================================================
 
-async def start(
+async def stats_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-
     if not is_owner(update):
-
-        if update.message:
-
-            await update.message.reply_text(
-                "⛔ هذا البوت خاص."
-            )
-
         return
 
-    if update.message:
+    total = wins + losses
 
-        await update.message.reply_text(
-            "🎓 ZinoProSignalAI\n\n"
-            "📸 أرسل Screenshot للشارت.\n\n"
-            "⚡ سيتم تحليل الصورة مباشرة.\n"
-            "📊 الاتجاه + الثقة + النقاط\n"
-            "⏱️ وقت الدخول\n"
-            "💰 سعر الدخول\n"
-            "🚫 مستوى الإلغاء"
-        )
+    if total > 0:
+        win_rate = (wins / total) * 100
+    else:
+        win_rate = 0
+
+    await update.message.reply_text(
+        "📊 إحصائيات ZinoProSignalAI\n\n"
+        f"🟢 Wins: {wins}\n"
+        f"🔴 Losses: {losses}\n"
+        f"📈 Total: {total}\n"
+        f"🎯 Win Rate: {win_rate:.1f}%"
+    )
 
 
 # ============================================================
-# GEMINI ANALYSIS PROMPT
+# RESET
 # ============================================================
 
-ANALYSIS_PROMPT = """
-أنت محرك التحليل الفني الرئيسي لبوت
-ZinoProSignalAI.
-
-حلل Screenshot حقيقية لشارت Quotex.
-
-يجب اختيار اتجاه واحد فقط:
-
-UP
-أو
-DOWN
-
-ممنوع:
-
-NO SIGNAL
-WAIT
-NEUTRAL
-
-==================================================
-IMPORTANT
-==================================================
-
-لا تجعل UP افتراضياً.
-
-لا تجعل DOWN افتراضياً.
-
-احسب الأدلة لصالح UP و DOWN بشكل منفصل.
-
-لا تعتمد على مؤشر واحد.
-
-الأولوية:
-
-1. Market Structure
-2. Candle Close / Open
-3. Highs / Lows
-4. Breakout
-5. Liquidity Sweep
-6. Momentum
-7. Candle Confirmation
-8. RSI
-9. Oscillators
-10. Moving Averages
-
-إذا كان عامل غير ظاهر في الصورة:
-لا تخترع بياناته.
-
-==================================================
-SCORING
-==================================================
-
-المجموع الأقصى = 18 نقطة.
-
-Structure       = 2
-Breakout        = 2
-Liquidity       = 1
-Momentum        = 2
-Candle          = 2
-RSI             = 1
-Summary         = 2
-Oscillators     = 3
-Moving Averages = 3
-
-TOTAL = 18
-
-احسب UP و DOWN بشكل مستقل.
-
-لا تعطِ نقاطاً مرتفعة بدون دليل واضح.
-
-==================================================
-STRUCTURE
-==================================================
-
-راقب:
-
-Higher High
-Higher Low
-Lower High
-Lower Low
-Break of Structure
-Change of Character
-
-Higher High + Higher Low
-يدعم UP.
-
-Lower High + Lower Low
-يدعم DOWN.
-
-==================================================
-CANDLE
-==================================================
-
-ركز على آخر شمعة مغلقة.
-
-افحص:
-
-Open
-Close
-Body
-Upper Wick
-Lower Wick
-Strong Close
-Weak Close
-
-راقب:
-
-Bullish Engulfing
-Bearish Engulfing
-Hammer
-Shooting Star
-Pin Bar
-Strong Close
-Continuation
-
-==================================================
-BREAKOUT
-==================================================
-
-ميز بين:
-
-True Breakout
-Fake Breakout
-Breakout Confirmation
-
-لا تعتبر Wick وحده Breakout مؤكداً.
-
-==================================================
-LIQUIDITY
-==================================================
-
-راقب:
-
-High Sweep
-Low Sweep
-Liquidity Sweep
-Rejection
-
-Sweep لقاع ثم إغلاق فوقه
-قد يدعم UP.
-
-Sweep لقمة ثم إغلاق تحتها
-قد يدعم DOWN.
-
-==================================================
-MOMENTUM
-==================================================
-
-افحص:
-
-قوة جسم الشموع
-تتابع الشموع
-سرعة الحركة
-Wicks
-
-إذا كان ADX ظاهراً:
-حلله.
-
-لا تخترع ADX.
-
-==================================================
-RSI
-==================================================
-
-إذا كان RSI ظاهراً:
-
-Above 50
-Below 50
-Overbought
-Oversold
-Divergence
-
-لا تخترع قيمة RSI.
-
-==================================================
-OSCILLATORS
-==================================================
-
-حلل المؤشرات الظاهرة فقط.
-
-مثل:
-
-RSI
-MACD
-Stochastic
-
-إذا لم تكن ظاهرة:
-لا تخترعها.
-
-==================================================
-MOVING AVERAGES
-==================================================
-
-إذا كانت ظاهرة:
-
-السعر فوق أو تحت المتوسطات
-اتجاه المتوسطات
-Cross
-Alignment
-
-لا تخترع أرقاماً.
-
-==================================================
-KELTNER / ADX
-==================================================
-
-إذا كان Keltner Channel ظاهراً:
-
-Upper band rejection
-Lower band rejection
-Middle line
-Breakout
-
-إذا كان ADX ظاهراً:
-
-ADX strength
-DI+
-DI-
-
-لا تخترع القيم.
-
-==================================================
-ENTRY
-==================================================
-
-اختر:
-
-0
-أو
-1
-أو
-2
-
-إذا كانت الحركة جاهزة:
-0
-
-إذا كانت تحتاج تأكيد:
-1
-
-إذا كانت تحتاج تأكيد أقوى:
-2
-
-==================================================
-ENTRY PRICE
-==================================================
-
-استخدم السعر الظاهر في الصورة.
-
-إذا كان السعر واضحاً:
-استخدمه.
-
-إذا لم يكن واضحاً:
-استخدم أقرب سعر منطقي يمكن قراءته من الشارت.
-
-لا تخترع سعراً عشوائياً.
-
-==================================================
-CANCELLATION
-==================================================
-
-UP:
-
-cancellation_price أسفل الدخول
-أو أسفل بنية مهمة.
-
-DOWN:
-
-cancellation_price فوق الدخول
-أو فوق بنية مهمة.
-
-==================================================
-CONFIDENCE
-==================================================
-
-الثقة تعبر عن توافق الأدلة.
-
-50-60 = ضعيف
-61-72 = متوسط
-73-82 = جيد
-83-90 = قوي
-
-لا تتجاوز 90.
-
-لا تستخدم 90 لمجرد رفع الرقم.
-
-==================================================
-FINAL CHECK
-==================================================
-
-قبل إخراج JSON:
-
-- direction = UP أو DOWN فقط.
-- confidence بين 50 و90.
-- entry_delay_minutes = 0 أو 1 أو 2.
-- UP scores لا تتجاوز 18.
-- DOWN scores لا تتجاوز 18.
-- لا تخترع المؤشرات غير الظاهرة.
-- cancellation_price منطقي للاتجاه.
-- entry_price مأخوذ من السعر الظاهر قدر الإمكان.
-
-==================================================
-OUTPUT
-==================================================
-
-أرجع JSON فقط.
-
-ممنوع Markdown.
-
-ممنوع ```json.
-
-ممنوع أي كلام قبل أو بعد JSON.
-
-الشكل:
+async def reset_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global wins, losses
+
+    if not is_owner(update):
+        return
+
+    wins = 0
+    losses = 0
+
+    await update.message.reply_text(
+        "♻️ تم تصفير الإحصائيات."
+    )
+
+
+# ============================================================
+# WIN / LOSS
+# ============================================================
+
+async def win_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global wins
+
+    if not is_owner(update):
+        return
+
+    wins += 1
+
+    await update.message.reply_text(
+        f"🟢 WIN\n\n"
+        f"Total Wins: {wins}\n"
+        f"Losses: {losses}"
+    )
+
+
+async def loss_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global losses
+
+    if not is_owner(update):
+        return
+
+    losses += 1
+
+    await update.message.reply_text(
+        f"🔴 LOSS\n\n"
+        f"Wins: {wins}\n"
+        f"Total Losses: {losses}"
+    )
+
+
+# ============================================================
+# GEMINI PROMPT
+# ============================================================
+
+ANALYSIS_PROMPT = r"""
+أنت محلل فني لشارتات التداول قصير الأجل.
+
+حلل صورة الشارت المرفقة فقط.
+
+مهم جدًا:
+- لا تخترع بيانات غير ظاهرة في الصورة.
+- اقرأ اسم الأصل إذا كان ظاهرًا.
+- اقرأ الفريم إذا كان ظاهرًا.
+- ركز على حركة السعر والشموع والبنية السعرية.
+- افحص الاتجاه.
+- افحص Higher High / Higher Low.
+- افحص Lower High / Lower Low.
+- افحص الاختراقات وإعادة الاختبار.
+- افحص مناطق الرفض.
+- افحص الزخم.
+- افحص شكل آخر الشموع.
+- افحص RSI إذا كان ظاهرًا.
+- افحص Moving Averages إذا كانت ظاهرة.
+- افحص Keltner Channel إذا كان ظاهرًا.
+- افحص ADX إذا كان ظاهرًا.
+- لا تستخدم مؤشرًا غير ظاهر في الصورة وكأنه موجود.
+- أعطِ اتجاهًا واحدًا فقط: UP أو DOWN.
+- لا تعطِ WAIT.
+- لا تعطِ NO SIGNAL.
+- لا تعطِ الاتجاهين معًا.
+
+نظام التقييم المطلوب من 18:
+
+Structure = 2
+Breakout = 2
+Liquidity = 1
+Momentum = 2
+Candle = 2
+RSI = 1
+Summary = 2
+Oscillators = 2
+Moving Averages = 2
+
+المجموع = 18.
+
+احسب UP score و DOWN score بناءً على الأدلة الظاهرة.
+
+اختيار الاتجاه:
+- إذا كانت أدلة الصعود أقوى اختر UP.
+- إذا كانت أدلة الهبوط أقوى اختر DOWN.
+- إذا كانت الصورة ضعيفة، اختر الاتجاه الذي تدعمه الأدلة الأقوى، لكن خفّض confidence.
+- لا تجعل confidence مرتفعًا بدون أدلة واضحة.
+
+التوقيت:
+- الوقت المطلوب بتوقيت الجزائر Africa/Algiers.
+- لا تجعل وقت الدخول مساويًا بالضرورة لوقت رفع الصورة.
+- اقترح دخولًا على الشمعة التالية أو بعد تأخير مناسب حسب الفريم الظاهر.
+- إذا كان الفريم 1M فالتأخير المعتاد حوالي دقيقة.
+- إذا كان 2M فالتأخير المعتاد حوالي دقيقتين.
+- إذا كان 3M فالتأخير المعتاد حوالي ثلاث دقائق.
+- لا تغيّر الفريم الموجود في الصورة.
+
+السعر:
+- استخرج Entry Price من السعر الظاهر في الصورة.
+- اقترح Cancellation Level منطقيًا من البنية السعرية.
+- لا تضع Cancellation Level في نفس سطر Entry Price.
+
+أخرج JSON فقط بهذا الشكل:
 
 {
-  "asset": "",
-  "timeframe": "",
-  "current_price": "",
+  "asset": "EUR/USD",
+  "timeframe": "1M",
   "direction": "UP",
-  "confidence": 0,
+  "confidence": 84,
+  "up_score": 15,
+  "down_score": 3,
   "entry_delay_minutes": 1,
-  "entry_price": "",
-  "cancellation_price": "",
-
-  "up_scores": {
-    "structure": 0,
-    "breakout": 0,
-    "liquidity": 0,
-    "momentum": 0,
-    "candle": 0,
-    "rsi": 0,
-    "summary": 0,
-    "oscillators": 0,
-    "moving_averages": 0
-  },
-
-  "down_scores": {
-    "structure": 0,
-    "breakout": 0,
-    "liquidity": 0,
-    "momentum": 0,
-    "candle": 0,
-    "rsi": 0,
-    "summary": 0,
-    "oscillators": 0,
-    "moving_averages": 0
-  },
-
-  "analysis": {
-    "structure": "",
-    "breakout": "",
-    "liquidity": "",
-    "momentum": "",
-    "candle": "",
-    "rsi": "",
-    "summary": "",
-    "oscillators": "",
-    "moving_averages": ""
-  },
-
-  "reason": ""
+  "entry_price": "1.13460",
+  "cancellation_level": "1.13435",
+  "cancellation_text": "إلغاء إذا أغلقت شمعة تحت 1.13435",
+  "reason": "سبب مختصر جدًا مبني على الشارت"
 }
+
+لا تضف أي نص خارج JSON.
 """
 
 
 # ============================================================
-# JSON CLEANING
+# JSON CLEANER
 # ============================================================
 
-def clean_json(
-    text
-):
-
-    if not text:
-        return ""
-
+def clean_json(text: str) -> str:
     text = text.strip()
 
-    if text.startswith("```json"):
+    if text.startswith("```"):
+        lines = text.splitlines()
 
-        text = text[
-            len("```json"):
-        ]
+        if len(lines) >= 3:
+            lines = lines[1:]
 
-    elif text.startswith("```"):
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
 
-        text = text[3:]
+            text = "\n".join(lines).strip()
 
-    if text.endswith("```"):
-
-        text = text[:-3]
-
-    return text.strip()
+    return text
 
 
 # ============================================================
-# SAFE INTEGER
+# IMAGE ANALYSIS
 # ============================================================
 
-def safe_int(
-    value,
-    default=0
-):
+async def analyze_chart(image_bytes: bytes):
 
-    try:
-
-        return int(
-            float(value)
-        )
-
-    except Exception:
-
-        return default
-
-
-# ============================================================
-# SCORE LIMITS
-# ============================================================
-
-SCORE_LIMITS = {
-
-    "structure": 2,
-
-    "breakout": 2,
-
-    "liquidity": 1,
-
-    "momentum": 2,
-
-    "candle": 2,
-
-    "rsi": 1,
-
-    "summary": 2,
-
-    "oscillators": 3,
-
-    "moving_averages": 3,
-
-}
-
-
-def normalize_scores(
-    scores
-):
-
-    if not isinstance(
-        scores,
-        dict
-    ):
-
-        scores = {}
-
-    result = {}
-
-    for name, maximum in SCORE_LIMITS.items():
-
-        value = safe_int(
-            scores.get(
-                name,
-                0
-            )
-        )
-
-        if value < 0:
-            value = 0
-
-        if value > maximum:
-            value = maximum
-
-        result[name] = value
-
-    return result
-
-
-def total_score(
-    scores
-):
-
-    return sum(
-        scores.get(
-            name,
-            0
-        )
-        for name in SCORE_LIMITS
+    image_part = types.Part.from_bytes(
+        data=image_bytes,
+        mime_type="image/jpeg",
     )
 
-
-# ============================================================
-# GEMINI TEMPORARY ERRORS
-# ============================================================
-
-def is_temporary_gemini_error(
-    error
-):
-
-    text = str(
-        error
-    ).upper()
-
-    temporary_errors = [
-
-        "503",
-        "UNAVAILABLE",
-
-        "429",
-        "RESOURCE_EXHAUSTED",
-
-        "504",
-        "DEADLINE_EXCEEDED",
-
-        "TIMEOUT",
-
-        "INTERNAL",
-
-    ]
-
-    return any(
-        item in text
-        for item in temporary_errors
-    )
-
-
-# ============================================================
-# GEMINI REQUEST
-# ============================================================
-
-async def request_gemini(
-    image_bytes
-):
-
-    last_error = None
-
-    max_attempts = 3
-
-    for attempt in range(
-        1,
-        max_attempts + 1
-    ):
-
-        try:
-
-            logger.info(
-                "Gemini request %s/%s | model=%s",
-                attempt,
-                max_attempts,
-                GEMINI_MODEL
-            )
-
-            response = await asyncio.to_thread(
-
-                gemini.models.generate_content,
-
-                model=GEMINI_MODEL,
-
-                contents=[
-
-                    types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type="image/jpeg"
-                    ),
-
-                    ANALYSIS_PROMPT
-
-                ],
-
-                config=types.GenerateContentConfig(
-
-                    temperature=0.05,
-
-                    response_mime_type=(
-                        "application/json"
-                    )
-
-                )
-
-            )
-
-            if not response.text:
-
-                raise RuntimeError(
-                    "Gemini returned an empty response"
-                )
-
-            return response.text
-
-        except Exception as error:
-
-            last_error = error
-
-            logger.error(
-                "Gemini request failed "
-                "(%s/%s): %s",
-                attempt,
-                max_attempts,
-                error
-            )
-
-            if (
-                attempt < max_attempts
-                and
-                is_temporary_gemini_error(
-                    error
-                )
-            ):
-
-                wait_seconds = (
-                    attempt * 5
-                )
-
-                logger.info(
-                    "Temporary Gemini error. "
-                    "Retrying in %s seconds...",
-                    wait_seconds
-                )
-
-                await asyncio.sleep(
-                    wait_seconds
-                )
-
-                continue
-
-            raise
-
-    raise last_error
-
-
-# ============================================================
-# ANALYZE CHART
-# ============================================================
-
-async def analyze_chart(
-    image_bytes
-):
-
-    raw_text = await request_gemini(
-        image_bytes
-    )
-
-    raw_text = clean_json(
-        raw_text
-    )
-
-    try:
-
-        data = json.loads(
-            raw_text
-        )
-
-    except json.JSONDecodeError as error:
-
-        logger.error(
-            "Gemini invalid JSON: %s",
-            raw_text[:2000]
-        )
-
-        raise error
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        raise RuntimeError(
-            "Invalid Gemini response"
-        )
-
-    up_scores = normalize_scores(
-        data.get(
-            "up_scores",
-            {}
-        )
-    )
-
-    down_scores = normalize_scores(
-        data.get(
-            "down_scores",
-            {}
-        )
-    )
-
-    data["up_scores"] = (
-        up_scores
-    )
-
-    data["down_scores"] = (
-        down_scores
-    )
-
-    up_total = total_score(
-        up_scores
-    )
-
-    down_total = total_score(
-        down_scores
-    )
-
-    direction = str(
-        data.get(
-            "direction",
-            ""
-        )
-    ).upper().strip()
-
-    if direction not in (
-        "UP",
-        "DOWN"
-    ):
-
-        if up_total >= down_total:
-
-            direction = "UP"
-
-        else:
-
-            direction = "DOWN"
-
-    data["direction"] = (
-        direction
-    )
-
-    confidence = safe_int(
-        data.get(
-            "confidence",
-            0
-        )
-    )
-
-    if confidence < 50:
-        confidence = 50
-
-    if confidence > 90:
-        confidence = 90
-
-    data["confidence"] = (
-        confidence
-    )
-
-    delay = safe_int(
-        data.get(
-            "entry_delay_minutes",
-            1
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            image_part,
+            ANALYSIS_PROMPT,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.15,
+            response_mime_type="application/json",
         ),
-        1
     )
 
-    if delay < 0:
-        delay = 0
+    text = response.text
 
-    if delay > 2:
-        delay = 2
+    if not text:
+        raise RuntimeError("Gemini returned an empty response")
 
-    data["entry_delay_minutes"] = (
-        delay
-    )
+    text = clean_json(text)
 
-    data["asset"] = str(
-        data.get(
-            "asset",
-            "Unknown"
-        )
-    ).strip()
-
-    data["timeframe"] = str(
-        data.get(
-            "timeframe",
-            "Unknown"
-        )
-    ).strip()
-
-    data["current_price"] = str(
-        data.get(
-            "current_price",
-            ""
-        )
-    ).strip()
-
-    data["entry_price"] = str(
-        data.get(
-            "entry_price",
-            ""
-        )
-    ).strip()
-
-    data["cancellation_price"] = str(
-        data.get(
-            "cancellation_price",
-            ""
-        )
-    ).strip()
-
-    data["reason"] = str(
-        data.get(
-            "reason",
-            ""
-        )
-    ).strip()
-
-    analysis = data.get(
-        "analysis",
-        {}
-    )
-
-    if not isinstance(
-        analysis,
-        dict
-    ):
-
-        analysis = {}
-
-    normalized_analysis = {}
-
-    analysis_keys = [
-
-        "structure",
-        "breakout",
-        "liquidity",
-        "momentum",
-        "candle",
-        "rsi",
-        "summary",
-        "oscillators",
-        "moving_averages",
-
-    ]
-
-    for key in analysis_keys:
-
-        normalized_analysis[key] = str(
-            analysis.get(
-                key,
-                ""
-            )
-        ).strip()
-
-    data["analysis"] = (
-        normalized_analysis
-    )
-
-    logger.info(
-        "Analysis successful | "
-        "direction=%s | "
-        "UP=%s/18 | "
-        "DOWN=%s/18 | "
-        "confidence=%s | "
-        "delay=%s",
-
-        direction,
-        up_total,
-        down_total,
-        confidence,
-        delay
-    )
+    data = json.loads(text)
 
     return data
-
-
-# ============================================================
-# ENTRY TIME
-# ============================================================
-
-def calculate_entry_time(
-    received_at,
-    delay_minutes
-):
-
-    base = received_at.astimezone(
-        ALGERIA_TZ
-    )
-
-    entry_time = (
-
-        base.replace(
-            second=0,
-            microsecond=0
-        )
-
-        + timedelta(
-            minutes=1
-        )
-
-    )
-
-    if delay_minutes > 0:
-
-        entry_time += timedelta(
-            minutes=delay_minutes
-        )
-
-    return entry_time
 
 
 # ============================================================
 # FORMAT SIGNAL
 # ============================================================
 
-def format_signal(
-    data,
-    received_at
-):
+def format_signal(data: dict) -> str:
 
-    direction = data[
-        "direction"
-    ]
+    asset = str(data.get("asset", "Unknown"))
+    timeframe = str(data.get("timeframe", "Unknown"))
+    direction = str(data.get("direction", "UP")).upper()
 
-    if direction == "UP":
+    confidence = data.get("confidence", 0)
+    up_score = data.get("up_score", 0)
+    down_score = data.get("down_score", 0)
 
-        direction_text = "🟢 UP"
+    delay = data.get("entry_delay_minutes", 1)
 
-        cancel_text = (
-            "🚫 إلغاء إذا أغلقت شمعة تحت "
-            f"{data['cancellation_price']}"
-        )
-
-    else:
-
-        direction_text = "🔴 DOWN"
-
-        cancel_text = (
-            "🚫 إلغاء إذا أغلقت شمعة فوق "
-            f"{data['cancellation_price']}"
-        )
-
-    up_total = total_score(
-        data["up_scores"]
+    entry_price = str(
+        data.get("entry_price", "غير واضح")
     )
 
-    down_total = total_score(
-        data["down_scores"]
+    cancellation_level = str(
+        data.get("cancellation_level", "غير واضح")
     )
 
-    entry_time = calculate_entry_time(
-        received_at,
-        data[
-            "entry_delay_minutes"
-        ]
+    cancellation_text = str(
+        data.get(
+            "cancellation_text",
+            f"إلغاء إذا أغلقت شمعة عند المستوى {cancellation_level}",
+        )
     )
 
-    time_text = entry_time.strftime(
-        "%H:%M"
+    reason = str(
+        data.get(
+            "reason",
+            "تم اعتماد الاتجاه بناءً على البنية والزخم والشموع الظاهرة.",
+        )
     )
 
-    delay = data[
-        "entry_delay_minutes"
-    ]
+    now = datetime.now(
+        ZoneInfo("Africa/Algiers")
+    )
 
-    if delay == 0:
+    entry_time = now
 
-        delay_text = (
-            "الشمعة القادمة"
-        )
+    try:
+        delay_minutes = int(delay)
+    except Exception:
+        delay_minutes = 1
 
-    elif delay == 1:
+    from datetime import timedelta
 
-        delay_text = (
-            "بعد 1 دقيقة"
-        )
+    entry_time = now + timedelta(
+        minutes=max(1, delay_minutes)
+    )
 
-    else:
+    direction_text = "🟢 UP" if direction == "UP" else "🔴 DOWN"
 
-        delay_text = (
-            f"بعد {delay} دقائق"
-        )
-
-    analysis = data[
-        "analysis"
-    ]
-
-    message = (
-
+    return (
         "🎓 ZinoProSignalAI\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
-
-        f"📊 الأصل: "
-        f"{data['asset']}\n"
-
-        f"⏱️ الفريم: "
-        f"{data['timeframe']}\n"
-
-        f"🎯 الاتجاه: "
-        f"{direction_text}\n"
-
-        f"🔥 الثقة: "
-        f"{data['confidence']}%\n"
-
-        "\n"
-
-        f"🟢 UP: "
-        f"{up_total}/18\n"
-
-        f"🔴 DOWN: "
-        f"{down_total}/18\n"
-
-        "\n"
-
-        f"⏳ الدخول: "
-        f"{delay_text}\n"
-
-        f"🕐 الوقت: "
-        f"{time_text} الجزائر\n"
-
-        f"💰 سعر الدخول: "
-        f"{data['entry_price']}\n"
-
-        f"{cancel_text}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        "📋 التحليل\n"
-
-        f"• Structure: "
-        f"{analysis['structure']}\n"
-
-        f"• Breakout: "
-        f"{analysis['breakout']}\n"
-
-        f"• Liquidity: "
-        f"{analysis['liquidity']}\n"
-
-        f"• Momentum: "
-        f"{analysis['momentum']}\n"
-
-        f"• Candle: "
-        f"{analysis['candle']}\n"
-
-        f"• RSI: "
-        f"{analysis['rsi']}\n"
-
-        f"• Summary: "
-        f"{analysis['summary']}\n"
-
-        f"• Oscillators: "
-        f"{analysis['oscillators']}\n"
-
-        f"• Moving Averages: "
-        f"{analysis['moving_averages']}\n"
-
-        "\n"
-
-        f"💡 السبب: "
-        f"{data['reason']}"
-
+        f"📊 الأصل: {asset}\n"
+        f"⏱ الفريم: {timeframe}\n"
+        f"🎯 الثقة: {confidence}%\n\n"
+        f"📌 القرار: {direction_text}\n"
+        f"🟢 UP Score: {up_score}/18\n"
+        f"🔴 DOWN Score: {down_score}/18\n\n"
+        f"⏳ الدخول بعد: {max(1, delay_minutes)} دقيقة\n"
+        f"🕐 وقت الدخول: {entry_time.strftime('%H:%M:%S')}\n\n"
+        f"💰 Entry Price: {entry_price}\n"
+        f"🚫 {cancellation_text}\n\n"
+        f"📝 {reason}\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
-
-    return message
 
 
 # ============================================================
 # PHOTO HANDLER
 # ============================================================
 
-async def handle_photo(
+async def photo_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     if not is_owner(update):
+        await update.message.reply_text(
+            "❌ هذا البوت خاص."
+        )
+        return
 
-        if update.message:
+    message = update.message
 
-            await update.message.reply_text(
-                "⛔ هذا البوت خاص."
+    if not message or not message.photo:
+        return
+
+    processing_message = await message.reply_text(
+        "🔎 جاري تحليل الشارت..."
+    )
+
+    try:
+
+        photo = message.photo[-1]
+
+        file = await context.bot.get_file(
+            photo.file_id
+        )
+
+        image_buffer = io.BytesIO()
+
+        await file.download_to_memory(
+            image_buffer
+        )
+
+        image_bytes = image_buffer.getvalue()
+
+        if not image_bytes:
+            raise RuntimeError(
+                "Could not download image"
             )
 
+        result = await analyze_chart(
+            image_bytes
+        )
+
+        signal = format_signal(result)
+
+        await processing_message.edit_text(
+            signal
+        )
+
+    except json.JSONDecodeError:
+
+        logger.exception(
+            "Gemini returned invalid JSON"
+        )
+
+        await processing_message.edit_text(
+            "❌ لم أستطع قراءة نتيجة التحليل.\n"
+            "أعد إرسال صورة الشارت."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Chart analysis failed"
+        )
+
+        error_text = str(e)
+
+        if len(error_text) > 300:
+            error_text = error_text[:300]
+
+        await processing_message.edit_text(
+            "❌ حدث خطأ أثناء تحليل الشارت.\n\n"
+            f"{error_text}"
+        )
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+
+async def text_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_owner(update):
         return
 
     if not update.message:
         return
 
-    received_at = datetime.now(
-        ALGERIA_TZ
+    await update.message.reply_text(
+        "📸 أرسل صورة الشارت وسأبدأ التحليل مباشرة."
     )
-
-    processing_message = (
-        await update.message.reply_text(
-            "🔎 جاري تحليل الشارت..."
-        )
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        telegram_file = (
-            await context.bot.get_file(
-                photo.file_id
-            )
-        )
-
-        image_buffer = (
-            io.BytesIO()
-        )
-
-        await telegram_file.download_to_memory(
-            image_buffer
-        )
-
-        image_bytes = (
-            image_buffer.getvalue()
-        )
-
-        if not image_bytes:
-
-            raise RuntimeError(
-                "Empty image received"
-            )
-
-        logger.info(
-            "Screenshot received: %s bytes",
-            len(image_bytes)
-        )
-
-        data = await analyze_chart(
-            image_bytes
-        )
-
-        signal_message = format_signal(
-            data,
-            received_at
-        )
-
-        await processing_message.edit_text(
-            signal_message
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Screenshot analysis failed"
-        )
-
-        error_text = str(
-            error
-        )
-
-        if len(error_text) > 700:
-
-            error_text = (
-                error_text[:700]
-                + "..."
-            )
-
-        try:
-
-            await processing_message.edit_text(
-
-                "❌ فشل تحليل الشارت.\n\n"
-
-                f"الخطأ:\n"
-                f"{error_text}\n\n"
-
-                "💡 إذا كان الخطأ 503 أو 429 "
-                "سيتم إعادة المحاولة تلقائياً."
-
-            )
-
-        except Exception:
-
-            pass
 
 
 # ============================================================
-# TELEGRAM ERROR HANDLER
+# ERROR HANDLER
 # ============================================================
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    logger.error(
-        "Telegram error: %s",
-        context.error
+    logger.exception(
+        "Telegram error",
+        exc_info=context.error,
     )
 
 
@@ -1434,72 +570,15 @@ async def error_handler(
 def main():
 
     logger.info(
-        "=================================================="
+        "Starting ZinoProSignalAI..."
     )
 
-    logger.info(
-        "Starting ZinoProSignalAI"
-    )
-
-    logger.info(
-        "Render PORT=%s",
-        PORT
-    )
-
-    logger.info(
-        "Gemini model=%s",
-        GEMINI_MODEL
-    )
-
-    logger.info(
-        "Process PID=%s",
-        os.getpid()
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    # --------------------------------------------------------
-    # START HEALTH SERVER FIRST
-    # --------------------------------------------------------
-
-    try:
-
-        health_server = (
-            create_health_server()
-        )
-
-    except Exception:
-
-        logger.exception(
-            "FAILED TO BIND PORT %s",
-            PORT
-        )
-
-        raise
-
-    health_thread = threading.Thread(
-
-        target=run_health_server,
-
-        args=(health_server,),
-
+    web_thread = threading.Thread(
+        target=start_web_server,
         daemon=True,
-
-        name="RenderHealthServer"
-
     )
 
-    health_thread.start()
-
-    logger.info(
-        "Render health thread started."
-    )
-
-    # --------------------------------------------------------
-    # CREATE TELEGRAM APPLICATION
-    # --------------------------------------------------------
+    web_thread.start()
 
     application = (
         Application.builder()
@@ -1510,14 +589,49 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reset",
+            reset_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "win",
+            win_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "loss",
+            loss_command,
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            handle_photo
+            photo_handler,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
         )
     )
 
@@ -1526,45 +640,13 @@ def main():
     )
 
     logger.info(
-        "Telegram application starting..."
+        "Telegram bot is starting..."
     )
 
-    # --------------------------------------------------------
-    # RUN TELEGRAM
-    # --------------------------------------------------------
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
-    try:
-
-        application.run_polling(
-            drop_pending_updates=True
-        )
-
-    finally:
-
-        logger.info(
-            "Stopping health server..."
-        )
-
-        try:
-
-            health_server.shutdown()
-
-            health_server.server_close()
-
-        except Exception:
-
-            pass
-
-        logger.info(
-            "ZinoProSignalAI stopped."
-        )
-
-
-# ============================================================
-# PROGRAM ENTRY
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
-````
