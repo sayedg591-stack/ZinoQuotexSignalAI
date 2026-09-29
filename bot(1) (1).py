@@ -7,7 +7,6 @@ import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -16,7 +15,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 from google import genai
 from google.genai import types
 
@@ -28,10 +26,19 @@ from google.genai import types
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = os.getenv("OWNER_ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
 
-# Render يعطي PORT تلقائياً
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(
+    os.getenv("PORT", "10000")
+)
+
+
+# ============================================================
+# ENVIRONMENT CHECK
+# ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -57,11 +64,13 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger("ZinoProSignalAI")
+logger = logging.getLogger(
+    "ZinoProSignalAI"
+)
 
 
 # ============================================================
-# GEMINI
+# GEMINI CLIENT
 # ============================================================
 
 gemini = genai.Client(
@@ -73,7 +82,7 @@ gemini = genai.Client(
 # ALGERIA TIME
 # ============================================================
 
-SIGNAL_TZ = timezone(
+ALGERIA_TZ = timezone(
     timedelta(hours=1)
 )
 
@@ -85,10 +94,13 @@ SIGNAL_TZ = timezone(
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         try:
 
             if self.path == "/health":
-                body = b"ZinoProSignalAI is running"
+                body = (
+                    b"ZinoProSignalAI is running"
+                )
             else:
                 body = b"ZinoProSignalAI"
 
@@ -114,6 +126,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         except Exception:
+
             logger.exception(
                 "Health request error"
             )
@@ -126,23 +139,22 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_health_server():
+def create_health_server():
 
     logger.info(
-        "=================================================="
+        "Creating HTTP health server..."
     )
 
     logger.info(
-        "CREATING RENDER HEALTH SERVER"
-    )
-
-    logger.info(
-        "PORT=%s",
+        "Binding 0.0.0.0:%s",
         PORT
     )
 
     server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
+        (
+            "0.0.0.0",
+            PORT
+        ),
         HealthHandler
     )
 
@@ -170,7 +182,9 @@ def start_health_server():
     return server
 
 
-def run_health_server(server):
+def run_health_server(
+    server
+):
 
     try:
 
@@ -189,7 +203,9 @@ def run_health_server(server):
 # OWNER CHECK
 # ============================================================
 
-def is_owner(update: Update):
+def is_owner(
+    update: Update
+):
 
     if not update.effective_user:
         return False
@@ -201,7 +217,7 @@ def is_owner(update: Update):
 
 
 # ============================================================
-# START
+# START COMMAND
 # ============================================================
 
 async def start(
@@ -212,6 +228,7 @@ async def start(
     if not is_owner(update):
 
         if update.message:
+
             await update.message.reply_text(
                 "⛔ هذا البوت خاص."
             )
@@ -232,10 +249,10 @@ async def start(
 
 
 # ============================================================
-# GEMINI PROMPT
+# GEMINI ANALYSIS PROMPT
 # ============================================================
 
-ANALYSIS_PROMPT = r"""
+ANALYSIS_PROMPT = """
 أنت محرك التحليل الفني الرئيسي لبوت
 ZinoProSignalAI.
 
@@ -279,7 +296,6 @@ IMPORTANT
 10. Moving Averages
 
 إذا كان عامل غير ظاهر في الصورة:
-
 لا تخترع بياناته.
 
 ==================================================
@@ -485,7 +501,7 @@ ENTRY PRICE
 إذا كان السعر واضحاً:
 استخدمه.
 
-إذا لم يكن السعر واضحاً:
+إذا لم يكن واضحاً:
 استخدم أقرب سعر منطقي يمكن قراءته من الشارت.
 
 لا تخترع سعراً عشوائياً.
@@ -603,7 +619,9 @@ OUTPUT
 # JSON CLEANING
 # ============================================================
 
-def clean_json(text):
+def clean_json(
+    text
+):
 
     if not text:
         return ""
@@ -611,19 +629,24 @@ def clean_json(text):
     text = text.strip()
 
     if text.startswith("```json"):
-        text = text[7:]
+
+        text = text[
+            len("```json"):
+        ]
 
     elif text.startswith("```"):
+
         text = text[3:]
 
     if text.endswith("```"):
+
         text = text[:-3]
 
     return text.strip()
 
 
 # ============================================================
-# SCORE HELPERS
+# SAFE INTEGER
 # ============================================================
 
 def safe_int(
@@ -632,35 +655,52 @@ def safe_int(
 ):
 
     try:
+
         return int(
             float(value)
         )
 
     except Exception:
+
         return default
 
+
+# ============================================================
+# SCORE LIMITS
+# ============================================================
 
 SCORE_LIMITS = {
 
     "structure": 2,
+
     "breakout": 2,
+
     "liquidity": 1,
+
     "momentum": 2,
+
     "candle": 2,
+
     "rsi": 1,
+
     "summary": 2,
+
     "oscillators": 3,
+
     "moving_averages": 3,
 
 }
 
 
-def normalize_scores(scores):
+def normalize_scores(
+    scores
+):
 
     if not isinstance(
         scores,
         dict
     ):
+
         scores = {}
 
     result = {}
@@ -685,7 +725,9 @@ def normalize_scores(scores):
     return result
 
 
-def total_score(scores):
+def total_score(
+    scores
+):
 
     return sum(
         scores.get(
@@ -697,14 +739,16 @@ def total_score(scores):
 
 
 # ============================================================
-# GEMINI TEMPORARY ERROR
+# GEMINI TEMPORARY ERRORS
 # ============================================================
 
 def is_temporary_gemini_error(
     error
 ):
 
-    text = str(error).upper()
+    text = str(
+        error
+    ).upper()
 
     temporary_errors = [
 
@@ -764,11 +808,8 @@ async def request_gemini(
                 contents=[
 
                     types.Part.from_bytes(
-
                         data=image_bytes,
-
                         mime_type="image/jpeg"
-
                     ),
 
                     ANALYSIS_PROMPT
@@ -779,7 +820,9 @@ async def request_gemini(
 
                     temperature=0.05,
 
-                    response_mime_type="application/json"
+                    response_mime_type=(
+                        "application/json"
+                    )
 
                 )
 
@@ -798,7 +841,8 @@ async def request_gemini(
             last_error = error
 
             logger.error(
-                "Gemini request failed (%s/%s): %s",
+                "Gemini request failed "
+                "(%s/%s): %s",
                 attempt,
                 max_attempts,
                 error
@@ -812,7 +856,9 @@ async def request_gemini(
                 )
             ):
 
-                wait_seconds = attempt * 5
+                wait_seconds = (
+                    attempt * 5
+                )
 
                 logger.info(
                     "Temporary Gemini error. "
@@ -885,8 +931,13 @@ async def analyze_chart(
         )
     )
 
-    data["up_scores"] = up_scores
-    data["down_scores"] = down_scores
+    data["up_scores"] = (
+        up_scores
+    )
+
+    data["down_scores"] = (
+        down_scores
+    )
 
     up_total = total_score(
         up_scores
@@ -909,11 +960,16 @@ async def analyze_chart(
     ):
 
         if up_total >= down_total:
+
             direction = "UP"
+
         else:
+
             direction = "DOWN"
 
-    data["direction"] = direction
+    data["direction"] = (
+        direction
+    )
 
     confidence = safe_int(
         data.get(
@@ -928,7 +984,9 @@ async def analyze_chart(
     if confidence > 90:
         confidence = 90
 
-    data["confidence"] = confidence
+    data["confidence"] = (
+        confidence
+    )
 
     delay = safe_int(
         data.get(
@@ -944,7 +1002,9 @@ async def analyze_chart(
     if delay > 2:
         delay = 2
 
-    data["entry_delay_minutes"] = delay
+    data["entry_delay_minutes"] = (
+        delay
+    )
 
     data["asset"] = str(
         data.get(
@@ -997,11 +1057,12 @@ async def analyze_chart(
         analysis,
         dict
     ):
+
         analysis = {}
 
     normalized_analysis = {}
 
-    for key in [
+    analysis_keys = [
 
         "structure",
         "breakout",
@@ -1013,7 +1074,9 @@ async def analyze_chart(
         "oscillators",
         "moving_averages",
 
-    ]:
+    ]
+
+    for key in analysis_keys:
 
         normalized_analysis[key] = str(
             analysis.get(
@@ -1054,18 +1117,20 @@ def calculate_entry_time(
 ):
 
     base = received_at.astimezone(
-        SIGNAL_TZ
+        ALGERIA_TZ
     )
 
-    # Always enter on a future candle.
     entry_time = (
+
         base.replace(
             second=0,
             microsecond=0
         )
+
         + timedelta(
             minutes=1
         )
+
     )
 
     if delay_minutes > 0:
@@ -1133,11 +1198,15 @@ def format_signal(
 
     if delay == 0:
 
-        delay_text = "الشمعة القادمة"
+        delay_text = (
+            "الشمعة القادمة"
+        )
 
     elif delay == 1:
 
-        delay_text = "بعد 1 دقيقة"
+        delay_text = (
+            "بعد 1 دقيقة"
+        )
 
     else:
 
@@ -1155,27 +1224,36 @@ def format_signal(
 
         "━━━━━━━━━━━━━━━━━━\n"
 
-        f"📊 الأصل: {data['asset']}\n"
+        f"📊 الأصل: "
+        f"{data['asset']}\n"
 
-        f"⏱️ الفريم: {data['timeframe']}\n"
+        f"⏱️ الفريم: "
+        f"{data['timeframe']}\n"
 
-        f"🎯 الاتجاه: {direction_text}\n"
+        f"🎯 الاتجاه: "
+        f"{direction_text}\n"
 
-        f"🔥 الثقة: {data['confidence']}%\n"
-
-        "\n"
-
-        f"🟢 UP: {up_total}/18\n"
-
-        f"🔴 DOWN: {down_total}/18\n"
+        f"🔥 الثقة: "
+        f"{data['confidence']}%\n"
 
         "\n"
 
-        f"⏳ الدخول: {delay_text}\n"
+        f"🟢 UP: "
+        f"{up_total}/18\n"
 
-        f"🕐 الوقت: {time_text} الجزائر\n"
+        f"🔴 DOWN: "
+        f"{down_total}/18\n"
 
-        f"💰 سعر الدخول: {data['entry_price']}\n"
+        "\n"
+
+        f"⏳ الدخول: "
+        f"{delay_text}\n"
+
+        f"🕐 الوقت: "
+        f"{time_text} الجزائر\n"
+
+        f"💰 سعر الدخول: "
+        f"{data['entry_price']}\n"
 
         f"{cancel_text}\n"
 
@@ -1242,11 +1320,8 @@ async def handle_photo(
     if not update.message:
         return
 
-    # IMPORTANT:
-    # Save time immediately when Telegram receives
-    # the screenshot.
     received_at = datetime.now(
-        SIGNAL_TZ
+        ALGERIA_TZ
     )
 
     processing_message = (
@@ -1265,7 +1340,9 @@ async def handle_photo(
             )
         )
 
-        image_buffer = io.BytesIO()
+        image_buffer = (
+            io.BytesIO()
+        )
 
         await telegram_file.download_to_memory(
             image_buffer
@@ -1322,7 +1399,8 @@ async def handle_photo(
 
                 "❌ فشل تحليل الشارت.\n\n"
 
-                f"الخطأ:\n{error_text}\n\n"
+                f"الخطأ:\n"
+                f"{error_text}\n\n"
 
                 "💡 إذا كان الخطأ 503 أو 429 "
                 "سيتم إعادة المحاولة تلقائياً."
@@ -1374,7 +1452,7 @@ def main():
     )
 
     logger.info(
-        "Python process PID=%s",
+        "Process PID=%s",
         os.getpid()
     )
 
@@ -1383,13 +1461,13 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START HTTP SERVER FIRST
+    # START HEALTH SERVER FIRST
     # --------------------------------------------------------
 
     try:
 
         health_server = (
-            start_health_server()
+            create_health_server()
         )
 
     except Exception:
@@ -1420,7 +1498,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START TELEGRAM
+    # CREATE TELEGRAM APPLICATION
     # --------------------------------------------------------
 
     application = (
@@ -1451,6 +1529,10 @@ def main():
         "Telegram application starting..."
     )
 
+    # --------------------------------------------------------
+    # RUN TELEGRAM
+    # --------------------------------------------------------
+
     try:
 
         application.run_polling(
@@ -1479,7 +1561,7 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# PROGRAM ENTRY
 # ============================================================
 
 if __name__ == "__main__":
