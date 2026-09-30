@@ -26,7 +26,10 @@ from google.genai import types
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_RAW = os.getenv("OWNER_ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite",
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -59,7 +62,9 @@ logger = logging.getLogger("ZinoProSignalAI")
 # GEMINI
 # ============================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # ============================================================
@@ -83,6 +88,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             "text/plain; charset=utf-8",
         )
         self.end_headers()
+
         self.wfile.write(
             b"ZinoProSignalAI is running"
         )
@@ -100,7 +106,10 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-    port = int(os.getenv("PORT", "10000"))
+
+    port = int(
+        os.getenv("PORT", "10000")
+    )
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", port),
@@ -120,6 +129,7 @@ def start_web_server():
 # ============================================================
 
 def is_owner(update: Update) -> bool:
+
     return (
         update.effective_user is not None
         and update.effective_user.id == OWNER_ID
@@ -134,6 +144,7 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not is_owner(update):
         return
 
@@ -141,6 +152,13 @@ async def start_command(
         "🎓 ZinoProSignalAI\n\n"
         "📸 أرسل صورة الشارت مباشرة.\n"
         "سيبدأ التحليل تلقائيًا.\n\n"
+        "المؤشرات المعتمدة:\n"
+        "🟢 EMA 9\n"
+        "🔴 EMA 21\n"
+        "🟣 RSI 14\n"
+        "🟠 Williams %R 14\n"
+        "🔵 ADX 14 + DI 14\n"
+        "🟡 Keltner EMA 20 / ATR 10 / Multiplier 5\n\n"
         "الأوامر:\n"
         "/stats - الإحصائيات\n"
         "/win - تسجيل WIN\n"
@@ -153,15 +171,17 @@ async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not is_owner(update):
         return
 
     total = wins + losses
 
-    if total:
-        win_rate = wins / total * 100
-    else:
-        win_rate = 0
+    win_rate = (
+        wins / total * 100
+        if total
+        else 0
+    )
 
     await update.message.reply_text(
         "📊 ZinoProSignalAI Stats\n\n"
@@ -176,6 +196,7 @@ async def win_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     global wins
 
     if not is_owner(update):
@@ -184,7 +205,7 @@ async def win_command(
     wins += 1
 
     await update.message.reply_text(
-        f"🟢 WIN مسجلة\n\n"
+        "🟢 WIN مسجلة\n\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}"
     )
@@ -194,6 +215,7 @@ async def loss_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     global losses
 
     if not is_owner(update):
@@ -202,7 +224,7 @@ async def loss_command(
     losses += 1
 
     await update.message.reply_text(
-        f"🔴 LOSS مسجلة\n\n"
+        "🔴 LOSS مسجلة\n\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}"
     )
@@ -212,7 +234,9 @@ async def reset_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    global wins, losses
+
+    global wins
+    global losses
 
     if not is_owner(update):
         return
@@ -236,86 +260,236 @@ ANALYSIS_PROMPT = r"""
 
 ممنوع اختلاق أي معلومة غير ظاهرة بوضوح في الصورة.
 
-أولًا:
-اقرأ:
-- اسم الأصل إن كان ظاهرًا.
-- الفريم إن كان ظاهرًا.
-- السعر الحالي إن كان ظاهرًا.
-- آخر الشموع.
-- البنية السعرية.
+==================================================
+INDICATORS SETTINGS
+==================================================
 
-ركز على Price Action قبل المؤشرات.
+الشارت يفترض أن يحتوي على:
 
-حلل:
+1. EMA 9
+- Period = 9
+- لون أخضر
 
+2. EMA 21
+- Period = 21
+- لون أحمر
+
+3. RSI
+- Period = 14
+- Overbought = 70
+- Oversold = 30
+
+4. Williams %R
+- Period = 14
+- Overbought = -20
+- Oversold = -80
+
+5. ADX
+- ADX = 14
+- DI Length = 14
+
+6. Keltner Channel
+- EMA = 20
+- ATR = 10
+- Multiplier = 5
+
+لا تفترض أن أي مؤشر ظاهر لمجرد أن الإعدادات المفترضة موجودة.
+
+إذا كان المؤشر غير واضح أو غير ظاهر:
+اكتب "غير متاح".
+
+لا تخترع أي رقم.
+
+==================================================
+PRIORITY
+==================================================
+
+ترتيب أهمية التحليل:
+
+1. Price Action
+2. Structure
+3. Breakout / Retest
+4. Liquidity
+5. Momentum
+6. Candle
+7. EMA 9 / EMA 21
+8. RSI
+9. Williams %R
+10. Keltner Channel
+11. ADX / DI
+
+المؤشرات ليست بديلًا عن حركة السعر.
+
+لا تعطِ إشارة فقط لأن مؤشرًا واحدًا صاعد أو هابط.
+
+==================================================
 1. STRUCTURE
+==================================================
+
+حدد إن كان واضحًا:
+
 - Higher High
 - Higher Low
 - Lower High
 - Lower Low
-- الاتجاه أو التذبذب.
+- Trend
+- Range / Consolidation
 
+الاتجاه الصاعد يحتاج بنية Higher High / Higher Low أو دليل صاعد واضح.
+
+الاتجاه الهابط يحتاج بنية Lower High / Lower Low أو دليل هابط واضح.
+
+==================================================
 2. BREAKOUT
-- هل يوجد اختراق واضح؟
-- هل حصل إغلاق بعد الاختراق؟
-- هل يوجد Retest؟
-- لا تعتبر مجرد لمس المستوى اختراقًا.
+==================================================
 
-3. LIQUIDITY
-- مناطق سحب السيولة الظاهرة.
-- False Breakout إن كان واضحًا.
-- رفض سعري واضح.
-
-4. MOMENTUM
-- قوة الحركة الأخيرة.
-- تسارع أو ضعف الحركة.
-- مقارنة الشموع الأخيرة.
-
-5. CANDLE
 ابحث عن:
-- Engulfing
-- Pin Bar
-- Hammer
-- Shooting Star
+
+- Breakout واضح
+- Candle close بعد الاختراق
+- Retest
+- Breakout failure
+
+لا تعتبر مجرد لمس المستوى اختراقًا.
+
+==================================================
+3. LIQUIDITY
+==================================================
+
+ابحث عن:
+
+- Liquidity sweep
+- False breakout
 - Rejection
-- قوة الإغلاق.
+- أخذ قمة أو قاع قريب ثم انعكاس
 
-6. RSI
-إذا كان RSI ظاهرًا فقط:
-- افحص 70 / 30.
-- افحص الاتجاه.
-- لا تستخدم RSI وحده.
+استخدم فقط ما يظهر في الصورة.
 
-7. WILLIAMS %R
-إذا كان Williams %R ظاهرًا فقط:
-- افحص منطقة -20.
-- افحص منطقة -80.
-- راقب الخروج من منطقة التشبع.
-- لا تعتبر مجرد وصول المؤشر إلى -20 أو -80 إشارة دخول.
-- استخدمه كتأكيد لحركة السعر.
+==================================================
+4. MOMENTUM
+==================================================
 
-8. MOVING AVERAGES
-إذا كانت ظاهرة:
-- اتجاه السعر بالنسبة لها.
-- التقاطع إن كان واضحًا.
-- لا تخترع قيمًا غير موجودة.
+افحص:
 
+- قوة آخر الحركة
+- سرعة الحركة
+- حجم الشموع
+- استمرار أو ضعف الزخم
+- تسلسل الشموع
+
+==================================================
+5. CANDLE
+==================================================
+
+افحص:
+
+- Bullish engulfing
+- Bearish engulfing
+- Pin bar
+- Hammer
+- Shooting star
+- Rejection candle
+- قوة الإغلاق
+
+لا تعتبر شكلًا صغيرًا جدًا Pattern مؤكدًا.
+
+==================================================
+6. EMA 9 + EMA 21
+==================================================
+
+إذا ظهرا بوضوح:
+
+EMA 9 أخضر.
+EMA 21 أحمر.
+
+افحص:
+
+- EMA 9 فوق EMA 21
+- EMA 9 تحت EMA 21
+- تقاطع واضح
+- ميل الخطوط
+- موقع السعر بالنسبة لهما
+
+لا تستخدم التقاطع وحده.
+
+==================================================
+7. RSI 14
+==================================================
+
+إذا كان RSI ظاهرًا بوضوح:
+
+- فوق 70 = منطقة تشبع شرائي
+- تحت 30 = منطقة تشبع بيعي
+- افحص اتجاه RSI
+- افحص divergence فقط إذا كان واضحًا جدًا
+
+الوصول إلى 70 أو 30 وحده ليس دخولًا.
+
+==================================================
+8. WILLIAMS %R 14
+==================================================
+
+إذا كان ظاهرًا:
+
+- فوق -20 = تشبع شرائي
+- تحت -80 = تشبع بيعي
+- راقب الخروج من منطقة التشبع
+- راقب اتجاه المؤشر
+
+مجرد لمس -20 أو -80 لا يكفي.
+
+Williams %R عامل تأكيد فقط.
+
+==================================================
 9. KELTNER CHANNEL
-إذا كان ظاهرًا:
-- لمس/اختراق الحد.
-- rejection.
-- استمرار الاتجاه.
-- لا تعتمد عليه منفردًا.
+==================================================
 
-10. ADX
+الإعداد:
+
+EMA 20
+ATR 10
+Multiplier 5
+
 إذا كان ظاهرًا:
-- قوة الاتجاه.
-- DI+ / DI- إذا كانت واضحة.
-- لا تستخدم رقمًا غير ظاهر.
+
+افحص:
+
+- السعر بالنسبة للحد العلوي
+- السعر بالنسبة للحد الأوسط
+- السعر بالنسبة للحد السفلي
+- rejection
+- breakout
+- استمرار الاتجاه
+
+لا تعتمد على Keltner وحده.
 
 ==================================================
-SCORING
+10. ADX + DI
 ==================================================
+
+الإعداد:
+
+ADX = 14
+DI Length = 14
+
+إذا ظهر بوضوح:
+
+افحص:
+
+- قوة الاتجاه
+- DI+ مقابل DI-
+- اتجاه ADX
+- هل الحركة اتجاهية أم ضعيفة
+
+لا تخترع قيمة ADX.
+
+لا تستخدم ADX وحده.
+
+==================================================
+SCORING SYSTEM
+==================================================
+
+المجموع = 18 نقطة.
 
 Structure = 2
 Breakout = 2
@@ -327,81 +501,237 @@ Summary = 2
 Oscillators = 2
 Moving Averages = 2
 
-المجموع = 18.
-
-Williams %R يستخدم كعامل تأكيد داخل Oscillators.
-لا تضف نقاطًا وهمية بسبب عدم ظهور المؤشر.
-
-احسب:
-
-UP score
-DOWN score
-
-كل نقطة يجب أن تكون مدعومة بدليل ظاهر.
+TOTAL = 18
 
 ==================================================
-الاتجاه
+SCORING RULES
 ==================================================
 
-اختر:
+لكل عنصر:
+
+Structure:
+0 إلى 2
+
+Breakout:
+0 إلى 2
+
+Liquidity:
+0 إلى 1
+
+Momentum:
+0 إلى 2
+
+Candle:
+0 إلى 2
+
+RSI:
+0 إلى 1
+
+Summary:
+0 إلى 2
+
+Oscillators:
+0 إلى 2
+
+Moving Averages:
+0 إلى 2
+
+كل نقطة يجب أن تكون مدعومة بدليل من الصورة.
+
+لا تمنح النقاط لمؤشر غير ظاهر.
+
+==================================================
+OSCILLATORS
+==================================================
+
+Oscillators = 2 نقاط.
+
+استخدم داخلها:
+
+- RSI
+- Williams %R
+- ADX/DI عند الحاجة كتأكيد للاتجاه
+
+لا تعطي نقطتين تلقائيًا.
+
+إذا كانت المؤشرات متعارضة، خفّض نقاط Oscillators.
+
+==================================================
+MOVING AVERAGES
+==================================================
+
+Moving Averages = 2 نقاط.
+
+استخدم:
+
+EMA 9
+EMA 21
+
+إذا كان EMA 9 فوق EMA 21 مع ميل صاعد وتأكيد سعري:
+يميل إلى UP.
+
+إذا كان EMA 9 تحت EMA 21 مع ميل هابط وتأكيد سعري:
+يميل إلى DOWN.
+
+التقاطع وحده لا يكفي.
+
+==================================================
+SUMMARY
+==================================================
+
+Summary = 2 نقاط.
+
+لخّص توافق:
+
+Structure
+Momentum
+Candle
+Breakout
+Indicators
+
+إذا كان هناك توافق قوي وواضح:
+يمكن إعطاء 2.
+
+إذا كان التوافق جزئيًا:
+1.
+
+إذا لم يوجد دعم واضح:
+0.
+
+==================================================
+DIRECTION
+==================================================
+
+اختر اتجاهًا واحدًا فقط:
+
 UP
 أو
 DOWN
 
-لا تعط:
+ممنوع:
+
 WAIT
 NO SIGNAL
 NEUTRAL
 
-لكن إذا كانت الصورة ضعيفة أو غير واضحة:
-- اختر الاتجاه الذي لديه أدلة أكثر.
-- اخفض confidence.
-- لا تدّعي أن الإشارة قوية.
+إذا كانت الأدلة ضعيفة أو متعارضة:
 
-لا تجعل confidence مرتفعًا فقط لأن UP score أو DOWN score مرتفع.
+اختر الاتجاه الذي لديه أدلة أكثر.
+
+لكن اخفض confidence.
+
+لا ترفع confidence فقط بسبب ارتفاع score.
 
 ==================================================
-التوقيت
+CONFIDENCE
 ==================================================
 
-استخدم توقيت الجزائر:
-Africa/Algiers
+Confidence تقدير لقوة الأدلة الظاهرة في الصورة فقط.
 
-إذا كان الفريم:
-1M → دخول بعد حوالي دقيقة.
-2M → دخول بعد حوالي دقيقتين.
-3M → دخول بعد حوالي 3 دقائق.
+لا تجعل confidence يساوي score بشكل آلي.
 
-لا تغير الفريم الظاهر في الصورة.
+لا تعطِ 90% أو أكثر إلا إذا كانت الصورة تحتوي على توافق واضح جدًا بين:
 
-لا تجعل وقت الدخول مساويًا لوقت رفع الصورة.
+Structure
+Price Action
+Momentum
+Candle
+EMA
+والتأكيدات الأخرى.
+
+إذا كانت المؤشرات متعارضة:
+اخفض confidence.
 
 ==================================================
 ENTRY
 ==================================================
 
-استخرج Entry Price من السعر الظاهر.
+استخرج:
 
-Cancellation Level يجب أن يكون مرتبطًا بالبنية السعرية الأخيرة.
+- Entry Price
+- Timeframe
 
-لا تضع Cancellation Level فوق Entry Price في حالة DOWN إذا كان ذلك غير منطقي.
+من الصورة إذا كانا واضحين.
 
-ولا تضعه تحت Entry Price في حالة UP إذا كان ذلك غير منطقي.
+إذا كان السعر غير واضح:
+اكتب "غير واضح".
+
+لا تخترع سعرًا.
 
 ==================================================
-مهم جدًا
+ENTRY DELAY
+==================================================
+
+إذا كان الفريم:
+
+1M:
+entry_delay_minutes = 1
+
+2M:
+entry_delay_minutes = 2
+
+3M:
+entry_delay_minutes = 3
+
+إذا كان فريم آخر:
+استخدم عدد دقائق الفريم إذا كان واضحًا.
+
+لا تغير الفريم الموجود في الصورة.
+
+==================================================
+ENTRY TIME
+==================================================
+
+التوقيت النهائي سيتم حسابه بواسطة البرنامج بتوقيت الجزائر:
+
+Africa/Algiers
+
+لا تحسب Entry Time بنفسك.
+
+أرسل فقط:
+
+entry_delay_minutes
+
+==================================================
+CANCELLATION
+==================================================
+
+Cancellation Level يجب أن يكون منطقيًا مع الاتجاه والبنية الأخيرة.
+
+في UP:
+عادة يكون مستوى الإلغاء أسفل البنية أو القاع الأخير إذا كان واضحًا.
+
+في DOWN:
+عادة يكون مستوى الإلغاء فوق البنية أو القمة الأخيرة إذا كان واضحًا.
+
+لا تضع مستوى عشوائي.
+
+إذا لم يمكن تحديده:
+اكتب "غير واضح".
+
+==================================================
+IMPORTANT
 ==================================================
 
 لا تستخدم بيانات السوق الحية.
-لا تدّعي أنك ترى شموعًا غير موجودة.
-لا تخترع RSI.
-لا تخترع Williams %R.
-لا تخترع ADX.
-لا تخترع Keltner.
-لا تخترع Moving Average.
 
-إذا كان المؤشر غير ظاهر:
-اجعل قيمته "غير متاح".
+لا تستخدم الإنترنت.
+
+لا تدّعي أنك ترى شموعًا غير موجودة.
+
+لا تخترع:
+
+RSI
+Williams %R
+ADX
+DI
+Keltner
+EMA
+السعر
+الفريم
+
+إذا لم يظهر المؤشر:
+"غير متاح"
 
 ==================================================
 OUTPUT
@@ -409,7 +739,7 @@ OUTPUT
 
 أخرج JSON فقط.
 
-الشكل:
+يجب أن يكون الشكل:
 
 {
   "asset": "EUR/USD",
@@ -417,25 +747,25 @@ OUTPUT
   "direction": "DOWN",
   "confidence": 76,
   "up_score": 5,
-  "down_score": 14,
+  "down_score": 13,
   "entry_delay_minutes": 2,
   "entry_price": "1.13460",
   "cancellation_level": "1.13490",
   "cancellation_text": "إلغاء إذا أغلقت شمعة فوق 1.13490",
   "structure": "Lower High + Lower Low",
   "breakout": "Bearish breakout confirmed",
-  "liquidity": "Bearish rejection",
+  "liquidity": "Bearish liquidity sweep",
   "momentum": "Negative",
   "candle": "Bearish rejection",
-  "rsi": "غير متاح",
+  "rsi": "Below 30",
   "williams_r": "خرج من منطقة التشبع الشرائي",
-  "moving_averages": "Bearish",
-  "keltner": "غير متاح",
-  "adx": "غير متاح",
-  "reason": "اتجاه هابط مع رفض سعري وزخم سلبي وتأكيد من Williams %R"
+  "moving_averages": "EMA 9 below EMA 21",
+  "keltner": "Bearish rejection from upper area",
+  "adx": "ADX 14 with DI- stronger than DI+",
+  "reason": "بنية هابطة مع زخم سلبي ورفض سعري وتأكيد من EMA وWilliams %R"
 }
 
-لا تضف أي نص خارج JSON.
+ممنوع إضافة نص خارج JSON.
 """
 
 
@@ -448,12 +778,16 @@ def clean_json(text: str) -> str:
     text = text.strip()
 
     if text.startswith("```"):
+
         lines = text.splitlines()
 
         if lines:
             lines = lines[1:]
 
-        if lines and lines[-1].strip() == "```":
+        if (
+            lines
+            and lines[-1].strip() == "```"
+        ):
             lines = lines[:-1]
 
         text = "\n".join(lines).strip()
@@ -465,7 +799,9 @@ def clean_json(text: str) -> str:
 # GEMINI ANALYSIS
 # ============================================================
 
-async def analyze_chart(image_bytes: bytes):
+async def analyze_chart(
+    image_bytes: bytes,
+):
 
     image_part = types.Part.from_bytes(
         data=image_bytes,
@@ -489,42 +825,108 @@ async def analyze_chart(image_bytes: bytes):
             "Gemini returned an empty response"
         )
 
-    raw = clean_json(response.text)
+    raw = clean_json(
+        response.text
+    )
 
-    return json.loads(raw)
+    data = json.loads(raw)
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Gemini response is not a JSON object"
+        )
+
+    return data
+
+
+# ============================================================
+# SAFE SCORE
+# ============================================================
+
+def safe_score(
+    value,
+) -> int:
+
+    try:
+        number = int(value)
+    except Exception:
+        return 0
+
+    return max(
+        0,
+        min(18, number),
+    )
 
 
 # ============================================================
 # SIGNAL FORMAT
 # ============================================================
 
-def format_signal(data: dict) -> str:
+def format_signal(
+    data: dict,
+) -> str:
 
     asset = str(
-        data.get("asset", "غير واضح")
+        data.get(
+            "asset",
+            "غير واضح",
+        )
     )
 
     timeframe = str(
-        data.get("timeframe", "غير واضح")
+        data.get(
+            "timeframe",
+            "غير واضح",
+        )
     )
 
     direction = str(
-        data.get("direction", "UP")
+        data.get(
+            "direction",
+            "UP",
+        )
     ).upper()
+
+    if direction not in (
+        "UP",
+        "DOWN",
+    ):
+        direction = "UP"
 
     confidence = data.get(
         "confidence",
         0,
     )
 
-    up_score = data.get(
-        "up_score",
-        0,
+    try:
+        confidence = float(
+            confidence
+        )
+
+        confidence = max(
+            0,
+            min(100, confidence),
+        )
+
+        confidence_text = (
+            f"{confidence:.0f}%"
+        )
+
+    except Exception:
+        confidence_text = "غير واضح"
+
+    up_score = safe_score(
+        data.get(
+            "up_score",
+            0,
+        )
     )
 
-    down_score = data.get(
-        "down_score",
-        0,
+    down_score = safe_score(
+        data.get(
+            "down_score",
+            0,
+        )
     )
 
     delay = data.get(
@@ -533,12 +935,15 @@ def format_signal(data: dict) -> str:
     )
 
     try:
-        delay = max(
-            1,
-            int(delay),
-        )
+        delay = int(delay)
+
     except Exception:
         delay = 1
+
+    delay = max(
+        1,
+        min(60, delay),
+    )
 
     entry_price = str(
         data.get(
@@ -557,9 +962,33 @@ def format_signal(data: dict) -> str:
     cancellation_text = str(
         data.get(
             "cancellation_text",
-            f"إلغاء إذا أغلقت شمعة عند {cancellation_level}",
+            "",
         )
-    )
+    ).strip()
+
+    if not cancellation_text:
+
+        if (
+            cancellation_level
+            != "غير واضح"
+        ):
+
+            if direction == "DOWN":
+                cancellation_text = (
+                    "إلغاء إذا أغلقت شمعة فوق "
+                    f"{cancellation_level}"
+                )
+
+            else:
+                cancellation_text = (
+                    "إلغاء إذا أغلقت شمعة تحت "
+                    f"{cancellation_level}"
+                )
+
+        else:
+            cancellation_text = (
+                "إلغاء إذا أغلقت شمعة عكس الاتجاه"
+            )
 
     reason = str(
         data.get(
@@ -572,8 +1001,9 @@ def format_signal(data: dict) -> str:
         ZoneInfo("Africa/Algiers")
     )
 
-    entry_time = now + timedelta(
-        minutes=delay
+    entry_time = (
+        now
+        + timedelta(minutes=delay)
     )
 
     if direction == "DOWN":
@@ -585,7 +1015,7 @@ def format_signal(data: dict) -> str:
         "🎓 ZinoProSignalAI\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 {asset} | {timeframe}\n"
-        f"🎯 Confidence: {confidence}%\n\n"
+        f"🎯 Confidence: {confidence_text}\n\n"
         f"📌 Decision: {direction_text}\n"
         f"🟢 UP Score: {up_score}/18\n"
         f"🔴 DOWN Score: {down_score}/18\n\n"
@@ -618,15 +1048,20 @@ async def photo_handler(
 
     processing = await update.message.reply_text(
         "🔎 تحليل الشارت...\n"
-        "Price Action + Structure + Williams %R + المؤشرات الظاهرة"
+        "Price Action + Structure + "
+        "EMA 9/21 + RSI 14 + "
+        "Williams %R 14 + ADX/DI 14 + "
+        "Keltner 20/10/5"
     )
 
     try:
 
         photo = update.message.photo[-1]
 
-        telegram_file = await context.bot.get_file(
-            photo.file_id
+        telegram_file = (
+            await context.bot.get_file(
+                photo.file_id
+            )
         )
 
         image_buffer = io.BytesIO()
@@ -635,7 +1070,9 @@ async def photo_handler(
             image_buffer
         )
 
-        image_bytes = image_buffer.getvalue()
+        image_bytes = (
+            image_buffer.getvalue()
+        )
 
         if not image_bytes:
             raise RuntimeError(
