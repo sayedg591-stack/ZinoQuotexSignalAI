@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -26,10 +27,13 @@ from google.genai import types
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_RAW = os.getenv("OWNER_ID")
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite",
 )
+
+MT4_API_KEY = os.getenv("MT4_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -39,6 +43,9 @@ if not GEMINI_API_KEY:
 
 if not OWNER_ID_RAW:
     raise RuntimeError("OWNER_ID is missing")
+
+if not MT4_API_KEY:
+    raise RuntimeError("MT4_API_KEY is missing")
 
 try:
     OWNER_ID = int(OWNER_ID_RAW)
@@ -76,48 +83,408 @@ losses = 0
 
 
 # ============================================================
+# MT4 DATA STORAGE
+# ============================================================
+
+mt4_data = {}
+
+mt4_lock = threading.Lock()
+
+
+# ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
-        self.send_response(200)
+    def send_json(
+        self,
+        status_code,
+        data,
+    ):
+
+        body = json.dumps(
+            data,
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        self.send_response(status_code)
+
         self.send_header(
             "Content-Type",
-            "text/plain; charset=utf-8",
+            "application/json; charset=utf-8",
         )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*",
+        )
+
         self.end_headers()
 
-        self.wfile.write(
-            b"ZinoProSignalAI is running"
+        self.wfile.write(body)
+
+    def do_GET(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
+
+        if path == "/":
+
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "ZinoProSignalAI",
+                },
+            )
+
+            return
+
+        if path == "/health":
+
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "ZinoProSignalAI",
+                },
+            )
+
+            return
+
+        if path == "/mt4":
+
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "endpoint": "/mt4",
+                    "message": "MT4 endpoint is ready",
+                },
+            )
+
+            return
+
+        self.send_json(
+            404,
+            {
+                "error": "Not found"
+            },
         )
 
     def do_HEAD(self):
+
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8",
         )
+
         self.end_headers()
 
-    def log_message(self, format, *args):
+    def do_POST(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
+
+        if path != "/mt4":
+
+            self.send_json(
+                404,
+                {
+                    "error": "Not found"
+                },
+            )
+
+            return
+
+        try:
+
+            content_length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0",
+                )
+            )
+
+        except Exception:
+
+            self.send_json(
+                400,
+                {
+                    "error": "Invalid Content-Length"
+                },
+            )
+
+            return
+
+        if content_length <= 0:
+
+            self.send_json(
+                400,
+                {
+                    "error": "Empty request"
+                },
+            )
+
+            return
+
+        if content_length > 2_000_000:
+
+            self.send_json(
+                413,
+                {
+                    "error": "Request too large"
+                },
+            )
+
+            return
+
+        try:
+
+            raw_body = self.rfile.read(
+                content_length
+            )
+
+            body = raw_body.decode(
+                "utf-8"
+            )
+
+            data = json.loads(body)
+
+        except Exception as error:
+
+            logger.error(
+                "Invalid MT4 JSON: %s",
+                error,
+            )
+
+            self.send_json(
+                400,
+                {
+                    "error": "Invalid JSON"
+                },
+            )
+
+            return
+
+        if not isinstance(data, dict):
+
+            self.send_json(
+                400,
+                {
+                    "error": "JSON must be an object"
+                },
+            )
+
+            return
+
+        received_key = str(
+            data.get(
+                "api_key",
+                "",
+            )
+        )
+
+        if received_key != MT4_API_KEY:
+
+            logger.warning(
+                "Unauthorized MT4 request"
+            )
+
+            self.send_json(
+                401,
+                {
+                    "error": "Unauthorized"
+                },
+            )
+
+            return
+
+        symbol = str(
+            data.get(
+                "symbol",
+                "",
+            )
+        ).strip().upper()
+
+        timeframe = str(
+            data.get(
+                "timeframe",
+                "",
+            )
+        ).strip().upper()
+
+        candles = data.get(
+            "candles",
+            [],
+        )
+
+        if not symbol:
+
+            self.send_json(
+                400,
+                {
+                    "error": "symbol is required"
+                },
+            )
+
+            return
+
+        if not timeframe:
+
+            self.send_json(
+                400,
+                {
+                    "error": "timeframe is required"
+                },
+            )
+
+            return
+
+        if not isinstance(
+            candles,
+            list,
+        ):
+
+            self.send_json(
+                400,
+                {
+                    "error": "candles must be a list"
+                },
+            )
+
+            return
+
+        if len(candles) > 200:
+
+            candles = candles[:200]
+
+        clean_candles = []
+
+        for candle in candles:
+
+            if not isinstance(
+                candle,
+                dict,
+            ):
+                continue
+
+            clean_candles.append(
+                {
+                    "time": candle.get(
+                        "time",
+                        "",
+                    ),
+                    "open": candle.get(
+                        "open",
+                        None,
+                    ),
+                    "high": candle.get(
+                        "high",
+                        None,
+                    ),
+                    "low": candle.get(
+                        "low",
+                        None,
+                    ),
+                    "close": candle.get(
+                        "close",
+                        None,
+                    ),
+                    "volume": candle.get(
+                        "volume",
+                        0,
+                    ),
+                }
+            )
+
+        stored_data = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "price": data.get(
+                "price",
+                None,
+            ),
+            "digits": data.get(
+                "digits",
+                None,
+            ),
+            "server_time": data.get(
+                "server_time",
+                "",
+            ),
+            "received_at": datetime.now(
+                ZoneInfo("Africa/Algiers")
+            ).isoformat(),
+            "candles": clean_candles,
+        }
+
+        key = (
+            f"{symbol}:{timeframe}"
+        )
+
+        with mt4_lock:
+
+            mt4_data[key] = stored_data
+
+        logger.info(
+            "MT4 data received: %s | %s | candles=%s",
+            symbol,
+            timeframe,
+            len(clean_candles),
+        )
+
+        self.send_json(
+            200,
+            {
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candles": len(clean_candles),
+            },
+        )
+
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
         return
 
 
 def start_web_server():
 
     port = int(
-        os.getenv("PORT", "10000")
+        os.getenv(
+            "PORT",
+            "10000",
+        )
     )
 
     server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
+        (
+            "0.0.0.0",
+            port,
+        ),
         HealthHandler,
     )
 
     logger.info(
-        "Health server started on port %s",
+        "HTTP server started on port %s",
         port,
     )
 
@@ -128,16 +495,19 @@ def start_web_server():
 # OWNER
 # ============================================================
 
-def is_owner(update: Update) -> bool:
+def is_owner(
+    update: Update,
+) -> bool:
 
     return (
         update.effective_user is not None
-        and update.effective_user.id == OWNER_ID
+        and update.effective_user.id
+        == OWNER_ID
     )
 
 
 # ============================================================
-# COMMANDS
+# START COMMAND
 # ============================================================
 
 async def start_command(
@@ -150,22 +520,28 @@ async def start_command(
 
     await update.message.reply_text(
         "🎓 ZinoProSignalAI\n\n"
-        "📸 أرسل صورة الشارت مباشرة.\n"
-        "سيبدأ التحليل تلقائيًا.\n\n"
-        "المؤشرات المعتمدة:\n"
-        "🟢 EMA 9\n"
-        "🔴 EMA 21\n"
-        "🟣 RSI 14\n"
-        "🟠 Williams %R 14\n"
-        "🔵 ADX 14 + DI 14\n"
-        "🟡 Keltner EMA 20 / ATR 10 / Multiplier 5\n\n"
+        "📸 أرسل صورة الشارت للتحليل بالصورة.\n\n"
+        "📡 أو استخدم MT4 لإرسال بيانات الشموع.\n"
+        "مثال:\n"
+        "/analyze EURUSD M1\n\n"
         "الأوامر:\n"
         "/stats - الإحصائيات\n"
         "/win - تسجيل WIN\n"
         "/loss - تسجيل LOSS\n"
-        "/reset - تصفير الإحصائيات"
+        "/reset - تصفير الإحصائيات\n"
+        "/mt4status - حالة بيانات MT4\n\n"
+        "تحليل الصورة يعتمد على:\n"
+        "EMA 9 / EMA 21\n"
+        "RSI 14\n"
+        "Williams %R 14\n"
+        "ADX 14 + DI 14\n"
+        "Keltner EMA 20 / ATR 10 / Multiplier 5"
     )
 
+
+# ============================================================
+# STATS
+# ============================================================
 
 async def stats_command(
     update: Update,
@@ -192,6 +568,10 @@ async def stats_command(
     )
 
 
+# ============================================================
+# WIN
+# ============================================================
+
 async def win_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -211,6 +591,10 @@ async def win_command(
     )
 
 
+# ============================================================
+# LOSS
+# ============================================================
+
 async def loss_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -229,6 +613,10 @@ async def loss_command(
         f"Losses: {losses}"
     )
 
+
+# ============================================================
+# RESET
+# ============================================================
 
 async def reset_command(
     update: Update,
@@ -250,7 +638,1027 @@ async def reset_command(
 
 
 # ============================================================
-# ANALYSIS PROMPT
+# MT4 STATUS
+# ============================================================
+
+async def mt4status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_owner(update):
+        return
+
+    with mt4_lock:
+
+        if not mt4_data:
+
+            await update.message.reply_text(
+                "📡 لا توجد بيانات MT4 حتى الآن."
+            )
+
+            return
+
+        items = list(
+            mt4_data.values()
+        )
+
+    items.sort(
+        key=lambda item: item.get(
+            "received_at",
+            "",
+        ),
+        reverse=True,
+    )
+
+    lines = [
+        "📡 MT4 Data Status",
+        "",
+    ]
+
+    for item in items[:10]:
+
+        symbol = item.get(
+            "symbol",
+            "UNKNOWN",
+        )
+
+        timeframe = item.get(
+            "timeframe",
+            "UNKNOWN",
+        )
+
+        candles = len(
+            item.get(
+                "candles",
+                [],
+            )
+        )
+
+        received = item.get(
+            "received_at",
+            "",
+        )
+
+        lines.append(
+            f"• {symbol} {timeframe}"
+        )
+
+        lines.append(
+            f"  Candles: {candles}"
+        )
+
+        lines.append(
+            f"  Received: {received}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# ANALYSIS PROMPT FOR MT4
+# ============================================================
+
+MT4_ANALYSIS_PROMPT = r"""
+أنت ZinoProSignalAI، محلل فني للبيانات الرقمية القادمة من MT4.
+
+أنت لا ترى صورة.
+
+أنت تعتمد فقط على بيانات OHLC والوقت والحجم والسعر الحالي التي أرسلها MT4.
+
+ممنوع اختلاق أي قيمة غير موجودة.
+
+==================================================
+DATA
+==================================================
+
+البيانات تحتوي على شموع مرتبة من الأقدم إلى الأحدث.
+
+كل شمعة تحتوي:
+
+time
+open
+high
+low
+close
+volume
+
+==================================================
+IMPORTANT
+==================================================
+
+استخدم آخر الشموع في التحليل.
+
+لا تستخدم الإنترنت.
+
+لا تفترض سعرًا غير موجود.
+
+لا تخترع RSI أو ADX أو Keltner أو EMA.
+
+إذا لم يتم إرسال قيم المؤشرات، يجب حسابها رياضيًا من بيانات OHLC إذا كانت البيانات كافية.
+
+إذا لم تكن البيانات كافية لحساب مؤشر معين:
+اكتب "غير متاح".
+
+==================================================
+INDICATORS
+==================================================
+
+EMA 9
+EMA 21
+
+RSI 14
+
+Williams %R 14
+
+ADX 14 + DI 14
+
+Keltner Channel:
+
+EMA 20
+ATR 10
+Multiplier 5
+
+==================================================
+PRICE ACTION
+==================================================
+
+حلل:
+
+- Higher High
+- Higher Low
+- Lower High
+- Lower Low
+- Trend
+- Range
+- Consolidation
+
+الاتجاه الصاعد يحتاج بنية صاعدة واضحة.
+
+الاتجاه الهابط يحتاج بنية هابطة واضحة.
+
+==================================================
+BREAKOUT
+==================================================
+
+ابحث عن:
+
+- Breakout
+- Candle close بعد الاختراق
+- Retest
+- Failed breakout
+
+لا تعتبر مجرد لمس مستوى اختراقًا.
+
+==================================================
+LIQUIDITY
+==================================================
+
+ابحث عن:
+
+- Sweep
+- False breakout
+- أخذ قمة
+- أخذ قاع
+- Rejection
+
+==================================================
+MOMENTUM
+==================================================
+
+حلل:
+
+- حجم الشموع
+- سرعة الحركة
+- استمرار الحركة
+- ضعف الحركة
+- تسلسل الإغلاقات
+
+==================================================
+CANDLE
+==================================================
+
+حلل آخر الشموع:
+
+- Bullish engulfing
+- Bearish engulfing
+- Pin bar
+- Hammer
+- Shooting star
+- Rejection
+- قوة الإغلاق
+
+==================================================
+EMA
+==================================================
+
+EMA 9 و EMA 21.
+
+افحص:
+
+- EMA 9 فوق EMA 21
+- EMA 9 تحت EMA 21
+- التقاطع
+- الميل
+- موقع السعر
+
+التقاطع وحده لا يكفي.
+
+==================================================
+RSI
+==================================================
+
+RSI 14.
+
+70 = تشبع شرائي.
+
+30 = تشبع بيعي.
+
+حلل:
+
+- القيمة
+- الاتجاه
+- divergence إذا كان واضحًا
+
+لا تجعل RSI وحده سبب الدخول.
+
+==================================================
+WILLIAMS
+==================================================
+
+Williams %R 14.
+
+-20 = منطقة تشبع شرائي.
+
+-80 = منطقة تشبع بيعي.
+
+راقب:
+
+- الدخول إلى التشبع
+- الخروج من التشبع
+- اتجاه المؤشر
+
+==================================================
+KELTNER
+==================================================
+
+EMA 20
+
+ATR 10
+
+Multiplier 5
+
+احسب القناة إذا كانت البيانات كافية.
+
+راقب:
+
+- Upper
+- Middle
+- Lower
+- Rejection
+- Breakout
+- Continuation
+
+==================================================
+ADX
+==================================================
+
+ADX 14.
+
+DI Length 14.
+
+راقب:
+
+- قوة الاتجاه
+- DI+
+- DI-
+- ADX
+
+لا تستخدم ADX وحده.
+
+==================================================
+SCORING
+==================================================
+
+المجموع = 18.
+
+Structure = 2
+
+Breakout = 2
+
+Liquidity = 1
+
+Momentum = 2
+
+Candle = 2
+
+RSI = 1
+
+Summary = 2
+
+Oscillators = 2
+
+Moving Averages = 2
+
+TOTAL = 18
+
+==================================================
+DIRECTION
+==================================================
+
+اختر اتجاهًا واحدًا:
+
+UP
+
+أو
+
+DOWN
+
+ممنوع:
+
+WAIT
+
+NO SIGNAL
+
+NEUTRAL
+
+إذا كانت الأدلة ضعيفة:
+
+اختر الاتجاه الذي لديه دعم أكبر.
+
+لكن اخفض confidence.
+
+==================================================
+BEST ENTRY TIME
+==================================================
+
+هذه نقطة مهمة جدًا.
+
+لا تعطِ وقت دخول عشوائيًا.
+
+حلل الشموع الحالية وحدد هل الأفضل:
+
+- الدخول عند بداية الشمعة القادمة
+- الانتظار حتى إغلاق الشمعة الحالية
+- الانتظار حتى Retest
+- الانتظار حتى تأكيد Breakout
+
+ثم حدد عدد الدقائق من الوقت الحالي.
+
+إذا كان الفريم:
+
+M1 = الشمعة التالية بعد دقيقة
+
+M2 = الشمعة التالية بعد دقيقتين
+
+M3 = الشمعة التالية بعد 3 دقائق
+
+M5 = الشمعة التالية بعد 5 دقائق
+
+لكن إذا كان هناك سبب فني واضح للانتظار أكثر، يمكن زيادة delay.
+
+يجب أن يكون:
+
+entry_delay_minutes
+
+رقمًا صحيحًا.
+
+==================================================
+ENTRY PRICE
+==================================================
+
+استخدم السعر الحالي أو مستوى الدخول المنطقي بناءً على البيانات.
+
+لا تخترع سعرًا.
+
+==================================================
+CANCELLATION
+==================================================
+
+UP:
+
+الإلغاء عادة تحت القاع البنيوي الأخير.
+
+DOWN:
+
+الإلغاء عادة فوق القمة البنيوية الأخيرة.
+
+يجب أن يكون المستوى مبنيًا على بيانات فعلية.
+
+==================================================
+CONFIDENCE
+==================================================
+
+Confidence ليست مساوية للـscore تلقائيًا.
+
+إذا كان:
+
+Structure + Price Action + Momentum + Candle
+
+متوافقة بقوة:
+
+ارفع confidence.
+
+إذا كانت المؤشرات متعارضة:
+
+اخفض confidence.
+
+==================================================
+OUTPUT
+==================================================
+
+أخرج JSON فقط.
+
+الشكل:
+
+{
+  "asset": "EURUSD",
+  "timeframe": "M1",
+  "direction": "UP",
+  "confidence": 82,
+  "up_score": 15,
+  "down_score": 5,
+  "entry_delay_minutes": 1,
+  "entry_price": "1.17452",
+  "cancellation_level": "1.17430",
+  "cancellation_text": "إلغاء إذا أغلقت شمعة تحت 1.17430",
+  "structure": "Higher High + Higher Low",
+  "breakout": "Bullish breakout confirmed",
+  "liquidity": "Bullish liquidity sweep",
+  "momentum": "Positive",
+  "candle": "Bullish continuation",
+  "rsi": "61",
+  "williams_r": "-34",
+  "moving_averages": "EMA 9 above EMA 21",
+  "keltner": "Price above middle band",
+  "adx": "ADX rising with DI+ stronger",
+  "reason": "بنية صاعدة مع زخم إيجابي وتأكيد من المتوسطات"
+}
+
+ممنوع إضافة نص خارج JSON.
+"""
+
+
+# ============================================================
+# GET MT4 DATA
+# ============================================================
+
+def get_mt4_data(
+    symbol,
+    timeframe,
+):
+
+    key = (
+        f"{symbol.upper()}:{timeframe.upper()}"
+    )
+
+    with mt4_lock:
+
+        data = mt4_data.get(
+            key
+        )
+
+        if data is None:
+            return None
+
+        return json.loads(
+            json.dumps(
+                data
+            )
+        )
+
+
+# ============================================================
+# CALCULATE ENTRY TIME
+# ============================================================
+
+def calculate_entry_time(
+    delay,
+):
+
+    try:
+
+        delay = int(delay)
+
+    except Exception:
+
+        delay = 1
+
+    delay = max(
+        1,
+        min(120, delay),
+    )
+
+    now = datetime.now(
+        ZoneInfo(
+            "Africa/Algiers"
+        )
+    )
+
+    return (
+        now
+        + timedelta(
+            minutes=delay
+        )
+    )
+
+
+# ============================================================
+# FORMAT MT4 SIGNAL
+# ============================================================
+
+def format_mt4_signal(
+    data,
+):
+
+    asset = str(
+        data.get(
+            "asset",
+            "غير واضح",
+        )
+    )
+
+    timeframe = str(
+        data.get(
+            "timeframe",
+            "غير واضح",
+        )
+    )
+
+    direction = str(
+        data.get(
+            "direction",
+            "UP",
+        )
+    ).upper()
+
+    if direction not in (
+        "UP",
+        "DOWN",
+    ):
+
+        direction = "UP"
+
+    try:
+
+        confidence = float(
+            data.get(
+                "confidence",
+                0,
+            )
+        )
+
+        confidence = max(
+            0,
+            min(
+                100,
+                confidence,
+            )
+        )
+
+        confidence_text = (
+            f"{confidence:.0f}%"
+        )
+
+    except Exception:
+
+        confidence_text = (
+            "غير واضح"
+        )
+
+    up_score = safe_score(
+        data.get(
+            "up_score",
+            0,
+        )
+    )
+
+    down_score = safe_score(
+        data.get(
+            "down_score",
+            0,
+        )
+    )
+
+    try:
+
+        delay = int(
+            data.get(
+                "entry_delay_minutes",
+                1,
+            )
+        )
+
+    except Exception:
+
+        delay = 1
+
+    delay = max(
+        1,
+        min(
+            120,
+            delay,
+        )
+    )
+
+    entry_time = calculate_entry_time(
+        delay
+    )
+
+    entry_price = str(
+        data.get(
+            "entry_price",
+            "غير واضح",
+        )
+    )
+
+    cancellation_level = str(
+        data.get(
+            "cancellation_level",
+            "غير واضح",
+        )
+    )
+
+    cancellation_text = str(
+        data.get(
+            "cancellation_text",
+            "",
+        )
+    ).strip()
+
+    if not cancellation_text:
+
+        if (
+            cancellation_level
+            != "غير واضح"
+        ):
+
+            if direction == "DOWN":
+
+                cancellation_text = (
+                    "إلغاء إذا أغلقت شمعة فوق "
+                    f"{cancellation_level}"
+                )
+
+            else:
+
+                cancellation_text = (
+                    "إلغاء إذا أغلقت شمعة تحت "
+                    f"{cancellation_level}"
+                )
+
+        else:
+
+            cancellation_text = (
+                "إلغاء إذا أغلقت شمعة عكس الاتجاه"
+            )
+
+    if direction == "UP":
+
+        direction_text = "🟢 UP"
+
+    else:
+
+        direction_text = "🔴 DOWN"
+
+    structure = str(
+        data.get(
+            "structure",
+            "غير متاح",
+        )
+    )
+
+    breakout = str(
+        data.get(
+            "breakout",
+            "غير متاح",
+        )
+    )
+
+    liquidity = str(
+        data.get(
+            "liquidity",
+            "غير متاح",
+        )
+    )
+
+    momentum = str(
+        data.get(
+            "momentum",
+            "غير متاح",
+        )
+    )
+
+    candle = str(
+        data.get(
+            "candle",
+            "غير متاح",
+        )
+    )
+
+    rsi = str(
+        data.get(
+            "rsi",
+            "غير متاح",
+        )
+    )
+
+    williams = str(
+        data.get(
+            "williams_r",
+            "غير متاح",
+        )
+    )
+
+    ma = str(
+        data.get(
+            "moving_averages",
+            "غير متاح",
+        )
+    )
+
+    keltner = str(
+        data.get(
+            "keltner",
+            "غير متاح",
+        )
+    )
+
+    adx = str(
+        data.get(
+            "adx",
+            "غير متاح",
+        )
+    )
+
+    reason = str(
+        data.get(
+            "reason",
+            "لا يوجد سبب متاح.",
+        )
+    )
+
+    return (
+        "🎓 ZinoProSignalAI\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 {asset} | {timeframe}\n"
+        f"🎯 Confidence: {confidence_text}\n\n"
+        f"📌 Decision: {direction_text}\n"
+        f"🟢 UP Score: {up_score}/18\n"
+        f"🔴 DOWN Score: {down_score}/18\n\n"
+
+        "📊 ANALYSIS\n"
+        f"🏗 Structure: {structure}\n"
+        f"💥 Breakout: {breakout}\n"
+        f"💧 Liquidity: {liquidity}\n"
+        f"⚡ Momentum: {momentum}\n"
+        f"🕯 Candle: {candle}\n"
+        f"📈 RSI 14: {rsi}\n"
+        f"📉 Williams %R: {williams}\n"
+        f"📊 EMA 9/21: {ma}\n"
+        f"〰️ Keltner: {keltner}\n"
+        f"📐 ADX/DI: {adx}\n\n"
+
+        f"⏳ Entry after: {delay} min\n"
+        f"🕐 Entry Time: "
+        f"{entry_time.strftime('%H:%M:%S')}\n"
+        f"💰 Entry Price: {entry_price}\n"
+        f"🚫 {cancellation_text}\n\n"
+
+        f"📝 {reason}\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# CLEAN JSON
+# ============================================================
+
+def clean_json(
+    text: str,
+) -> str:
+
+    text = text.strip()
+
+    if text.startswith("```"):
+
+        lines = text.splitlines()
+
+        if lines:
+            lines = lines[1:]
+
+        if (
+            lines
+            and lines[-1].strip()
+            == "```"
+        ):
+
+            lines = lines[:-1]
+
+        text = "\n".join(
+            lines
+        ).strip()
+
+    return text
+
+
+# ============================================================
+# SAFE SCORE
+# ============================================================
+
+def safe_score(
+    value,
+) -> int:
+
+    try:
+
+        number = int(
+            value
+        )
+
+    except Exception:
+
+        return 0
+
+    return max(
+        0,
+        min(
+            18,
+            number,
+        ),
+    )
+
+
+# ============================================================
+# GEMINI MT4 ANALYSIS
+# ============================================================
+
+async def analyze_mt4_data(
+    market_data,
+):
+
+    payload = json.dumps(
+        market_data,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            MT4_ANALYSIS_PROMPT,
+            "\n\nMT4 MARKET DATA:\n",
+            payload,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.10,
+            response_mime_type="application/json",
+        ),
+    )
+
+    if not response.text:
+
+        raise RuntimeError(
+            "Gemini returned an empty response"
+        )
+
+    raw = clean_json(
+        response.text
+    )
+
+    result = json.loads(
+        raw
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "Gemini response is not a JSON object"
+        )
+
+    return result
+
+
+# ============================================================
+# ANALYZE COMMAND
+# ============================================================
+
+async def analyze_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_owner(update):
+        return
+
+    args = context.args
+
+    if len(args) < 2:
+
+        await update.message.reply_text(
+            "❌ استخدم الأمر هكذا:\n\n"
+            "/analyze EURUSD M1\n\n"
+            "مثال آخر:\n"
+            "/analyze GBPUSD M3"
+        )
+
+        return
+
+    symbol = args[0].strip().upper()
+
+    timeframe = args[1].strip().upper()
+
+    market_data = get_mt4_data(
+        symbol,
+        timeframe,
+    )
+
+    if market_data is None:
+
+        await update.message.reply_text(
+            "❌ لا توجد بيانات MT4 لهذا الزوج والفريم.\n\n"
+            f"الزوج: {symbol}\n"
+            f"الفريم: {timeframe}\n\n"
+            "تأكد أن EA يعمل وأنه أرسل البيانات."
+        )
+
+        return
+
+    candles = market_data.get(
+        "candles",
+        [],
+    )
+
+    if len(candles) < 20:
+
+        await update.message.reply_text(
+            "⏳ البيانات غير كافية للتحليل.\n\n"
+            f"المتاح: {len(candles)} شمعة\n"
+            "المطلوب حاليًا: 20 شمعة على الأقل."
+        )
+
+        return
+
+    processing = await update.message.reply_text(
+        "📡 استلام بيانات MT4...\n"
+        "🔎 تحليل Structure + Price Action + "
+        "EMA + RSI + Williams + ADX + Keltner..."
+    )
+
+    try:
+
+        result = await analyze_mt4_data(
+            market_data
+        )
+
+        signal = format_mt4_signal(
+            result
+        )
+
+        await processing.edit_text(
+            signal
+        )
+
+    except json.JSONDecodeError:
+
+        logger.exception(
+            "Invalid JSON from Gemini MT4"
+        )
+
+        await processing.edit_text(
+            "❌ Gemini رجّع نتيجة غير قابلة للقراءة."
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "MT4 analysis error"
+        )
+
+        message = str(
+            error
+        )
+
+        if len(message) > 350:
+
+            message = message[:350]
+
+        await processing.edit_text(
+            "❌ حدث خطأ أثناء تحليل MT4.\n\n"
+            f"{message}"
+        )
+
+
+# ============================================================
+# ANALYSIS PROMPT FOR SCREENSHOT
 # ============================================================
 
 ANALYSIS_PROMPT = r"""
@@ -323,10 +1731,10 @@ PRIORITY
 لا تعطِ إشارة فقط لأن مؤشرًا واحدًا صاعد أو هابط.
 
 ==================================================
-1. STRUCTURE
+STRUCTURE
 ==================================================
 
-حدد إن كان واضحًا:
+حدد:
 
 - Higher High
 - Higher Low
@@ -335,25 +1743,19 @@ PRIORITY
 - Trend
 - Range / Consolidation
 
-الاتجاه الصاعد يحتاج بنية Higher High / Higher Low أو دليل صاعد واضح.
-
-الاتجاه الهابط يحتاج بنية Lower High / Lower Low أو دليل هابط واضح.
-
 ==================================================
-2. BREAKOUT
+BREAKOUT
 ==================================================
 
 ابحث عن:
 
 - Breakout واضح
-- Candle close بعد الاختراق
+- Candle close
 - Retest
 - Breakout failure
 
-لا تعتبر مجرد لمس المستوى اختراقًا.
-
 ==================================================
-3. LIQUIDITY
+LIQUIDITY
 ==================================================
 
 ابحث عن:
@@ -363,22 +1765,20 @@ PRIORITY
 - Rejection
 - أخذ قمة أو قاع قريب ثم انعكاس
 
-استخدم فقط ما يظهر في الصورة.
-
 ==================================================
-4. MOMENTUM
+MOMENTUM
 ==================================================
 
 افحص:
 
-- قوة آخر الحركة
+- قوة الحركة
 - سرعة الحركة
 - حجم الشموع
 - استمرار أو ضعف الزخم
 - تسلسل الشموع
 
 ==================================================
-5. CANDLE
+CANDLE
 ==================================================
 
 افحص:
@@ -391,10 +1791,8 @@ PRIORITY
 - Rejection candle
 - قوة الإغلاق
 
-لا تعتبر شكلًا صغيرًا جدًا Pattern مؤكدًا.
-
 ==================================================
-6. EMA 9 + EMA 21
+EMA 9 + EMA 21
 ==================================================
 
 إذا ظهرا بوضوح:
@@ -406,90 +1804,67 @@ EMA 21 أحمر.
 
 - EMA 9 فوق EMA 21
 - EMA 9 تحت EMA 21
-- تقاطع واضح
+- تقاطع
 - ميل الخطوط
-- موقع السعر بالنسبة لهما
+- موقع السعر
 
 لا تستخدم التقاطع وحده.
 
 ==================================================
-7. RSI 14
+RSI 14
 ==================================================
 
-إذا كان RSI ظاهرًا بوضوح:
+70 = تشبع شرائي.
 
-- فوق 70 = منطقة تشبع شرائي
-- تحت 30 = منطقة تشبع بيعي
-- افحص اتجاه RSI
-- افحص divergence فقط إذا كان واضحًا جدًا
+30 = تشبع بيعي.
 
-الوصول إلى 70 أو 30 وحده ليس دخولًا.
+افحص اتجاه RSI وdivergence إذا كان واضحًا.
 
 ==================================================
-8. WILLIAMS %R 14
+WILLIAMS %R 14
 ==================================================
 
-إذا كان ظاهرًا:
+-20 = تشبع شرائي.
 
-- فوق -20 = تشبع شرائي
-- تحت -80 = تشبع بيعي
-- راقب الخروج من منطقة التشبع
-- راقب اتجاه المؤشر
+-80 = تشبع بيعي.
 
-مجرد لمس -20 أو -80 لا يكفي.
-
-Williams %R عامل تأكيد فقط.
+راقب الخروج من التشبع.
 
 ==================================================
-9. KELTNER CHANNEL
+KELTNER
 ==================================================
-
-الإعداد:
 
 EMA 20
 ATR 10
 Multiplier 5
 
-إذا كان ظاهرًا:
-
 افحص:
 
-- السعر بالنسبة للحد العلوي
-- السعر بالنسبة للحد الأوسط
-- السعر بالنسبة للحد السفلي
+- Upper
+- Middle
+- Lower
 - rejection
 - breakout
-- استمرار الاتجاه
-
-لا تعتمد على Keltner وحده.
+- continuation
 
 ==================================================
-10. ADX + DI
+ADX + DI
 ==================================================
-
-الإعداد:
 
 ADX = 14
 DI Length = 14
-
-إذا ظهر بوضوح:
 
 افحص:
 
 - قوة الاتجاه
 - DI+ مقابل DI-
 - اتجاه ADX
-- هل الحركة اتجاهية أم ضعيفة
-
-لا تخترع قيمة ADX.
-
-لا تستخدم ADX وحده.
 
 ==================================================
-SCORING SYSTEM
+SCORING
 ==================================================
 
-المجموع = 18 نقطة.
+المجموع = 18.
 
 Structure = 2
 Breakout = 2
@@ -504,108 +1879,15 @@ Moving Averages = 2
 TOTAL = 18
 
 ==================================================
-SCORING RULES
-==================================================
-
-لكل عنصر:
-
-Structure:
-0 إلى 2
-
-Breakout:
-0 إلى 2
-
-Liquidity:
-0 إلى 1
-
-Momentum:
-0 إلى 2
-
-Candle:
-0 إلى 2
-
-RSI:
-0 إلى 1
-
-Summary:
-0 إلى 2
-
-Oscillators:
-0 إلى 2
-
-Moving Averages:
-0 إلى 2
-
-كل نقطة يجب أن تكون مدعومة بدليل من الصورة.
-
-لا تمنح النقاط لمؤشر غير ظاهر.
-
-==================================================
-OSCILLATORS
-==================================================
-
-Oscillators = 2 نقاط.
-
-استخدم داخلها:
-
-- RSI
-- Williams %R
-- ADX/DI عند الحاجة كتأكيد للاتجاه
-
-لا تعطي نقطتين تلقائيًا.
-
-إذا كانت المؤشرات متعارضة، خفّض نقاط Oscillators.
-
-==================================================
-MOVING AVERAGES
-==================================================
-
-Moving Averages = 2 نقاط.
-
-استخدم:
-
-EMA 9
-EMA 21
-
-إذا كان EMA 9 فوق EMA 21 مع ميل صاعد وتأكيد سعري:
-يميل إلى UP.
-
-إذا كان EMA 9 تحت EMA 21 مع ميل هابط وتأكيد سعري:
-يميل إلى DOWN.
-
-التقاطع وحده لا يكفي.
-
-==================================================
-SUMMARY
-==================================================
-
-Summary = 2 نقاط.
-
-لخّص توافق:
-
-Structure
-Momentum
-Candle
-Breakout
-Indicators
-
-إذا كان هناك توافق قوي وواضح:
-يمكن إعطاء 2.
-
-إذا كان التوافق جزئيًا:
-1.
-
-إذا لم يوجد دعم واضح:
-0.
-
-==================================================
 DIRECTION
 ==================================================
 
-اختر اتجاهًا واحدًا فقط:
+اختر:
 
 UP
+
 أو
+
 DOWN
 
 ممنوع:
@@ -614,33 +1896,7 @@ WAIT
 NO SIGNAL
 NEUTRAL
 
-إذا كانت الأدلة ضعيفة أو متعارضة:
-
-اختر الاتجاه الذي لديه أدلة أكثر.
-
-لكن اخفض confidence.
-
-لا ترفع confidence فقط بسبب ارتفاع score.
-
-==================================================
-CONFIDENCE
-==================================================
-
-Confidence تقدير لقوة الأدلة الظاهرة في الصورة فقط.
-
-لا تجعل confidence يساوي score بشكل آلي.
-
-لا تعطِ 90% أو أكثر إلا إذا كانت الصورة تحتوي على توافق واضح جدًا بين:
-
-Structure
-Price Action
-Momentum
-Candle
-EMA
-والتأكيدات الأخرى.
-
-إذا كانت المؤشرات متعارضة:
-اخفض confidence.
+إذا كانت الأدلة ضعيفة اختر الاتجاه الذي لديه أدلة أكثر وخفض confidence.
 
 ==================================================
 ENTRY
@@ -648,45 +1904,23 @@ ENTRY
 
 استخرج:
 
-- Entry Price
-- Timeframe
+Entry Price
+Timeframe
 
-من الصورة إذا كانا واضحين.
-
-إذا كان السعر غير واضح:
-اكتب "غير واضح".
-
-لا تخترع سعرًا.
+إذا كان غير واضح:
+"غير واضح"
 
 ==================================================
 ENTRY DELAY
 ==================================================
 
-إذا كان الفريم:
+1M = 1 دقيقة
 
-1M:
-entry_delay_minutes = 1
+2M = 2 دقائق
 
-2M:
-entry_delay_minutes = 2
+3M = 3 دقائق
 
-3M:
-entry_delay_minutes = 3
-
-إذا كان فريم آخر:
-استخدم عدد دقائق الفريم إذا كان واضحًا.
-
-لا تغير الفريم الموجود في الصورة.
-
-==================================================
-ENTRY TIME
-==================================================
-
-التوقيت النهائي سيتم حسابه بواسطة البرنامج بتوقيت الجزائر:
-
-Africa/Algiers
-
-لا تحسب Entry Time بنفسك.
+الفريم الآخر = عدد دقائق الفريم إذا كان واضحًا.
 
 أرسل فقط:
 
@@ -696,50 +1930,19 @@ entry_delay_minutes
 CANCELLATION
 ==================================================
 
-Cancellation Level يجب أن يكون منطقيًا مع الاتجاه والبنية الأخيرة.
+UP:
 
-في UP:
-عادة يكون مستوى الإلغاء أسفل البنية أو القاع الأخير إذا كان واضحًا.
+أسفل البنية أو القاع الأخير إذا كان واضحًا.
 
-في DOWN:
-عادة يكون مستوى الإلغاء فوق البنية أو القمة الأخيرة إذا كان واضحًا.
+DOWN:
 
-لا تضع مستوى عشوائي.
-
-إذا لم يمكن تحديده:
-اكتب "غير واضح".
-
-==================================================
-IMPORTANT
-==================================================
-
-لا تستخدم بيانات السوق الحية.
-
-لا تستخدم الإنترنت.
-
-لا تدّعي أنك ترى شموعًا غير موجودة.
-
-لا تخترع:
-
-RSI
-Williams %R
-ADX
-DI
-Keltner
-EMA
-السعر
-الفريم
-
-إذا لم يظهر المؤشر:
-"غير متاح"
+فوق البنية أو القمة الأخيرة إذا كان واضحًا.
 
 ==================================================
 OUTPUT
 ==================================================
 
-أخرج JSON فقط.
-
-يجب أن يكون الشكل:
+أخرج JSON فقط:
 
 {
   "asset": "EUR/USD",
@@ -760,9 +1963,9 @@ OUTPUT
   "rsi": "Below 30",
   "williams_r": "خرج من منطقة التشبع الشرائي",
   "moving_averages": "EMA 9 below EMA 21",
-  "keltner": "Bearish rejection from upper area",
-  "adx": "ADX 14 with DI- stronger than DI+",
-  "reason": "بنية هابطة مع زخم سلبي ورفض سعري وتأكيد من EMA وWilliams %R"
+  "keltner": "Bearish rejection",
+  "adx": "DI- stronger than DI+",
+  "reason": "بنية هابطة مع زخم سلبي وتأكيد من EMA"
 }
 
 ممنوع إضافة نص خارج JSON.
@@ -770,33 +1973,7 @@ OUTPUT
 
 
 # ============================================================
-# JSON CLEANER
-# ============================================================
-
-def clean_json(text: str) -> str:
-
-    text = text.strip()
-
-    if text.startswith("```"):
-
-        lines = text.splitlines()
-
-        if lines:
-            lines = lines[1:]
-
-        if (
-            lines
-            and lines[-1].strip() == "```"
-        ):
-            lines = lines[:-1]
-
-        text = "\n".join(lines).strip()
-
-    return text
-
-
-# ============================================================
-# GEMINI ANALYSIS
+# SCREENSHOT ANALYSIS
 # ============================================================
 
 async def analyze_chart(
@@ -821,6 +1998,7 @@ async def analyze_chart(
     )
 
     if not response.text:
+
         raise RuntimeError(
             "Gemini returned an empty response"
         )
@@ -829,9 +2007,15 @@ async def analyze_chart(
         response.text
     )
 
-    data = json.loads(raw)
+    data = json.loads(
+        raw
+    )
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
+
         raise RuntimeError(
             "Gemini response is not a JSON object"
         )
@@ -840,26 +2024,7 @@ async def analyze_chart(
 
 
 # ============================================================
-# SAFE SCORE
-# ============================================================
-
-def safe_score(
-    value,
-) -> int:
-
-    try:
-        number = int(value)
-    except Exception:
-        return 0
-
-    return max(
-        0,
-        min(18, number),
-    )
-
-
-# ============================================================
-# SIGNAL FORMAT
+# SCREENSHOT SIGNAL FORMAT
 # ============================================================
 
 def format_signal(
@@ -891,21 +2056,24 @@ def format_signal(
         "UP",
         "DOWN",
     ):
+
         direction = "UP"
 
-    confidence = data.get(
-        "confidence",
-        0,
-    )
-
     try:
+
         confidence = float(
-            confidence
+            data.get(
+                "confidence",
+                0,
+            )
         )
 
         confidence = max(
             0,
-            min(100, confidence),
+            min(
+                100,
+                confidence,
+            )
         )
 
         confidence_text = (
@@ -913,7 +2081,10 @@ def format_signal(
         )
 
     except Exception:
-        confidence_text = "غير واضح"
+
+        confidence_text = (
+            "غير واضح"
+        )
 
     up_score = safe_score(
         data.get(
@@ -929,20 +2100,25 @@ def format_signal(
         )
     )
 
-    delay = data.get(
-        "entry_delay_minutes",
-        1,
-    )
-
     try:
-        delay = int(delay)
+
+        delay = int(
+            data.get(
+                "entry_delay_minutes",
+                1,
+            )
+        )
 
     except Exception:
+
         delay = 1
 
     delay = max(
         1,
-        min(60, delay),
+        min(
+            60,
+            delay,
+        )
     )
 
     entry_price = str(
@@ -974,18 +2150,21 @@ def format_signal(
         ):
 
             if direction == "DOWN":
+
                 cancellation_text = (
                     "إلغاء إذا أغلقت شمعة فوق "
                     f"{cancellation_level}"
                 )
 
             else:
+
                 cancellation_text = (
                     "إلغاء إذا أغلقت شمعة تحت "
                     f"{cancellation_level}"
                 )
 
         else:
+
             cancellation_text = (
                 "إلغاء إذا أغلقت شمعة عكس الاتجاه"
             )
@@ -998,17 +2177,24 @@ def format_signal(
     )
 
     now = datetime.now(
-        ZoneInfo("Africa/Algiers")
+        ZoneInfo(
+            "Africa/Algiers"
+        )
     )
 
     entry_time = (
         now
-        + timedelta(minutes=delay)
+        + timedelta(
+            minutes=delay
+        )
     )
 
     if direction == "DOWN":
+
         direction_text = "🔴 DOWN"
+
     else:
+
         direction_text = "🟢 UP"
 
     return (
@@ -1020,7 +2206,8 @@ def format_signal(
         f"🟢 UP Score: {up_score}/18\n"
         f"🔴 DOWN Score: {down_score}/18\n\n"
         f"⏳ Entry after: {delay} min\n"
-        f"🕐 Entry Time: {entry_time.strftime('%H:%M:%S')}\n"
+        f"🕐 Entry Time: "
+        f"{entry_time.strftime('%H:%M:%S')}\n"
         f"💰 Entry Price: {entry_price}\n"
         f"🚫 {cancellation_text}\n\n"
         f"📝 {reason}\n"
@@ -1075,6 +2262,7 @@ async def photo_handler(
         )
 
         if not image_bytes:
+
             raise RuntimeError(
                 "الصورة فارغة"
             )
@@ -1108,9 +2296,12 @@ async def photo_handler(
             "Analysis error"
         )
 
-        message = str(error)
+        message = str(
+            error
+        )
 
         if len(message) > 350:
+
             message = message[:350]
 
         await processing.edit_text(
@@ -1134,8 +2325,49 @@ async def text_handler(
     if not update.message:
         return
 
+    text = update.message.text.strip()
+
+    parts = text.split()
+
+    if len(parts) == 2:
+
+        symbol = parts[0].upper()
+
+        timeframe = parts[1].upper()
+
+        valid_timeframes = {
+            "M1",
+            "M2",
+            "M3",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1",
+        }
+
+        if timeframe in valid_timeframes:
+
+            market_data = get_mt4_data(
+                symbol,
+                timeframe,
+            )
+
+            if market_data is not None:
+
+                await analyze_command(
+                    update,
+                    context,
+                )
+
+                return
+
     await update.message.reply_text(
-        "📸 أرسل صورة الشارت مباشرة."
+        "📸 أرسل صورة الشارت مباشرة.\n\n"
+        "أو لتحليل بيانات MT4:\n"
+        "اكتب مثلًا:\n"
+        "EURUSD M1"
     )
 
 
@@ -1211,6 +2443,20 @@ def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "mt4status",
+            mt4status_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command,
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.PHOTO,
             photo_handler,
@@ -1219,7 +2465,8 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             text_handler,
         )
     )
