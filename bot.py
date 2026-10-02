@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -72,6 +73,85 @@ logger = logging.getLogger("ZinoProSignalAI")
 client = genai.Client(
     api_key=GEMINI_API_KEY
 )
+
+
+# ============================================================
+# GEMINI RETRY
+# ============================================================
+
+async def gemini_generate_with_retry(
+    model,
+    contents,
+    config,
+    max_retries=4,
+):
+    """
+    إعادة المحاولة تلقائياً عند أخطاء Gemini المؤقتة.
+    
+    المحاولات:
+    1) مباشرة
+    2) بعد 3 ثواني
+    3) بعد 7 ثواني
+    4) بعد 15 ثانية
+    
+    ملاحظة:
+    إذا كان الخطأ غير مؤقت، يتم إظهاره مباشرة.
+    """
+
+    delays = [3, 7, 15]
+
+    for attempt in range(max_retries):
+
+        try:
+
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=model,
+                contents=contents,
+                config=config,
+            )
+
+            return response
+
+        except Exception as error:
+
+            error_text = str(error)
+
+            retryable = any(
+                code in error_text
+                for code in (
+                    "429",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "UNAVAILABLE",
+                    "RESOURCE_EXHAUSTED",
+                    "DEADLINE_EXCEEDED",
+                )
+            )
+
+            if not retryable:
+                raise
+
+            if attempt >= max_retries - 1:
+                raise
+
+            delay = delays[attempt]
+
+            logger.warning(
+                "Gemini temporary error: %s | retrying in %s seconds | attempt %s/%s",
+                error_text[:250],
+                delay,
+                attempt + 1,
+                max_retries,
+            )
+
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(
+        "Gemini failed after multiple retries"
+    )
 
 
 # ============================================================
@@ -994,18 +1074,7 @@ NEUTRAL
 BEST ENTRY TIME
 ==================================================
 
-هذه نقطة مهمة جدًا.
-
 لا تعطِ وقت دخول عشوائيًا.
-
-حلل الشموع الحالية وحدد هل الأفضل:
-
-- الدخول عند بداية الشمعة القادمة
-- الانتظار حتى إغلاق الشمعة الحالية
-- الانتظار حتى Retest
-- الانتظار حتى تأكيد Breakout
-
-ثم حدد عدد الدقائق من الوقت الحالي.
 
 إذا كان الفريم:
 
@@ -1017,7 +1086,7 @@ M3 = الشمعة التالية بعد 3 دقائق
 
 M5 = الشمعة التالية بعد 5 دقائق
 
-لكن إذا كان هناك سبب فني واضح للانتظار أكثر، يمكن زيادة delay.
+يمكن زيادة delay إذا كان هناك سبب فني واضح.
 
 يجب أن يكون:
 
@@ -1162,6 +1231,33 @@ def calculate_entry_time(
         + timedelta(
             minutes=delay
         )
+    )
+
+
+# ============================================================
+# SAFE SCORE
+# ============================================================
+
+def safe_score(
+    value,
+) -> int:
+
+    try:
+
+        number = int(
+            value
+        )
+
+    except Exception:
+
+        return 0
+
+    return max(
+        0,
+        min(
+            18,
+            number,
+        ),
     )
 
 
@@ -1465,33 +1561,6 @@ def clean_json(
 
 
 # ============================================================
-# SAFE SCORE
-# ============================================================
-
-def safe_score(
-    value,
-) -> int:
-
-    try:
-
-        number = int(
-            value
-        )
-
-    except Exception:
-
-        return 0
-
-    return max(
-        0,
-        min(
-            18,
-            number,
-        ),
-    )
-
-
-# ============================================================
 # GEMINI MT4 ANALYSIS
 # ============================================================
 
@@ -1508,7 +1577,7 @@ async def analyze_mt4_data(
         ),
     )
 
-    response = client.models.generate_content(
+    response = await gemini_generate_with_retry(
         model=GEMINI_MODEL,
         contents=[
             MT4_ANALYSIS_PROMPT,
@@ -1985,7 +2054,7 @@ async def analyze_chart(
         mime_type="image/jpeg",
     )
 
-    response = client.models.generate_content(
+    response = await gemini_generate_with_retry(
         model=GEMINI_MODEL,
         contents=[
             image_part,
