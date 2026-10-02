@@ -5,6 +5,7 @@ import logging
 import threading
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -28,17 +29,37 @@ from google.genai import types
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 OWNER_ID_RAW = os.getenv("OWNER_ID")
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
 )
+
 MT4_API_KEY = os.getenv("MT4_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
 
 ALGIERS = ZoneInfo("Africa/Algiers")
 
+
+# ============================================================
+# AUTO ANALYSIS SETTINGS
+# ============================================================
+
+# تحليل تلقائي بحد أقصى مرة كل دقيقتين
+# لكل زوج + فريم.
+AUTO_ANALYSIS_INTERVAL_MINUTES = 2
+
+# أقل وقت نتركه بين إرسال الإشارة ووقت الدخول.
+# إذا كانت الشمعة القادمة قريبة جدًا، نؤجل الدخول للشمعة التالية.
+MIN_ENTRY_LEAD_SECONDS = 20
+
+
+# ============================================================
+# ENV VALIDATION
+# ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -90,9 +111,16 @@ telegram_bot = None
 auto_analysis_running = set()
 auto_analysis_lock = threading.Lock()
 
+# آخر شمعة وصلت من MT4
 last_auto_candle = {}
+
+# آخر تحليل تلقائي تم تشغيله
+last_auto_analysis_at = {}
+
+# آخر إشارة تم إرسالها
 last_auto_signal = {}
-auto_signal_lock = threading.Lock()
+
+auto_state_lock = threading.Lock()
 
 stats = {
     "wins": 0,
@@ -105,7 +133,10 @@ stats = {
 # ============================================================
 
 def timeframe_to_minutes(timeframe):
-    tf = str(timeframe or "").upper().strip()
+
+    tf = str(
+        timeframe or ""
+    ).upper().strip()
 
     mapping = {
         "M1": 1,
@@ -120,16 +151,38 @@ def timeframe_to_minutes(timeframe):
         "H4": 240,
     }
 
-    return mapping.get(tf, 1)
+    return mapping.get(
+        tf,
+        1
+    )
 
 
-def get_next_entry_time(timeframe, delay_minutes=None):
-    minutes = timeframe_to_minutes(timeframe)
+def get_next_entry_time(
+    timeframe,
+    delay_minutes=None
+):
+    """
+    يحسب وقت الدخول القادم.
+
+    مثال M1:
+    إذا جاء التحليل 16:20:10
+    الدخول الطبيعي = 16:21:00
+
+    وإذا وصل التحليل قريبًا جدًا من 16:21
+    نؤجل إلى 16:22 حتى يكون عند المستخدم
+    وقت فعلي للدخول.
+    """
+
+    minutes = timeframe_to_minutes(
+        timeframe
+    )
 
     if delay_minutes is None:
         delay_minutes = minutes
 
-    now = datetime.now(ALGIERS)
+    now = datetime.now(
+        ALGIERS
+    )
 
     base = now.replace(
         second=0,
@@ -137,7 +190,10 @@ def get_next_entry_time(timeframe, delay_minutes=None):
     )
 
     next_boundary = (
-        base + timedelta(minutes=minutes)
+        base
+        + timedelta(
+            minutes=minutes
+        )
     )
 
     entry_time = (
@@ -150,6 +206,16 @@ def get_next_entry_time(timeframe, delay_minutes=None):
         )
     )
 
+    seconds_left = (
+        entry_time - now
+    ).total_seconds()
+
+    if seconds_left < MIN_ENTRY_LEAD_SECONDS:
+
+        entry_time += timedelta(
+            minutes=minutes
+        )
+
     return entry_time
 
 
@@ -157,12 +223,20 @@ def get_next_entry_time(timeframe, delay_minutes=None):
 # NUMBER HELPERS
 # ============================================================
 
-def safe_float(value, default=None):
+def safe_float(
+    value,
+    default=None
+):
+
     try:
+
         if value is None:
             return default
 
-        if isinstance(value, bool):
+        if isinstance(
+            value,
+            bool
+        ):
             return default
 
         number = float(value)
@@ -173,31 +247,55 @@ def safe_float(value, default=None):
         return number
 
     except Exception:
+
         return default
 
 
-def safe_int(value, default=0):
+def safe_int(
+    value,
+    default=0
+):
+
     try:
-        return int(float(value))
+        return int(
+            float(value)
+        )
+
     except Exception:
         return default
 
 
 def safe_score(value):
+
     try:
-        number = int(value)
+        number = int(
+            value
+        )
+
     except Exception:
         return 0
 
     return max(
         0,
-        min(18, number)
+        min(
+            18,
+            number
+        )
     )
 
 
-def determine_direction(up_score, down_score):
-    up_score = safe_score(up_score)
-    down_score = safe_score(down_score)
+def determine_direction(
+    up_score,
+    down_score
+):
+
+    up_score = safe_score(
+        up_score
+    )
+
+    down_score = safe_score(
+        down_score
+    )
 
     if up_score > down_score:
         return "UP"
@@ -205,12 +303,11 @@ def determine_direction(up_score, down_score):
     if down_score > up_score:
         return "DOWN"
 
-    raise RuntimeError(
-        f"Direction unclear: UP={up_score} DOWN={down_score}"
-    )
+    return None
 
 
 def infer_digits(price):
+
     if price is None:
         return 5
 
@@ -220,19 +317,28 @@ def infer_digits(price):
     )
 
     if "." in text:
+
         return min(
             8,
             max(
                 2,
-                len(text.split(".")[1])
+                len(
+                    text.split(".")[1]
+                )
             )
         )
 
     return 5
 
 
-def format_price(price, digits=5):
-    value = safe_float(price)
+def format_price(
+    price,
+    digits=5
+):
+
+    value = safe_float(
+        price
+    )
 
     if value is None:
         return "N/A"
@@ -244,22 +350,36 @@ def format_price(price, digits=5):
 # CANDLE HELPERS
 # ============================================================
 
-def candle_time_value(candle):
-    value = candle.get("time")
+def candle_time_value(
+    candle
+):
+
+    value = candle.get(
+        "time"
+    )
 
     if value is None:
         return 0
 
-    if isinstance(value, (int, float)):
+    if isinstance(
+        value,
+        (int, float)
+    ):
+
         return float(value)
 
-    text = str(value).strip()
+    text = str(
+        value
+    ).strip()
 
     if not text:
         return 0
 
     try:
-        return float(text)
+        return float(
+            text
+        )
+
     except Exception:
         pass
 
@@ -278,7 +398,9 @@ def candle_time_value(candle):
     ]
 
     for fmt in formats:
+
         try:
+
             dt = datetime.strptime(
                 text,
                 fmt
@@ -290,11 +412,13 @@ def candle_time_value(candle):
             pass
 
     try:
+
         dt = datetime.fromisoformat(
             cleaned
         )
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=ALGIERS
             )
@@ -302,18 +426,28 @@ def candle_time_value(candle):
         return dt.timestamp()
 
     except Exception:
+
         return 0
 
 
-def normalize_candles(candles):
+def normalize_candles(
+    candles
+):
+
     clean = []
 
-    if not isinstance(candles, list):
+    if not isinstance(
+        candles,
+        list
+    ):
         return clean
 
     for candle in candles:
 
-        if not isinstance(candle, dict):
+        if not isinstance(
+            candle,
+            dict
+        ):
             continue
 
         open_price = safe_float(
@@ -340,20 +474,38 @@ def normalize_candles(candles):
         ):
             continue
 
-        item = dict(candle)
+        item = dict(
+            candle
+        )
 
-        item["open"] = open_price
-        item["high"] = high_price
-        item["low"] = low_price
-        item["close"] = close_price
+        item["open"] = (
+            open_price
+        )
 
-        if candle.get("volume") is not None:
+        item["high"] = (
+            high_price
+        )
+
+        item["low"] = (
+            low_price
+        )
+
+        item["close"] = (
+            close_price
+        )
+
+        if candle.get(
+            "volume"
+        ) is not None:
+
             item["volume"] = safe_float(
                 candle.get("volume"),
                 0,
             )
 
-        clean.append(item)
+        clean.append(
+            item
+        )
 
     clean.sort(
         key=candle_time_value
@@ -362,13 +514,14 @@ def normalize_candles(candles):
     return clean
 
 
-def get_closed_candles(candles):
+def get_closed_candles(
+    candles
+):
     """
-    The newest MT4 candle is treated as
-    the currently forming candle.
+    آخر شمعة من MT4 تعتبر شمعة حالية تتشكل.
 
-    Therefore only candles[:-1] are used
-    for technical analysis.
+    لذلك Gemini يحلل candles[:-1]
+    فقط.
     """
 
     clean = normalize_candles(
@@ -385,37 +538,56 @@ def get_closed_candles(candles):
 # INDICATORS
 # ============================================================
 
-def ema(values, period):
+def ema(
+    values,
+    period
+):
 
     if len(values) < period:
         return None
 
-    multiplier = 2.0 / (period + 1)
+    multiplier = (
+        2.0
+        / (period + 1)
+    )
 
     current = (
-        sum(values[:period])
+        sum(
+            values[:period]
+        )
         / period
     )
 
     for value in values[period:]:
 
         current = (
-            (value - current)
+            (
+                value
+                - current
+            )
             * multiplier
         ) + current
 
     return current
 
 
-def calculate_rsi(closes, period=14):
+def calculate_rsi(
+    closes,
+    period=14
+):
 
-    if len(closes) < period + 1:
+    if len(closes) < (
+        period + 1
+    ):
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
+    for i in range(
+        1,
+        len(closes)
+    ):
 
         change = (
             closes[i]
@@ -423,20 +595,30 @@ def calculate_rsi(closes, period=14):
         )
 
         gains.append(
-            max(change, 0)
+            max(
+                change,
+                0
+            )
         )
 
         losses.append(
-            max(-change, 0)
+            max(
+                -change,
+                0
+            )
         )
 
     avg_gain = (
-        sum(gains[:period])
+        sum(
+            gains[:period]
+        )
         / period
     )
 
     avg_loss = (
-        sum(losses[:period])
+        sum(
+            losses[:period]
+        )
         / period
     )
 
@@ -447,27 +629,37 @@ def calculate_rsi(closes, period=14):
 
         avg_gain = (
             (
-                avg_gain
-                * (period - 1)
+                (
+                    avg_gain
+                    * (period - 1)
+                )
+                + gains[i]
             )
-            + gains[i]
-        ) / period
+            / period
+        )
 
         avg_loss = (
             (
-                avg_loss
-                * (period - 1)
+                (
+                    avg_loss
+                    * (period - 1)
+                )
+                + losses[i]
             )
-            + losses[i]
-        ) / period
+            / period
+        )
 
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
     return 100 - (
-        100 / (1 + rs)
+        100
+        / (1 + rs)
     )
 
 
@@ -491,7 +683,9 @@ def calculate_williams_r(
         for c in recent
     )
 
-    close = recent[-1]["close"]
+    close = (
+        recent[-1]["close"]
+    )
 
     if highest == lowest:
         return -50.0
@@ -500,7 +694,8 @@ def calculate_williams_r(
         (
             highest - close
         )
-        / (
+        /
+        (
             highest - lowest
         )
         * -100
@@ -512,7 +707,9 @@ def calculate_atr(
     period=10
 ):
 
-    if len(candles) < period + 1:
+    if len(candles) < (
+        period + 1
+    ):
         return None
 
     trs = []
@@ -540,13 +737,17 @@ def calculate_atr(
             ),
         )
 
-        trs.append(tr)
+        trs.append(
+            tr
+        )
 
     if len(trs) < period:
         return None
 
     return (
-        sum(trs[-period:])
+        sum(
+            trs[-period:]
+        )
         / period
     )
 
@@ -559,6 +760,7 @@ def calculate_adx(
     if len(candles) < (
         period * 2 + 2
     ):
+
         return {
             "adx": None,
             "plus_di": None,
@@ -620,11 +822,20 @@ def calculate_adx(
             ),
         )
 
-        true_ranges.append(tr)
-        plus_dm.append(plus)
-        minus_dm.append(minus)
+        true_ranges.append(
+            tr
+        )
+
+        plus_dm.append(
+            plus
+        )
+
+        minus_dm.append(
+            minus
+        )
 
     if len(true_ranges) < period:
+
         return {
             "adx": None,
             "plus_di": None,
@@ -632,17 +843,23 @@ def calculate_adx(
         }
 
     atr = (
-        sum(true_ranges[:period])
+        sum(
+            true_ranges[:period]
+        )
         / period
     )
 
     plus_smoothed = (
-        sum(plus_dm[:period])
+        sum(
+            plus_dm[:period]
+        )
         / period
     )
 
     minus_smoothed = (
-        sum(minus_dm[:period])
+        sum(
+            minus_dm[:period]
+        )
         / period
     )
 
@@ -698,8 +915,11 @@ def calculate_adx(
         )
 
         if denominator == 0:
+
             dx = 0
+
         else:
+
             dx = (
                 abs(
                     plus_di
@@ -717,6 +937,7 @@ def calculate_adx(
         )
 
     if len(dx_values) < period:
+
         return {
             "adx": None,
             "plus_di": None,
@@ -731,8 +952,13 @@ def calculate_adx(
         / period
     )
 
-    plus_di = dx_values[-1][1]
-    minus_di = dx_values[-1][2]
+    plus_di = (
+        dx_values[-1][1]
+    )
+
+    minus_di = (
+        dx_values[-1][2]
+    )
 
     return {
         "adx": adx,
@@ -741,7 +967,9 @@ def calculate_adx(
     }
 
 
-def calculate_keltner(candles):
+def calculate_keltner(
+    candles
+):
 
     closes = [
         c["close"]
@@ -758,7 +986,11 @@ def calculate_keltner(candles):
         10
     )
 
-    if middle is None or atr is None:
+    if (
+        middle is None
+        or atr is None
+    ):
+
         return {
             "middle": None,
             "upper": None,
@@ -769,16 +1001,20 @@ def calculate_keltner(candles):
 
     return {
         "middle": middle,
-        "upper": middle + (
-            atr * multiplier
+        "upper": (
+            middle
+            + (atr * multiplier)
         ),
-        "lower": middle - (
-            atr * multiplier
+        "lower": (
+            middle
+            - (atr * multiplier)
         ),
     }
 
 
-def calculate_indicators(candles):
+def calculate_indicators(
+    candles
+):
 
     closes = [
         c["close"]
@@ -828,7 +1064,9 @@ def calculate_indicators(candles):
 # PRICE ACTION / STRUCTURE
 # ============================================================
 
-def candle_description(candle):
+def candle_description(
+    candle
+):
 
     open_price = candle["open"]
     high = candle["high"]
@@ -869,15 +1107,19 @@ def candle_description(candle):
 
     if close > open_price:
         direction = "bullish"
+
     elif close < open_price:
         direction = "bearish"
+
     else:
         direction = "neutral"
 
     if body_ratio >= 0.65:
         strength = "strong"
+
     elif body_ratio >= 0.35:
         strength = "moderate"
+
     else:
         strength = "weak"
 
@@ -889,7 +1131,9 @@ def candle_description(candle):
     )
 
 
-def structure_analysis(candles):
+def structure_analysis(
+    candles
+):
 
     if len(candles) < 8:
         return "insufficient"
@@ -929,6 +1173,7 @@ def structure_analysis(candles):
         second_half_low
         > first_half_low
     ):
+
         return "HH + HL"
 
     if (
@@ -938,12 +1183,15 @@ def structure_analysis(candles):
         second_half_low
         < first_half_low
     ):
+
         return "LH + LL"
 
     return "mixed/range"
 
 
-def detect_recent_breakout(candles):
+def detect_recent_breakout(
+    candles
+):
 
     if len(candles) < 8:
         return "none"
@@ -975,7 +1223,9 @@ def detect_recent_breakout(candles):
 # CANCELLATION LEVEL
 # ============================================================
 
-def find_swing_low(candles):
+def find_swing_low(
+    candles
+):
 
     if len(candles) < 5:
         return None
@@ -995,6 +1245,7 @@ def find_swing_low(candles):
             current["low"]
             <= candles[i + 1]["low"]
         ):
+
             return current["low"]
 
     recent = candles[-6:]
@@ -1005,7 +1256,9 @@ def find_swing_low(candles):
     )
 
 
-def find_swing_high(candles):
+def find_swing_high(
+    candles
+):
 
     if len(candles) < 5:
         return None
@@ -1025,6 +1278,7 @@ def find_swing_high(candles):
             current["high"]
             >= candles[i + 1]["high"]
         ):
+
             return current["high"]
 
     recent = candles[-6:]
@@ -1045,6 +1299,7 @@ def calculate_cancellation(
         not candles
         or entry_price is None
     ):
+
         return None
 
     recent = candles[-12:]
@@ -1056,6 +1311,7 @@ def calculate_cancellation(
         )
 
         if level is None:
+
             level = min(
                 c["low"]
                 for c in recent
@@ -1075,6 +1331,7 @@ def calculate_cancellation(
     )
 
     if level is None:
+
         level = max(
             c["high"]
             for c in recent
@@ -1100,43 +1357,99 @@ def evaluate_signal_quality(
     indicators,
 ):
     """
-    STRICT QUALITY GATE.
+    جودة الإشارة:
 
-    Weak setups are rejected completely.
+    1. فرق السكور >= 5
+    2. السكور المختار >= 11
+    3. Confidence >= 70
+    4. 40 شمعة مغلقة على الأقل
+    5. عدة confirmations
+    6. منع الإشارات المتناقضة
+    7. منع exhaustion الشديد
 
-    The bot does NOT need to send a signal
-    on every candle.
-
-    A different pair can send a signal later
-    when its setup becomes strong.
+    إذا لم يتحقق الشرط:
+    لا يتم إرسال أي Telegram signal.
     """
 
     up_score = safe_score(
-        result.get("up_score")
+        result.get(
+            "up_score"
+        )
     )
 
     down_score = safe_score(
-        result.get("down_score")
+        result.get(
+            "down_score"
+        )
     )
 
-    difference = abs(
-        up_score - down_score
-    )
+    # يجب أن يكون مجموع السكور 18
+    if (
+        up_score
+        + down_score
+        != 18
+    ):
 
-    confidence = safe_int(
-        result.get("confidence"),
-        0,
-    )
+        return {
+            "approved": False,
+            "direction": None,
+            "score_difference": abs(
+                up_score
+                - down_score
+            ),
+            "selected_score": max(
+                up_score,
+                down_score
+            ),
+            "confidence": 0,
+            "reasons": [
+                (
+                    "invalid score total "
+                    f"({up_score}+{down_score})"
+                )
+            ],
+        }
 
     direction = determine_direction(
         up_score,
-        down_score,
+        down_score
+    )
+
+    if direction is None:
+
+        return {
+            "approved": False,
+            "direction": None,
+            "score_difference": 0,
+            "selected_score": up_score,
+            "confidence": 0,
+            "reasons": [
+                "UP and DOWN scores are equal"
+            ],
+        }
+
+    difference = abs(
+        up_score
+        - down_score
+    )
+
+    confidence = safe_int(
+        result.get(
+            "confidence"
+        ),
+        0,
+    )
+
+    selected_score = (
+        up_score
+        if direction == "UP"
+        else down_score
     )
 
     reasons = []
 
     # --------------------------------------------------------
-    # 1. Minimum directional separation
+    # BASIC FILTERS
     # --------------------------------------------------------
 
     if difference < 5:
@@ -1145,25 +1458,11 @@ def evaluate_signal_quality(
             f"score difference too small ({difference})"
         )
 
-    # --------------------------------------------------------
-    # 2. Minimum score of selected direction
-    # --------------------------------------------------------
-
-    selected_score = (
-        up_score
-        if direction == "UP"
-        else down_score
-    )
-
     if selected_score < 11:
 
         reasons.append(
             f"{direction} score too low ({selected_score}/18)"
         )
-
-    # --------------------------------------------------------
-    # 3. Confidence
-    # --------------------------------------------------------
 
     if confidence < 70:
 
@@ -1171,91 +1470,75 @@ def evaluate_signal_quality(
             f"confidence too low ({confidence}%)"
         )
 
-    # --------------------------------------------------------
-    # 4. Need enough candles
-    # --------------------------------------------------------
-
     if len(candles) < 40:
 
         reasons.append(
             "not enough closed candles"
         )
 
+    if reasons:
+
+        return {
+            "approved": False,
+            "direction": direction,
+            "score_difference": difference,
+            "selected_score": selected_score,
+            "confidence": confidence,
+            "reasons": reasons,
+        }
+
     # --------------------------------------------------------
-    # 5. Structure confirmation
+    # STRUCTURE
     # --------------------------------------------------------
 
     structure = structure_analysis(
         candles
     )
 
-    if direction == "UP":
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
 
-        if structure != "HH + HL":
-
-            reasons.append(
-                f"structure not bullish ({structure})"
-            )
-
-    else:
-
-        if structure != "LH + LL":
-
-            reasons.append(
-                f"structure not bearish ({structure})"
-            )
+    breakout = detect_recent_breakout(
+        candles
+    )
 
     # --------------------------------------------------------
-    # 6. EMA confirmation
+    # EMA
     # --------------------------------------------------------
 
     ema9 = safe_float(
-        indicators.get("ema9")
+        indicators.get(
+            "ema9"
+        )
     )
 
     ema21 = safe_float(
-        indicators.get("ema21")
+        indicators.get(
+            "ema21"
+        )
     )
 
     last_close = candles[-1]["close"]
 
-    if (
-        ema9 is None
-        or ema21 is None
-    ):
+    # --------------------------------------------------------
+    # OSCILLATORS
+    # --------------------------------------------------------
 
-        reasons.append(
-            "EMA data unavailable"
+    rsi = safe_float(
+        indicators.get(
+            "rsi"
         )
+    )
 
-    else:
-
-        if direction == "UP":
-
-            if not (
-                last_close > ema9
-                and
-                ema9 > ema21
-            ):
-
-                reasons.append(
-                    "EMA structure does not confirm UP"
-                )
-
-        else:
-
-            if not (
-                last_close < ema9
-                and
-                ema9 < ema21
-            ):
-
-                reasons.append(
-                    "EMA structure does not confirm DOWN"
-                )
+    williams = safe_float(
+        indicators.get(
+            "williams_r"
+        )
+    )
 
     # --------------------------------------------------------
-    # 7. ADX / DI confirmation
+    # ADX / DI
     # --------------------------------------------------------
 
     adx_data = indicators.get(
@@ -1263,60 +1546,37 @@ def evaluate_signal_quality(
         {}
     )
 
-    adx_value = safe_float(
-        adx_data.get("adx")
-        if isinstance(adx_data, dict)
-        else None
-    )
-
-    plus_di = safe_float(
-        adx_data.get("plus_di")
-        if isinstance(adx_data, dict)
-        else None
-    )
-
-    minus_di = safe_float(
-        adx_data.get("minus_di")
-        if isinstance(adx_data, dict)
-        else None
-    )
-
-    if (
-        adx_value is None
-        or plus_di is None
-        or minus_di is None
+    if isinstance(
+        adx_data,
+        dict
     ):
 
-        reasons.append(
-            "ADX/DI unavailable"
+        adx_value = safe_float(
+            adx_data.get(
+                "adx"
+            )
+        )
+
+        plus_di = safe_float(
+            adx_data.get(
+                "plus_di"
+            )
+        )
+
+        minus_di = safe_float(
+            adx_data.get(
+                "minus_di"
+            )
         )
 
     else:
 
-        if adx_value < 18:
-
-            reasons.append(
-                f"ADX too weak ({adx_value:.1f})"
-            )
-
-        if direction == "UP":
-
-            if plus_di <= minus_di:
-
-                reasons.append(
-                    "DI does not confirm UP"
-                )
-
-        else:
-
-            if minus_di <= plus_di:
-
-                reasons.append(
-                    "DI does not confirm DOWN"
-                )
+        adx_value = None
+        plus_di = None
+        minus_di = None
 
     # --------------------------------------------------------
-    # 8. Candle confirmation
+    # LATEST CANDLE
     # --------------------------------------------------------
 
     latest = candles[-1]
@@ -1331,43 +1591,340 @@ def evaluate_signal_quality(
         - latest["open"]
     )
 
-    if candle_range <= 0:
+    body_ratio = 0
 
-        reasons.append(
-            "invalid latest candle range"
-        )
-
-    else:
+    if candle_range > 0:
 
         body_ratio = (
             candle_body
             / candle_range
         )
 
-        if body_ratio < 0.35:
+    # --------------------------------------------------------
+    # EVIDENCE COUNTER
+    # --------------------------------------------------------
 
-            reasons.append(
-                f"latest candle too weak ({body_ratio:.2f})"
+    confirmations = 0
+    contradictions = 0
+
+    evidence = []
+
+    # ========================================================
+    # UP
+    # ========================================================
+
+    if direction == "UP":
+
+        # Structure
+        if structure == "HH + HL":
+
+            confirmations += 1
+            evidence.append(
+                "bullish structure"
             )
 
-        if direction == "UP":
+        elif structure == "LH + LL":
 
-            if latest["close"] <= latest["open"]:
+            contradictions += 1
+            evidence.append(
+                "bearish structure"
+            )
 
-                reasons.append(
-                    "latest closed candle is not bullish"
+        # Breakout
+        if breakout == "bullish breakout":
+
+            confirmations += 1
+            evidence.append(
+                "bullish breakout"
+            )
+
+        elif breakout == "bearish breakout":
+
+            contradictions += 1
+            evidence.append(
+                "bearish breakout"
+            )
+
+        # EMA
+        if (
+            ema9 is not None
+            and ema21 is not None
+        ):
+
+            if (
+                last_close > ema9
+                and ema9 > ema21
+            ):
+
+                confirmations += 1
+                evidence.append(
+                    "EMA bullish alignment"
                 )
 
-        else:
+            elif (
+                last_close < ema9
+                and ema9 < ema21
+            ):
 
-            if latest["close"] >= latest["open"]:
-
-                reasons.append(
-                    "latest closed candle is not bearish"
+                contradictions += 1
+                evidence.append(
+                    "EMA bearish alignment"
                 )
+
+        # RSI
+        if rsi is not None:
+
+            if rsi >= 52:
+
+                confirmations += 1
+                evidence.append(
+                    "RSI supports UP"
+                )
+
+            elif rsi <= 45:
+
+                contradictions += 1
+                evidence.append(
+                    "RSI opposes UP"
+                )
+
+        # Williams
+        if williams is not None:
+
+            if williams > -50:
+
+                confirmations += 1
+                evidence.append(
+                    "Williams supports UP"
+                )
+
+            elif williams < -70:
+
+                contradictions += 1
+                evidence.append(
+                    "Williams opposes UP"
+                )
+
+        # DI
+        if (
+            plus_di is not None
+            and minus_di is not None
+        ):
+
+            if plus_di > minus_di:
+
+                confirmations += 1
+                evidence.append(
+                    "DI supports UP"
+                )
+
+            else:
+
+                contradictions += 1
+                evidence.append(
+                    "DI opposes UP"
+                )
+
+        # Candle
+        if (
+            latest["close"]
+            > latest["open"]
+            and body_ratio >= 0.35
+        ):
+
+            confirmations += 1
+            evidence.append(
+                "bullish closed candle"
+            )
+
+        elif (
+            latest["close"]
+            < latest["open"]
+            and body_ratio >= 0.50
+        ):
+
+            contradictions += 1
+            evidence.append(
+                "strong bearish candle"
+            )
+
+    # ========================================================
+    # DOWN
+    # ========================================================
+
+    else:
+
+        # Structure
+        if structure == "LH + LL":
+
+            confirmations += 1
+            evidence.append(
+                "bearish structure"
+            )
+
+        elif structure == "HH + HL":
+
+            contradictions += 1
+            evidence.append(
+                "bullish structure"
+            )
+
+        # Breakout
+        if breakout == "bearish breakout":
+
+            confirmations += 1
+            evidence.append(
+                "bearish breakout"
+            )
+
+        elif breakout == "bullish breakout":
+
+            contradictions += 1
+            evidence.append(
+                "bullish breakout"
+            )
+
+        # EMA
+        if (
+            ema9 is not None
+            and ema21 is not None
+        ):
+
+            if (
+                last_close < ema9
+                and ema9 < ema21
+            ):
+
+                confirmations += 1
+                evidence.append(
+                    "EMA bearish alignment"
+                )
+
+            elif (
+                last_close > ema9
+                and ema9 > ema21
+            ):
+
+                contradictions += 1
+                evidence.append(
+                    "EMA bullish alignment"
+                )
+
+        # RSI
+        if rsi is not None:
+
+            if rsi <= 48:
+
+                confirmations += 1
+                evidence.append(
+                    "RSI supports DOWN"
+                )
+
+            elif rsi >= 55:
+
+                contradictions += 1
+                evidence.append(
+                    "RSI opposes DOWN"
+                )
+
+        # Williams
+        if williams is not None:
+
+            if williams < -50:
+
+                confirmations += 1
+                evidence.append(
+                    "Williams supports DOWN"
+                )
+
+            elif williams > -30:
+
+                contradictions += 1
+                evidence.append(
+                    "Williams opposes DOWN"
+                )
+
+        # DI
+        if (
+            plus_di is not None
+            and minus_di is not None
+        ):
+
+            if minus_di > plus_di:
+
+                confirmations += 1
+                evidence.append(
+                    "DI supports DOWN"
+                )
+
+            else:
+
+                contradictions += 1
+                evidence.append(
+                    "DI opposes DOWN"
+                )
+
+        # Candle
+        if (
+            latest["close"]
+            < latest["open"]
+            and body_ratio >= 0.35
+        ):
+
+            confirmations += 1
+            evidence.append(
+                "bearish closed candle"
+            )
+
+        elif (
+            latest["close"]
+            > latest["open"]
+            and body_ratio >= 0.50
+        ):
+
+            contradictions += 1
+            evidence.append(
+                "strong bullish candle"
+            )
 
     # --------------------------------------------------------
-    # 9. Exhaustion protection
+    # ADX STRENGTH
+    # --------------------------------------------------------
+
+    if adx_value is not None:
+
+        if adx_value >= 18:
+
+            confirmations += 1
+            evidence.append(
+                f"ADX active ({adx_value:.1f})"
+            )
+
+        elif adx_value < 14:
+
+            contradictions += 1
+            evidence.append(
+                f"ADX very weak ({adx_value:.1f})"
+            )
+
+    # --------------------------------------------------------
+    # REQUIRE CONFIRMATIONS
+    # --------------------------------------------------------
+
+    if confirmations < 4:
+
+        reasons.append(
+            f"not enough confirmations ({confirmations})"
+        )
+
+    if contradictions >= 2:
+
+        reasons.append(
+            f"too many contradictions ({contradictions})"
+        )
+
+    # --------------------------------------------------------
+    # EXHAUSTION PROTECTION
     # --------------------------------------------------------
 
     closes = [
@@ -1389,65 +1946,43 @@ def evaluate_signal_quality(
             recent_closes[i]
             > recent_closes[i - 1]
         ):
+
             bullish_count += 1
 
         elif (
             recent_closes[i]
             < recent_closes[i - 1]
         ):
+
             bearish_count += 1
 
-    rsi = safe_float(
-        indicators.get("rsi")
-    )
-
-    williams = safe_float(
-        indicators.get("williams_r")
-    )
-
-    # If DOWN has already moved strongly for many candles
-    # and oscillators are extremely oversold, reject continuation.
     if direction == "DOWN":
 
         if (
             bearish_count >= 5
-            and
-            rsi is not None
-            and
-            rsi < 25
-            and
-            williams is not None
-            and
-            williams < -90
+            and rsi is not None
+            and rsi < 25
+            and williams is not None
+            and williams < -90
         ):
 
             reasons.append(
                 "bearish move appears overextended"
             )
 
-    # If UP has already moved strongly for many candles
-    # and oscillators are extremely overbought, reject continuation.
-    if direction == "UP":
+    else:
 
         if (
             bullish_count >= 5
-            and
-            rsi is not None
-            and
-            rsi > 75
-            and
-            williams is not None
-            and
-            williams > -10
+            and rsi is not None
+            and rsi > 75
+            and williams is not None
+            and williams > -10
         ):
 
             reasons.append(
                 "bullish move appears overextended"
             )
-
-    # --------------------------------------------------------
-    # FINAL DECISION
-    # --------------------------------------------------------
 
     approved = (
         len(reasons) == 0
@@ -1459,6 +1994,9 @@ def evaluate_signal_quality(
         "score_difference": difference,
         "selected_score": selected_score,
         "confidence": confidence,
+        "confirmations": confirmations,
+        "contradictions": contradictions,
+        "evidence": evidence,
         "reasons": reasons,
     }
 
@@ -1479,7 +2017,7 @@ IMPORTANT:
 - Do NOT use future candles.
 - The supplied candles are CLOSED candles only.
 - The last supplied candle is the most recently CLOSED candle.
-- Analyze current market structure from closed candles.
+- Analyze the current market structure from closed candles.
 
 PRIMARY PRIORITY:
 
@@ -1511,28 +2049,34 @@ TOTAL = 18.
 
 For every category, assign points toward UP or DOWN.
 
-Do NOT force a strong score when evidence is weak.
+Do NOT artificially inflate scores.
+
+Do NOT create a strong signal from weak evidence.
 
 A score difference of 1-2 means close/uncertain.
 A score difference of 3-4 means moderate evidence.
 A score difference of 5+ means stronger directional evidence.
 
-Confidence must reflect evidence quality.
+Confidence must reflect the actual evidence.
 
 Do NOT give 90%+ confidence unless there is unusually strong multi-factor confluence.
 
 IMPORTANT:
-The system has a strict external quality filter.
-Therefore do NOT artificially inflate scores just to create a signal.
+There is an external server-side quality filter.
+The server decides whether a Telegram signal is sent.
 
-The final direction must be determined strictly from the larger score.
+Therefore:
+- Be conservative.
+- Do not inflate scores.
+- Do not inflate confidence.
+- Do not invent confirmations.
+
+The final direction must follow the larger score.
 
 UP if UP score > DOWN score.
 DOWN if DOWN score > UP score.
 
-Never use WAIT.
-Never use NEUTRAL.
-Never use NO SIGNAL.
+If scores are equal, the server will reject the setup.
 
 Return ONLY valid JSON.
 
@@ -1564,9 +2108,12 @@ JSON schema:
 # GEMINI JSON CLEANER
 # ============================================================
 
-def clean_json_text(text):
+def clean_json_text(
+    text
+):
 
     if not text:
+
         raise ValueError(
             "Gemini returned empty response"
         )
@@ -1586,8 +2133,13 @@ def clean_json_text(text):
         text,
     )
 
-    start = text.find("{")
-    end = text.rfind("}")
+    start = text.find(
+        "{"
+    )
+
+    end = text.rfind(
+        "}"
+    )
 
     if (
         start >= 0
@@ -1605,7 +2157,9 @@ def clean_json_text(text):
 # GEMINI MT4 ANALYSIS
 # ============================================================
 
-async def analyze_mt4_data(market_data):
+async def analyze_mt4_data(
+    market_data
+):
 
     symbol = str(
         market_data.get(
@@ -1669,7 +2223,9 @@ async def analyze_mt4_data(market_data):
 
         compact_candles.append(
             {
-                "time": candle.get("time"),
+                "time": candle.get(
+                    "time"
+                ),
                 "open": candle["open"],
                 "high": candle["high"],
                 "low": candle["low"],
@@ -1806,6 +2362,7 @@ async def analyze_mt4_data(market_data):
     )
 
     if actual_price is None:
+
         actual_price = (
             latest_closed["close"]
         )
@@ -1871,6 +2428,13 @@ def format_mt4_signal(
         down_score
     )
 
+    if direction is None:
+
+        return (
+            "❌ لا توجد إشارة.\n"
+            "UP و DOWN متساويان."
+        )
+
     entry_price = safe_float(
         market_data.get(
             "price"
@@ -1893,6 +2457,7 @@ def format_mt4_signal(
         )
 
         if closed:
+
             entry_price = (
                 closed[-1]["close"]
             )
@@ -2040,7 +2605,11 @@ async def auto_analyze_and_send(
             f"{latest_candle_time}"
         )
 
-        with auto_signal_lock:
+        # ----------------------------------------------------
+        # نفس الشمعة لا تعاد
+        # ----------------------------------------------------
+
+        with auto_state_lock:
 
             if (
                 last_auto_signal.get(key)
@@ -2073,9 +2642,9 @@ async def auto_analyze_and_send(
             {}
         )
 
-        # ====================================================
-        # STRICT QUALITY GATE
-        # ====================================================
+        # ----------------------------------------------------
+        # QUALITY FILTER
+        # ----------------------------------------------------
 
         quality = evaluate_signal_quality(
             result,
@@ -2086,34 +2655,51 @@ async def auto_analyze_and_send(
         if not quality["approved"]:
 
             logger.info(
-                "SIGNAL REJECTED: %s | %s",
+                "SIGNAL REJECTED: %s | "
+                "direction=%s | "
+                "score=%s | "
+                "diff=%s | "
+                "confidence=%s | "
+                "reasons=%s",
                 key,
+                quality["direction"],
+                quality["selected_score"],
+                quality["score_difference"],
+                quality["confidence"],
                 " | ".join(
                     quality["reasons"]
                 ),
             )
 
-            # IMPORTANT:
-            # Mark this candle as processed so
-            # the same weak setup is NOT sent
-            # repeatedly during the same candle.
-
-            with auto_signal_lock:
-
-                last_auto_signal[key] = (
-                    signal_key
-                )
-
+            # مهم:
+            # لا نسجلها كـ last_auto_signal.
+            # فقط لا نرسلها.
+            #
+            # إذا جاءت شمعة جديدة لاحقًا،
+            # سيعاد التحليل.
             return
 
         logger.info(
             "STRONG SIGNAL APPROVED: %s | "
-            "direction=%s | score=%s | difference=%s | confidence=%s",
+            "direction=%s | "
+            "score=%s/18 | "
+            "difference=%s | "
+            "confidence=%s | "
+            "confirmations=%s | "
+            "contradictions=%s",
             key,
             quality["direction"],
             quality["selected_score"],
             quality["score_difference"],
             quality["confidence"],
+            quality.get(
+                "confirmations",
+                0
+            ),
+            quality.get(
+                "contradictions",
+                0
+            ),
         )
 
         signal = format_mt4_signal(
@@ -2121,12 +2707,22 @@ async def auto_analyze_and_send(
             market_data,
         )
 
-        with auto_signal_lock:
+        # ----------------------------------------------------
+        # DUPLICATE PROTECTION
+        # ----------------------------------------------------
+
+        with auto_state_lock:
 
             if (
                 last_auto_signal.get(key)
                 == signal_key
             ):
+
+                logger.info(
+                    "AUTO SIGNAL DUPLICATE BLOCKED BEFORE SEND: %s",
+                    signal_key,
+                )
+
                 return
 
             last_auto_signal[key] = (
@@ -2183,6 +2779,51 @@ def schedule_auto_analysis(
 
         return
 
+    key = (
+        f"{str(symbol).upper()}:"
+        f"{str(timeframe).upper()}"
+    )
+
+    now = time.time()
+
+    interval_seconds = (
+        AUTO_ANALYSIS_INTERVAL_MINUTES
+        * 60
+    )
+
+    # --------------------------------------------------------
+    # 2-MINUTE THROTTLE
+    # --------------------------------------------------------
+
+    with auto_state_lock:
+
+        previous = (
+            last_auto_analysis_at.get(
+                key,
+                0
+            )
+        )
+
+        elapsed = (
+            now
+            - previous
+        )
+
+        if elapsed < interval_seconds:
+
+            logger.info(
+                "AUTO ANALYSIS THROTTLED: "
+                "%s | %.1fs since last analysis",
+                key,
+                elapsed,
+            )
+
+            return
+
+        # نحجز وقت التحليل هنا
+        # لمنع تشغيل تحليلين لنفس الزوج.
+        last_auto_analysis_at[key] = now
+
     future = (
         asyncio.run_coroutine_threadsafe(
             auto_analyze_and_send(
@@ -2193,9 +2834,12 @@ def schedule_auto_analysis(
         )
     )
 
-    def done_callback(f):
+    def done_callback(
+        f
+    ):
 
         try:
+
             f.result()
 
         except Exception:
@@ -2209,9 +2853,11 @@ def schedule_auto_analysis(
     )
 
     logger.info(
-        "AUTO ANALYSIS SCHEDULED: %s %s",
+        "AUTO ANALYSIS SCHEDULED: "
+        "%s %s | interval=%s minutes",
         symbol,
         timeframe,
+        AUTO_ANALYSIS_INTERVAL_MINUTES,
     )
 
 
@@ -2238,7 +2884,9 @@ def get_mt4_data(
         if data is None:
             return None
 
-        return dict(data)
+        return dict(
+            data
+        )
 
 
 # ============================================================
@@ -2289,7 +2937,9 @@ class HealthHandler(
             body
         )
 
-    def do_GET(self):
+    def do_GET(
+        self
+    ):
 
         path = urlparse(
             self.path
@@ -2326,7 +2976,9 @@ class HealthHandler(
             },
         )
 
-    def do_POST(self):
+    def do_POST(
+        self
+    ):
 
         path = urlparse(
             self.path
@@ -2343,6 +2995,10 @@ class HealthHandler(
             )
 
             return
+
+        # ----------------------------------------------------
+        # CONTENT LENGTH
+        # ----------------------------------------------------
 
         try:
 
@@ -2391,6 +3047,10 @@ class HealthHandler(
 
             return
 
+        # ----------------------------------------------------
+        # JSON
+        # ----------------------------------------------------
+
         try:
 
             raw_body = self.rfile.read(
@@ -2415,8 +3075,14 @@ class HealthHandler(
 
             return
 
+        # ----------------------------------------------------
+        # API KEY
+        # ----------------------------------------------------
+
         if (
-            payload.get("api_key")
+            payload.get(
+                "api_key"
+            )
             != MT4_API_KEY
         ):
 
@@ -2429,6 +3095,10 @@ class HealthHandler(
             )
 
             return
+
+        # ----------------------------------------------------
+        # SYMBOL
+        # ----------------------------------------------------
 
         symbol = str(
             payload.get(
@@ -2478,6 +3148,10 @@ class HealthHandler(
 
             return
 
+        # ----------------------------------------------------
+        # CANDLES
+        # ----------------------------------------------------
+
         clean_candles = normalize_candles(
             candles[:200]
         )
@@ -2508,24 +3182,34 @@ class HealthHandler(
             )
         )
 
-        previous_candle_time = (
-            last_auto_candle.get(
-                key
+        # ----------------------------------------------------
+        # NEW CANDLE DETECTION
+        # ----------------------------------------------------
+
+        with auto_state_lock:
+
+            previous_candle_time = (
+                last_auto_candle.get(
+                    key
+                )
             )
-        )
 
-        new_candle = (
-            bool(latest_candle_time)
-            and
-            latest_candle_time
-            != previous_candle_time
-        )
-
-        if latest_candle_time:
-
-            last_auto_candle[key] = (
+            new_candle = (
+                bool(latest_candle_time)
+                and
                 latest_candle_time
+                != previous_candle_time
             )
+
+            if latest_candle_time:
+
+                last_auto_candle[key] = (
+                    latest_candle_time
+                )
+
+        # ----------------------------------------------------
+        # PRICE
+        # ----------------------------------------------------
 
         price = safe_float(
             payload.get(
@@ -2558,6 +3242,10 @@ class HealthHandler(
             "candles": clean_candles,
         }
 
+        # ----------------------------------------------------
+        # STORE DATA
+        # ----------------------------------------------------
+
         with mt4_data_lock:
 
             mt4_data[key] = data
@@ -2570,6 +3258,10 @@ class HealthHandler(
             len(clean_candles),
             new_candle,
         )
+
+        # ----------------------------------------------------
+        # AUTO ANALYSIS
+        # ----------------------------------------------------
 
         if new_candle:
 
@@ -2589,6 +3281,9 @@ class HealthHandler(
                 ),
                 "new_candle": new_candle,
                 "auto_analysis": True,
+                "analysis_interval_minutes": (
+                    AUTO_ANALYSIS_INTERVAL_MINUTES
+                ),
             },
         )
 
@@ -2615,7 +3310,9 @@ def start_http_server():
 # TELEGRAM OWNER CHECK
 # ============================================================
 
-def is_owner(update):
+def is_owner(
+    update
+):
 
     if not update.effective_user:
         return False
@@ -2646,7 +3343,9 @@ async def start_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2658,8 +3357,9 @@ async def start_command(
         "🎓 ZinoProSignalAI\n\n"
         "✅ MT4 Auto Analysis فعال\n"
         "🧠 Quality Filter فعال\n"
+        "⏱️ التحليل التلقائي: كل دقيقتين كحد أقصى\n"
         "📊 الإشارة الضعيفة لا يتم إرسالها.\n"
-        "📡 التحليل يتم عند بداية كل شمعة جديدة.\n\n"
+        "🕒 توقيت الدخول: Africa/Algiers\n\n"
         "الأوامر:\n"
         "/stats\n"
         "/win\n"
@@ -2675,7 +3375,9 @@ async def stats_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2692,12 +3394,14 @@ async def stats_command(
     )
 
     if total:
+
         winrate = (
             wins
             / total
         ) * 100
 
     else:
+
         winrate = 0
 
     await update.message.reply_text(
@@ -2714,7 +3418,9 @@ async def win_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2736,7 +3442,9 @@ async def loss_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2758,7 +3466,9 @@ async def reset_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2779,7 +3489,9 @@ async def mt4status_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2835,7 +3547,9 @@ async def manual_analyze(
     timeframe
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2884,7 +3598,7 @@ async def manual_analyze(
 
             await update.message.reply_text(
                 "❌ Setup ضعيف\n\n"
-                "الإشارة لن يتم إرسالها.\n"
+                "الإشارة لن يتم إرسالها.\n\n"
                 + "\n".join(
                     f"• {reason}"
                     for reason in quality["reasons"]
@@ -2918,7 +3632,9 @@ async def analyze_command(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -2926,7 +3642,9 @@ async def analyze_command(
 
         return
 
-    if len(context.args) < 1:
+    if len(
+        context.args
+    ) < 1:
 
         await update.message.reply_text(
             "استعمل:\n"
@@ -2942,7 +3660,9 @@ async def analyze_command(
 
     timeframe = (
         context.args[1].upper()
-        if len(context.args) >= 2
+        if len(
+            context.args
+        ) >= 2
         else "M1"
     )
 
@@ -2959,7 +3679,7 @@ async def analyze_command(
 # ============================================================
 
 SCREENSHOT_PROMPT = """
-Analyze this trading chart for short-term binary-options technical analysis.
+Analyze this trading chart for short-term technical analysis.
 
 Use ONLY visible chart information.
 
@@ -3112,10 +3832,21 @@ async def analyze_chart(
             76
         )
 
-    result["direction"] = direction
-    result["up_score"] = up_score
-    result["down_score"] = down_score
-    result["confidence"] = confidence
+    result["direction"] = (
+        direction
+    )
+
+    result["up_score"] = (
+        up_score
+    )
+
+    result["down_score"] = (
+        down_score
+    )
+
+    result["confidence"] = (
+        confidence
+    )
 
     return result
 
@@ -3146,6 +3877,13 @@ def format_screenshot_signal(
             "down_score"
         )
     )
+
+    if direction is None:
+
+        return (
+            "❌ لا توجد إشارة.\n"
+            "الـ UP والـ DOWN متساويان."
+        )
 
     confidence = safe_int(
         result.get(
@@ -3205,7 +3943,9 @@ async def photo_handler(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -3218,6 +3958,7 @@ async def photo_handler(
         or
         not update.message.photo
     ):
+
         return
 
     try:
@@ -3284,7 +4025,9 @@ async def text_handler(
     context
 ):
 
-    if not is_owner(update):
+    if not is_owner(
+        update
+    ):
 
         await reject_non_owner(
             update
@@ -3394,7 +4137,12 @@ def main():
     )
 
     logger.info(
-        "Analysis frequency: NEW CANDLE"
+        "Analysis frequency: EVERY 2 MINUTES MAX"
+    )
+
+    logger.info(
+        "Minimum entry lead: %s seconds",
+        MIN_ENTRY_LEAD_SECONDS,
     )
 
     logger.info(
@@ -3409,12 +4157,20 @@ def main():
         "================================="
     )
 
+    # --------------------------------------------------------
+    # HTTP SERVER
+    # --------------------------------------------------------
+
     http_thread = threading.Thread(
         target=start_http_server,
         daemon=True,
     )
 
     http_thread.start()
+
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
@@ -3496,5 +4252,10 @@ def main():
     )
 
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
