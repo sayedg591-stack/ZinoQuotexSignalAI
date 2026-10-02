@@ -76,6 +76,30 @@ client = genai.Client(
 
 
 # ============================================================
+# TELEGRAM ASYNC STATE
+# ============================================================
+
+telegram_loop = None
+telegram_bot = None
+
+auto_analysis_running = set()
+auto_analysis_lock = threading.Lock()
+
+
+# ============================================================
+# AUTO ANALYSIS TRACKING
+# ============================================================
+
+# آخر شمعة تم تحليلها لكل زوج/فريم
+last_auto_candle = {}
+
+# حماية من تكرار نفس الإشارة
+last_auto_signal = {}
+
+auto_signal_lock = threading.Lock()
+
+
+# ============================================================
 # GEMINI RETRY
 # ============================================================
 
@@ -87,15 +111,12 @@ async def gemini_generate_with_retry(
 ):
     """
     إعادة المحاولة تلقائياً عند أخطاء Gemini المؤقتة.
-    
+
     المحاولات:
     1) مباشرة
     2) بعد 3 ثواني
     3) بعد 7 ثواني
     4) بعد 15 ثانية
-    
-    ملاحظة:
-    إذا كان الخطأ غير مؤقت، يتم إظهاره مباشرة.
     """
 
     delays = [3, 7, 15]
@@ -224,6 +245,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "ZinoProSignalAI",
+                    "auto_analysis": True,
                 },
             )
 
@@ -236,6 +258,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "ZinoProSignalAI",
+                    "auto_analysis": True,
                 },
             )
 
@@ -249,6 +272,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "endpoint": "/mt4",
                     "message": "MT4 endpoint is ready",
+                    "auto_analysis": True,
                 },
             )
 
@@ -517,16 +541,60 @@ class HealthHandler(BaseHTTPRequestHandler):
             f"{symbol}:{timeframe}"
         )
 
+        # ----------------------------------------------------
+        # اكتشاف شمعة جديدة
+        # ----------------------------------------------------
+
+        new_candle = False
+        latest_candle_time = None
+
+        if clean_candles:
+
+            latest_candle_time = clean_candles[-1].get(
+                "time",
+                "",
+            )
+
+            with auto_signal_lock:
+
+                previous_candle_time = last_auto_candle.get(
+                    key
+                )
+
+                if (
+                    latest_candle_time
+                    and latest_candle_time
+                    != previous_candle_time
+                ):
+
+                    new_candle = True
+
+                    last_auto_candle[key] = (
+                        latest_candle_time
+                    )
+
         with mt4_lock:
 
             mt4_data[key] = stored_data
 
         logger.info(
-            "MT4 data received: %s | %s | candles=%s",
+            "MT4 data received: %s | %s | candles=%s | new_candle=%s",
             symbol,
             timeframe,
             len(clean_candles),
+            new_candle,
         )
+
+        # ----------------------------------------------------
+        # تشغيل التحليل التلقائي
+        # ----------------------------------------------------
+
+        if new_candle:
+
+            schedule_auto_analysis(
+                symbol,
+                timeframe,
+            )
 
         self.send_json(
             200,
@@ -535,6 +603,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "candles": len(clean_candles),
+                "new_candle": new_candle,
+                "auto_analysis": True,
             },
         )
 
@@ -545,6 +615,10 @@ class HealthHandler(BaseHTTPRequestHandler):
     ):
         return
 
+
+# ============================================================
+# START WEB SERVER
+# ============================================================
 
 def start_web_server():
 
@@ -601,8 +675,9 @@ async def start_command(
     await update.message.reply_text(
         "🎓 ZinoProSignalAI\n\n"
         "📸 أرسل صورة الشارت للتحليل بالصورة.\n\n"
-        "📡 أو استخدم MT4 لإرسال بيانات الشموع.\n"
-        "مثال:\n"
+        "📡 MT4 يعمل الآن بنظام التحليل التلقائي.\n"
+        "كلما وصلت شمعة جديدة سيتم تحليلها تلقائيًا.\n\n"
+        "يمكنك أيضًا التحليل يدويًا:\n"
         "/analyze EURUSD M1\n\n"
         "الأوامر:\n"
         "/stats - الإحصائيات\n"
@@ -1112,7 +1187,7 @@ UP:
 
 DOWN:
 
-الإلغاء عادة فوق القمة البنيوية الأخيرة.
+الإلغاء عادة فوق القمة البنيوي الأخير.
 
 يجب أن يكون المستوى مبنيًا على بيانات فعلية.
 
@@ -1614,6 +1689,214 @@ async def analyze_mt4_data(
         )
 
     return result
+
+
+# ============================================================
+# AUTO ANALYSIS
+# ============================================================
+
+async def auto_analyze_and_send(
+    symbol,
+    timeframe,
+):
+
+    key = (
+        f"{symbol.upper()}:{timeframe.upper()}"
+    )
+
+    # --------------------------------------------------------
+    # منع تحليلين لنفس الزوج/الفريم في نفس الوقت
+    # --------------------------------------------------------
+
+    with auto_analysis_lock:
+
+        if key in auto_analysis_running:
+
+            logger.info(
+                "Auto analysis already running: %s",
+                key,
+            )
+
+            return
+
+        auto_analysis_running.add(
+            key
+        )
+
+    try:
+
+        market_data = get_mt4_data(
+            symbol,
+            timeframe,
+        )
+
+        if market_data is None:
+
+            logger.warning(
+                "No MT4 data for auto analysis: %s",
+                key,
+            )
+
+            return
+
+        candles = market_data.get(
+            "candles",
+            [],
+        )
+
+        if len(candles) < 20:
+
+            logger.warning(
+                "Not enough candles for auto analysis: %s | %s candles",
+                key,
+                len(candles),
+            )
+
+            return
+
+        logger.info(
+            "AUTO ANALYSIS START: %s",
+            key,
+        )
+
+        result = await analyze_mt4_data(
+            market_data
+        )
+
+        signal = format_mt4_signal(
+            result
+        )
+
+        # ----------------------------------------------------
+        # منع إرسال نفس الشمعة مرة ثانية
+        # ----------------------------------------------------
+
+        latest_candle_time = candles[-1].get(
+            "time",
+            "",
+        )
+
+        signal_key = (
+            f"{key}:{latest_candle_time}"
+        )
+
+        with auto_signal_lock:
+
+            if last_auto_signal.get(key) == signal_key:
+
+                logger.info(
+                    "Duplicate auto signal skipped: %s",
+                    key,
+                )
+
+                return
+
+            last_auto_signal[key] = signal_key
+
+        if telegram_bot is None:
+
+            logger.error(
+                "Telegram bot is not ready"
+            )
+
+            return
+
+        await telegram_bot.send_message(
+            chat_id=OWNER_ID,
+            text=signal,
+        )
+
+        logger.info(
+            "AUTO SIGNAL SENT: %s",
+            key,
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "AUTO MT4 ANALYSIS ERROR: %s",
+            key,
+        )
+
+        # لا نرسل أخطاء Gemini المتكررة إلى Telegram
+        # حتى لا يمتلئ الشات برسائل الخطأ.
+
+    finally:
+
+        with auto_analysis_lock:
+
+            auto_analysis_running.discard(
+                key
+            )
+
+
+# ============================================================
+# SCHEDULE AUTO ANALYSIS
+# ============================================================
+
+def schedule_auto_analysis(
+    symbol,
+    timeframe,
+):
+
+    global telegram_loop
+
+    if telegram_loop is None:
+
+        logger.warning(
+            "Telegram loop not ready; auto analysis skipped: %s %s",
+            symbol,
+            timeframe,
+        )
+
+        return
+
+    try:
+
+        asyncio.run_coroutine_threadsafe(
+            auto_analyze_and_send(
+                symbol,
+                timeframe,
+            ),
+            telegram_loop,
+        )
+
+        logger.info(
+            "AUTO ANALYSIS SCHEDULED: %s %s",
+            symbol,
+            timeframe,
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Failed to schedule auto analysis: %s",
+            error,
+        )
+
+
+# ============================================================
+# TELEGRAM POST INIT
+# ============================================================
+
+async def telegram_post_init(
+    application,
+):
+
+    global telegram_loop
+    global telegram_bot
+
+    telegram_loop = asyncio.get_running_loop()
+
+    telegram_bot = application.bot
+
+    logger.info(
+        "Telegram async loop ready"
+    )
+
+    logger.info(
+        "Automatic MT4 analysis is ENABLED"
+    )
 
 
 # ============================================================
@@ -2465,14 +2748,23 @@ def main():
         "Starting ZinoProSignalAI..."
     )
 
+    # --------------------------------------------------------
+    # تشغيل سيرفر MT4 / Render
+    # --------------------------------------------------------
+
     threading.Thread(
         target=start_web_server,
         daemon=True,
     ).start()
 
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(telegram_post_init)
         .build()
     )
 
@@ -2548,10 +2840,18 @@ def main():
         "Telegram bot is running"
     )
 
+    logger.info(
+        "Automatic MT4 -> Gemini -> Telegram mode ENABLED"
+    )
+
     application.run_polling(
         drop_pending_updates=True
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
