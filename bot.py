@@ -90,10 +90,7 @@ auto_analysis_lock = threading.Lock()
 # AUTO ANALYSIS TRACKING
 # ============================================================
 
-# آخر شمعة تم تحليلها لكل زوج/فريم
 last_auto_candle = {}
-
-# حماية من تكرار نفس الإشارة
 last_auto_signal = {}
 
 auto_signal_lock = threading.Lock()
@@ -109,15 +106,6 @@ async def gemini_generate_with_retry(
     config,
     max_retries=4,
 ):
-    """
-    إعادة المحاولة تلقائياً عند أخطاء Gemini المؤقتة.
-
-    المحاولات:
-    1) مباشرة
-    2) بعد 3 ثواني
-    3) بعد 7 ثواني
-    4) بعد 15 ثانية
-    """
 
     delays = [3, 7, 15]
 
@@ -474,7 +462,6 @@ class HealthHandler(BaseHTTPRequestHandler):
             return
 
         if len(candles) > 200:
-
             candles = candles[:200]
 
         clean_candles = []
@@ -537,9 +524,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             "candles": clean_candles,
         }
 
-        key = (
-            f"{symbol}:{timeframe}"
-        )
+        key = f"{symbol}:{timeframe}"
 
         # ----------------------------------------------------
         # اكتشاف شمعة جديدة
@@ -563,15 +548,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
                 if (
                     latest_candle_time
-                    and latest_candle_time
-                    != previous_candle_time
+                    and latest_candle_time != previous_candle_time
                 ):
 
                     new_candle = True
 
-                    last_auto_candle[key] = (
-                        latest_candle_time
-                    )
+                    last_auto_candle[key] = latest_candle_time
 
         with mt4_lock:
 
@@ -655,8 +637,7 @@ def is_owner(
 
     return (
         update.effective_user is not None
-        and update.effective_user.id
-        == OWNER_ID
+        and update.effective_user.id == OWNER_ID
     )
 
 
@@ -1120,30 +1101,92 @@ Moving Averages = 2
 TOTAL = 18
 
 ==================================================
-DIRECTION
+DIRECTION — IMPORTANT
 ==================================================
 
-اختر اتجاهًا واحدًا:
+الاتجاه النهائي يجب أن يكون متوافقًا تمامًا مع الـscores.
 
-UP
+القواعد إلزامية:
 
-أو
+إذا كان:
 
-DOWN
+up_score > down_score
 
-ممنوع:
+فإن:
 
-WAIT
+direction = "UP"
 
-NO SIGNAL
+إذا كان:
 
-NEUTRAL
+down_score > up_score
 
-إذا كانت الأدلة ضعيفة:
+فإن:
 
-اختر الاتجاه الذي لديه دعم أكبر.
+direction = "DOWN"
 
-لكن اخفض confidence.
+إذا كان:
+
+up_score == down_score
+
+فلا تختر اتجاهًا عشوائيًا.
+
+في هذه الحالة يجب إعادة تقييم الأدلة ودرجات المكونات حتى يظهر فرق حقيقي مبني على التحليل.
+
+ممنوع استخدام UP كاتجاه افتراضي.
+
+ممنوع استخدام DOWN كاتجاه افتراضي.
+
+ممنوع اختيار الاتجاه بناءً على RSI وحده.
+
+ممنوع اختيار الاتجاه بناءً على EMA وحده.
+
+ممنوع اختيار الاتجاه بناءً على مؤشر واحد.
+
+الاتجاه يجب أن يعتمد على مجموع الأدلة:
+
+Price Action
+Structure
+Breakout
+Liquidity
+Momentum
+Candle
+RSI
+Williams %R
+Moving Averages
+Keltner
+ADX/DI
+
+يجب أن تكون القيم الثلاث:
+
+direction
+up_score
+down_score
+
+متوافقة منطقيًا.
+
+مثال صحيح:
+
+direction = "UP"
+up_score = 14
+down_score = 4
+
+مثال صحيح:
+
+direction = "DOWN"
+up_score = 5
+down_score = 13
+
+مثال ممنوع:
+
+direction = "UP"
+up_score = 5
+down_score = 13
+
+مثال ممنوع:
+
+direction = "DOWN"
+up_score = 14
+down_score = 4
 
 ==================================================
 BEST ENTRY TIME
@@ -1254,9 +1297,7 @@ def get_mt4_data(
     timeframe,
 ):
 
-    key = (
-        f"{symbol.upper()}:{timeframe.upper()}"
-    )
+    key = f"{symbol.upper()}:{timeframe.upper()}"
 
     with mt4_lock:
 
@@ -1268,9 +1309,7 @@ def get_mt4_data(
             return None
 
         return json.loads(
-            json.dumps(
-                data
-            )
+            json.dumps(data)
         )
 
 
@@ -1283,11 +1322,8 @@ def calculate_entry_time(
 ):
 
     try:
-
         delay = int(delay)
-
     except Exception:
-
         delay = 1
 
     delay = max(
@@ -1296,16 +1332,12 @@ def calculate_entry_time(
     )
 
     now = datetime.now(
-        ZoneInfo(
-            "Africa/Algiers"
-        )
+        ZoneInfo("Africa/Algiers")
     )
 
     return (
         now
-        + timedelta(
-            minutes=delay
-        )
+        + timedelta(minutes=delay)
     )
 
 
@@ -1318,21 +1350,36 @@ def safe_score(
 ) -> int:
 
     try:
-
-        number = int(
-            value
-        )
-
+        number = int(value)
     except Exception:
-
         return 0
 
     return max(
         0,
-        min(
-            18,
-            number,
-        ),
+        min(18, number),
+    )
+
+
+# ============================================================
+# DETERMINE DIRECTION FROM SCORES
+# ============================================================
+
+def determine_direction(
+    up_score,
+    down_score,
+):
+
+    up_score = safe_score(up_score)
+    down_score = safe_score(down_score)
+
+    if up_score > down_score:
+        return "UP"
+
+    if down_score > up_score:
+        return "DOWN"
+
+    raise RuntimeError(
+        f"Direction unclear: UP={up_score} DOWN={down_score}"
     )
 
 
@@ -1358,19 +1405,29 @@ def format_mt4_signal(
         )
     )
 
-    direction = str(
+    up_score = safe_score(
         data.get(
-            "direction",
-            "UP",
+            "up_score",
+            0,
         )
-    ).upper()
+    )
 
-    if direction not in (
-        "UP",
-        "DOWN",
-    ):
+    down_score = safe_score(
+        data.get(
+            "down_score",
+            0,
+        )
+    )
 
-        direction = "UP"
+    # --------------------------------------------------------
+    # الاتجاه يحدد من الدرجات فقط
+    # لا يوجد fallback إلى UP
+    # --------------------------------------------------------
+
+    direction = determine_direction(
+        up_score,
+        down_score,
+    )
 
     try:
 
@@ -1395,23 +1452,7 @@ def format_mt4_signal(
 
     except Exception:
 
-        confidence_text = (
-            "غير واضح"
-        )
-
-    up_score = safe_score(
-        data.get(
-            "up_score",
-            0,
-        )
-    )
-
-    down_score = safe_score(
-        data.get(
-            "down_score",
-            0,
-        )
-    )
+        confidence_text = "غير واضح"
 
     try:
 
@@ -1428,10 +1469,7 @@ def format_mt4_signal(
 
     delay = max(
         1,
-        min(
-            120,
-            delay,
-        )
+        min(120, delay),
     )
 
     entry_time = calculate_entry_time(
@@ -1461,10 +1499,7 @@ def format_mt4_signal(
 
     if not cancellation_text:
 
-        if (
-            cancellation_level
-            != "غير واضح"
-        ):
+        if cancellation_level != "غير واضح":
 
             if direction == "DOWN":
 
@@ -1487,11 +1522,8 @@ def format_mt4_signal(
             )
 
     if direction == "UP":
-
         direction_text = "🟢 UP"
-
     else:
-
         direction_text = "🔴 DOWN"
 
     structure = str(
@@ -1622,8 +1654,7 @@ def clean_json(
 
         if (
             lines
-            and lines[-1].strip()
-            == "```"
+            and lines[-1].strip() == "```"
         ):
 
             lines = lines[:-1]
@@ -1688,6 +1719,35 @@ async def analyze_mt4_data(
             "Gemini response is not a JSON object"
         )
 
+    # --------------------------------------------------------
+    # التحقق من اتجاه Gemini مقابل الـscores
+    # --------------------------------------------------------
+
+    up_score = safe_score(
+        result.get(
+            "up_score",
+            0,
+        )
+    )
+
+    down_score = safe_score(
+        result.get(
+            "down_score",
+            0,
+        )
+    )
+
+    calculated_direction = determine_direction(
+        up_score,
+        down_score,
+    )
+
+    # نفرض الاتجاه المحسوب من الدرجات
+    # وليس الاتجاه النصي الذي قد يرسله Gemini
+    result["direction"] = calculated_direction
+    result["up_score"] = up_score
+    result["down_score"] = down_score
+
     return result
 
 
@@ -1700,13 +1760,7 @@ async def auto_analyze_and_send(
     timeframe,
 ):
 
-    key = (
-        f"{symbol.upper()}:{timeframe.upper()}"
-    )
-
-    # --------------------------------------------------------
-    # منع تحليلين لنفس الزوج/الفريم في نفس الوقت
-    # --------------------------------------------------------
+    key = f"{symbol.upper()}:{timeframe.upper()}"
 
     with auto_analysis_lock:
 
@@ -1767,10 +1821,6 @@ async def auto_analyze_and_send(
             result
         )
 
-        # ----------------------------------------------------
-        # منع إرسال نفس الشمعة مرة ثانية
-        # ----------------------------------------------------
-
         latest_candle_time = candles[-1].get(
             "time",
             "",
@@ -1817,9 +1867,6 @@ async def auto_analyze_and_send(
             "AUTO MT4 ANALYSIS ERROR: %s",
             key,
         )
-
-        # لا نرسل أخطاء Gemini المتكررة إلى Telegram
-        # حتى لا يمتلئ الشات برسائل الخطأ.
 
     finally:
 
@@ -1995,12 +2042,9 @@ async def analyze_command(
             "MT4 analysis error"
         )
 
-        message = str(
-            error
-        )
+        message = str(error)
 
         if len(message) > 350:
-
             message = message[:350]
 
         await processing.edit_text(
@@ -2231,24 +2275,48 @@ Moving Averages = 2
 TOTAL = 18
 
 ==================================================
-DIRECTION
+DIRECTION — IMPORTANT
 ==================================================
 
-اختر:
+الاتجاه النهائي يجب أن يتوافق مع الـscores.
 
-UP
+إذا كان:
 
-أو
+up_score > down_score
 
-DOWN
+فإن:
 
-ممنوع:
+direction = "UP"
 
-WAIT
-NO SIGNAL
-NEUTRAL
+إذا كان:
 
-إذا كانت الأدلة ضعيفة اختر الاتجاه الذي لديه أدلة أكثر وخفض confidence.
+down_score > up_score
+
+فإن:
+
+direction = "DOWN"
+
+إذا كانا متساويين:
+
+لا تختار UP كافتراضي.
+
+لا تختار DOWN كافتراضي.
+
+أعد تقييم الأدلة حتى يكون الاتجاه متوافقًا مع الدرجات.
+
+ممنوع جعل RSI وحده يحدد الاتجاه.
+
+ممنوع جعل EMA وحده يحدد الاتجاه.
+
+الاتجاه يجب أن يعتمد على مجموع الأدلة.
+
+يجب أن تكون:
+
+direction
+up_score
+down_score
+
+متوافقة منطقيًا.
 
 ==================================================
 ENTRY
@@ -2294,7 +2362,7 @@ DOWN:
 OUTPUT
 ==================================================
 
-أخرج JSON فقط:
+أخرج JSON فقط.
 
 {
   "asset": "EUR/USD",
@@ -2372,6 +2440,33 @@ async def analyze_chart(
             "Gemini response is not a JSON object"
         )
 
+    # --------------------------------------------------------
+    # منع الانحياز في تحليل الصورة أيضًا
+    # --------------------------------------------------------
+
+    up_score = safe_score(
+        data.get(
+            "up_score",
+            0,
+        )
+    )
+
+    down_score = safe_score(
+        data.get(
+            "down_score",
+            0,
+        )
+    )
+
+    direction = determine_direction(
+        up_score,
+        down_score,
+    )
+
+    data["direction"] = direction
+    data["up_score"] = up_score
+    data["down_score"] = down_score
+
     return data
 
 
@@ -2397,19 +2492,25 @@ def format_signal(
         )
     )
 
-    direction = str(
+    up_score = safe_score(
         data.get(
-            "direction",
-            "UP",
+            "up_score",
+            0,
         )
-    ).upper()
+    )
 
-    if direction not in (
-        "UP",
-        "DOWN",
-    ):
+    down_score = safe_score(
+        data.get(
+            "down_score",
+            0,
+        )
+    )
 
-        direction = "UP"
+    # الاتجاه من الدرجات فقط
+    direction = determine_direction(
+        up_score,
+        down_score,
+    )
 
     try:
 
@@ -2434,23 +2535,7 @@ def format_signal(
 
     except Exception:
 
-        confidence_text = (
-            "غير واضح"
-        )
-
-    up_score = safe_score(
-        data.get(
-            "up_score",
-            0,
-        )
-    )
-
-    down_score = safe_score(
-        data.get(
-            "down_score",
-            0,
-        )
-    )
+        confidence_text = "غير واضح"
 
     try:
 
@@ -2467,10 +2552,7 @@ def format_signal(
 
     delay = max(
         1,
-        min(
-            60,
-            delay,
-        )
+        min(60, delay),
     )
 
     entry_price = str(
@@ -2496,10 +2578,7 @@ def format_signal(
 
     if not cancellation_text:
 
-        if (
-            cancellation_level
-            != "غير واضح"
-        ):
+        if cancellation_level != "غير واضح":
 
             if direction == "DOWN":
 
@@ -2542,11 +2621,8 @@ def format_signal(
     )
 
     if direction == "DOWN":
-
         direction_text = "🔴 DOWN"
-
     else:
-
         direction_text = "🟢 UP"
 
     return (
@@ -2648,12 +2724,9 @@ async def photo_handler(
             "Analysis error"
         )
 
-        message = str(
-            error
-        )
+        message = str(error)
 
         if len(message) > 350:
-
             message = message[:350]
 
         await processing.edit_text(
