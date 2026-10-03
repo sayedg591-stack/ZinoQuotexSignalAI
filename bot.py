@@ -48,12 +48,8 @@ ALGIERS = ZoneInfo("Africa/Algiers")
 # AUTO ANALYSIS SETTINGS
 # ============================================================
 
-# تحليل تلقائي بحد أقصى مرة كل دقيقتين
-# لكل زوج + فريم.
 AUTO_ANALYSIS_INTERVAL_MINUTES = 2
 
-# أقل وقت نتركه بين إرسال الإشارة ووقت الدخول.
-# إذا كانت الشمعة القادمة قريبة جدًا، نؤجل الدخول للشمعة التالية.
 MIN_ENTRY_LEAD_SECONDS = 20
 
 
@@ -111,13 +107,8 @@ telegram_bot = None
 auto_analysis_running = set()
 auto_analysis_lock = threading.Lock()
 
-# آخر شمعة وصلت من MT4
 last_auto_candle = {}
-
-# آخر تحليل تلقائي تم تشغيله
 last_auto_analysis_at = {}
-
-# آخر إشارة تم إرسالها
 last_auto_signal = {}
 
 auto_state_lock = threading.Lock()
@@ -161,17 +152,6 @@ def get_next_entry_time(
     timeframe,
     delay_minutes=None
 ):
-    """
-    يحسب وقت الدخول القادم.
-
-    مثال M1:
-    إذا جاء التحليل 16:20:10
-    الدخول الطبيعي = 16:21:00
-
-    وإذا وصل التحليل قريبًا جدًا من 16:21
-    نؤجل إلى 16:22 حتى يكون عند المستخدم
-    وقت فعلي للدخول.
-    """
 
     minutes = timeframe_to_minutes(
         timeframe
@@ -376,6 +356,7 @@ def candle_time_value(
         return 0
 
     try:
+
         return float(
             text
         )
@@ -478,21 +459,10 @@ def normalize_candles(
             candle
         )
 
-        item["open"] = (
-            open_price
-        )
-
-        item["high"] = (
-            high_price
-        )
-
-        item["low"] = (
-            low_price
-        )
-
-        item["close"] = (
-            close_price
-        )
+        item["open"] = open_price
+        item["high"] = high_price
+        item["low"] = low_price
+        item["close"] = close_price
 
         if candle.get(
             "volume"
@@ -517,12 +487,6 @@ def normalize_candles(
 def get_closed_candles(
     candles
 ):
-    """
-    آخر شمعة من MT4 تعتبر شمعة حالية تتشكل.
-
-    لذلك Gemini يحلل candles[:-1]
-    فقط.
-    """
 
     clean = normalize_candles(
         candles
@@ -1356,20 +1320,6 @@ def evaluate_signal_quality(
     candles,
     indicators,
 ):
-    """
-    جودة الإشارة:
-
-    1. فرق السكور >= 5
-    2. السكور المختار >= 11
-    3. Confidence >= 70
-    4. 40 شمعة مغلقة على الأقل
-    5. عدة confirmations
-    6. منع الإشارات المتناقضة
-    7. منع exhaustion الشديد
-
-    إذا لم يتحقق الشرط:
-    لا يتم إرسال أي Telegram signal.
-    """
 
     up_score = safe_score(
         result.get(
@@ -1383,7 +1333,6 @@ def evaluate_signal_quality(
         )
     )
 
-    # يجب أن يكون مجموع السكور 18
     if (
         up_score
         + down_score
@@ -1448,10 +1397,6 @@ def evaluate_signal_quality(
 
     reasons = []
 
-    # --------------------------------------------------------
-    # BASIC FILTERS
-    # --------------------------------------------------------
-
     if difference < 5:
 
         reasons.append(
@@ -1487,25 +1432,13 @@ def evaluate_signal_quality(
             "reasons": reasons,
         }
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
-
     structure = structure_analysis(
         candles
     )
 
-    # --------------------------------------------------------
-    # BREAKOUT
-    # --------------------------------------------------------
-
     breakout = detect_recent_breakout(
         candles
     )
-
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
 
     ema9 = safe_float(
         indicators.get(
@@ -1521,10 +1454,6 @@ def evaluate_signal_quality(
 
     last_close = candles[-1]["close"]
 
-    # --------------------------------------------------------
-    # OSCILLATORS
-    # --------------------------------------------------------
-
     rsi = safe_float(
         indicators.get(
             "rsi"
@@ -1536,10 +1465,6 @@ def evaluate_signal_quality(
             "williams_r"
         )
     )
-
-    # --------------------------------------------------------
-    # ADX / DI
-    # --------------------------------------------------------
 
     adx_data = indicators.get(
         "adx",
@@ -1575,10 +1500,6 @@ def evaluate_signal_quality(
         plus_di = None
         minus_di = None
 
-    # --------------------------------------------------------
-    # LATEST CANDLE
-    # --------------------------------------------------------
-
     latest = candles[-1]
 
     candle_range = (
@@ -1600,22 +1521,13 @@ def evaluate_signal_quality(
             / candle_range
         )
 
-    # --------------------------------------------------------
-    # EVIDENCE COUNTER
-    # --------------------------------------------------------
-
     confirmations = 0
     contradictions = 0
 
     evidence = []
 
-    # ========================================================
-    # UP
-    # ========================================================
-
     if direction == "UP":
 
-        # Structure
         if structure == "HH + HL":
 
             confirmations += 1
@@ -1630,7 +1542,6 @@ def evaluate_signal_quality(
                 "bearish structure"
             )
 
-        # Breakout
         if breakout == "bullish breakout":
 
             confirmations += 1
@@ -1645,7 +1556,6 @@ def evaluate_signal_quality(
                 "bearish breakout"
             )
 
-        # EMA
         if (
             ema9 is not None
             and ema21 is not None
@@ -1671,7 +1581,6 @@ def evaluate_signal_quality(
                     "EMA bearish alignment"
                 )
 
-        # RSI
         if rsi is not None:
 
             if rsi >= 52:
@@ -1688,7 +1597,6 @@ def evaluate_signal_quality(
                     "RSI opposes UP"
                 )
 
-        # Williams
         if williams is not None:
 
             if williams > -50:
@@ -1705,7 +1613,6 @@ def evaluate_signal_quality(
                     "Williams opposes UP"
                 )
 
-        # DI
         if (
             plus_di is not None
             and minus_di is not None
@@ -1725,7 +1632,6 @@ def evaluate_signal_quality(
                     "DI opposes UP"
                 )
 
-        # Candle
         if (
             latest["close"]
             > latest["open"]
@@ -1748,13 +1654,8 @@ def evaluate_signal_quality(
                 "strong bearish candle"
             )
 
-    # ========================================================
-    # DOWN
-    # ========================================================
-
     else:
 
-        # Structure
         if structure == "LH + LL":
 
             confirmations += 1
@@ -1769,7 +1670,6 @@ def evaluate_signal_quality(
                 "bullish structure"
             )
 
-        # Breakout
         if breakout == "bearish breakout":
 
             confirmations += 1
@@ -1784,7 +1684,6 @@ def evaluate_signal_quality(
                 "bullish breakout"
             )
 
-        # EMA
         if (
             ema9 is not None
             and ema21 is not None
@@ -1810,7 +1709,6 @@ def evaluate_signal_quality(
                     "EMA bullish alignment"
                 )
 
-        # RSI
         if rsi is not None:
 
             if rsi <= 48:
@@ -1827,7 +1725,6 @@ def evaluate_signal_quality(
                     "RSI opposes DOWN"
                 )
 
-        # Williams
         if williams is not None:
 
             if williams < -50:
@@ -1844,7 +1741,6 @@ def evaluate_signal_quality(
                     "Williams opposes DOWN"
                 )
 
-        # DI
         if (
             plus_di is not None
             and minus_di is not None
@@ -1864,7 +1760,6 @@ def evaluate_signal_quality(
                     "DI opposes DOWN"
                 )
 
-        # Candle
         if (
             latest["close"]
             < latest["open"]
@@ -1887,10 +1782,6 @@ def evaluate_signal_quality(
                 "strong bullish candle"
             )
 
-    # --------------------------------------------------------
-    # ADX STRENGTH
-    # --------------------------------------------------------
-
     if adx_value is not None:
 
         if adx_value >= 18:
@@ -1907,10 +1798,6 @@ def evaluate_signal_quality(
                 f"ADX very weak ({adx_value:.1f})"
             )
 
-    # --------------------------------------------------------
-    # REQUIRE CONFIRMATIONS
-    # --------------------------------------------------------
-
     if confirmations < 4:
 
         reasons.append(
@@ -1922,10 +1809,6 @@ def evaluate_signal_quality(
         reasons.append(
             f"too many contradictions ({contradictions})"
         )
-
-    # --------------------------------------------------------
-    # EXHAUSTION PROTECTION
-    # --------------------------------------------------------
 
     closes = [
         c["close"]
@@ -2605,10 +2488,6 @@ async def auto_analyze_and_send(
             f"{latest_candle_time}"
         )
 
-        # ----------------------------------------------------
-        # نفس الشمعة لا تعاد
-        # ----------------------------------------------------
-
         with auto_state_lock:
 
             if (
@@ -2642,10 +2521,6 @@ async def auto_analyze_and_send(
             {}
         )
 
-        # ----------------------------------------------------
-        # QUALITY FILTER
-        # ----------------------------------------------------
-
         quality = evaluate_signal_quality(
             result,
             closed_candles,
@@ -2671,12 +2546,6 @@ async def auto_analyze_and_send(
                 ),
             )
 
-            # مهم:
-            # لا نسجلها كـ last_auto_signal.
-            # فقط لا نرسلها.
-            #
-            # إذا جاءت شمعة جديدة لاحقًا،
-            # سيعاد التحليل.
             return
 
         logger.info(
@@ -2706,10 +2575,6 @@ async def auto_analyze_and_send(
             result,
             market_data,
         )
-
-        # ----------------------------------------------------
-        # DUPLICATE PROTECTION
-        # ----------------------------------------------------
 
         with auto_state_lock:
 
@@ -2791,10 +2656,6 @@ def schedule_auto_analysis(
         * 60
     )
 
-    # --------------------------------------------------------
-    # 2-MINUTE THROTTLE
-    # --------------------------------------------------------
-
     with auto_state_lock:
 
         previous = (
@@ -2811,17 +2672,8 @@ def schedule_auto_analysis(
 
         if elapsed < interval_seconds:
 
-            logger.info(
-                "AUTO ANALYSIS THROTTLED: "
-                "%s | %.1fs since last analysis",
-                key,
-                elapsed,
-            )
-
             return
 
-        # نحجز وقت التحليل هنا
-        # لمنع تشغيل تحليلين لنفس الزوج.
         last_auto_analysis_at[key] = now
 
     future = (
@@ -2996,10 +2848,6 @@ class HealthHandler(
 
             return
 
-        # ----------------------------------------------------
-        # CONTENT LENGTH
-        # ----------------------------------------------------
-
         try:
 
             content_length = int(
@@ -3047,10 +2895,6 @@ class HealthHandler(
 
             return
 
-        # ----------------------------------------------------
-        # JSON
-        # ----------------------------------------------------
-
         try:
 
             raw_body = self.rfile.read(
@@ -3075,10 +2919,6 @@ class HealthHandler(
 
             return
 
-        # ----------------------------------------------------
-        # API KEY
-        # ----------------------------------------------------
-
         if (
             payload.get(
                 "api_key"
@@ -3095,10 +2935,6 @@ class HealthHandler(
             )
 
             return
-
-        # ----------------------------------------------------
-        # SYMBOL
-        # ----------------------------------------------------
 
         symbol = str(
             payload.get(
@@ -3148,10 +2984,6 @@ class HealthHandler(
 
             return
 
-        # ----------------------------------------------------
-        # CANDLES
-        # ----------------------------------------------------
-
         clean_candles = normalize_candles(
             candles[:200]
         )
@@ -3182,10 +3014,6 @@ class HealthHandler(
             )
         )
 
-        # ----------------------------------------------------
-        # NEW CANDLE DETECTION
-        # ----------------------------------------------------
-
         with auto_state_lock:
 
             previous_candle_time = (
@@ -3206,10 +3034,6 @@ class HealthHandler(
                 last_auto_candle[key] = (
                     latest_candle_time
                 )
-
-        # ----------------------------------------------------
-        # PRICE
-        # ----------------------------------------------------
 
         price = safe_float(
             payload.get(
@@ -3242,26 +3066,29 @@ class HealthHandler(
             "candles": clean_candles,
         }
 
-        # ----------------------------------------------------
-        # STORE DATA
-        # ----------------------------------------------------
-
         with mt4_data_lock:
 
             mt4_data[key] = data
 
-        logger.info(
-            "MT4 data received: "
-            "%s | %s | candles=%s | new_candle=%s",
-            symbol,
-            timeframe,
-            len(clean_candles),
-            new_candle,
-        )
+        # ====================================================
+        # CLEAN MT4 LOG
+        # ====================================================
+        # لا نطبع كل البيانات المتكررة.
+        # نطبع فقط عند اكتشاف شمعة جديدة.
 
-        # ----------------------------------------------------
+        if new_candle:
+
+            logger.info(
+                "NEW CANDLE: "
+                "%s | %s | candles=%s",
+                symbol,
+                timeframe,
+                len(clean_candles),
+            )
+
+        # ====================================================
         # AUTO ANALYSIS
-        # ----------------------------------------------------
+        # ====================================================
 
         if new_candle:
 
@@ -4157,20 +3984,12 @@ def main():
         "================================="
     )
 
-    # --------------------------------------------------------
-    # HTTP SERVER
-    # --------------------------------------------------------
-
     http_thread = threading.Thread(
         target=start_http_server,
         daemon=True,
     )
 
     http_thread.start()
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
 
     application = (
         Application.builder()
