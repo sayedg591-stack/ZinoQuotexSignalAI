@@ -42,8 +42,11 @@ PORT = int(os.getenv("PORT", "10000"))
 
 ALGIERS = ZoneInfo("Africa/Algiers")
 
-# الحد الأدنى بين تحليلات تلقائية لنفس الزوج والفريم
-AUTO_ANALYSIS_INTERVAL_MINUTES = 3
+# تحليل تلقائي مرة كل دقيقة لكل زوج/فريم
+AUTO_ANALYSIS_INTERVAL_MINUTES = 1
+
+# الدخول دائمًا بعد دقيقتين من وقت الإشارة
+ENTRY_DELAY_MINUTES = 2
 
 # الحد الأدنى للوقت المتبقي قبل الدخول
 MIN_ENTRY_LEAD_SECONDS = 40
@@ -190,15 +193,10 @@ def timeframe_to_minutes(timeframe):
 
 def get_next_entry_time(timeframe):
 
-    minutes = timeframe_to_minutes(
-        timeframe
-    )
-
-    if minutes < 1:
-        minutes = 1
-
+    # الفريم يستخدم للتحليل فقط.
+    # وقت الدخول ثابت بعد دقيقتين من الإشارة.
     return now_algiers() + timedelta(
-        minutes=minutes
+        minutes=ENTRY_DELAY_MINUTES
     )
 
 
@@ -292,7 +290,7 @@ def get_closed_candles(candles):
         return []
 
     # MT4 يرسل آخر شمعة باعتبارها الحالية.
-    # لذلك نستبعد الأخيرة لأنها غير مغلقة.
+    # نستبعد الأخيرة لأنها غير مغلقة.
     return candles[:-1]
 
 
@@ -932,6 +930,188 @@ def build_technical_snapshot(
 
 
 # ============================================================
+# ENSURE DIRECTIONAL SIGNAL
+# ============================================================
+
+def ensure_directional_signal(
+    analysis,
+    candles
+):
+
+    if not isinstance(
+        analysis,
+        dict
+    ):
+        return None
+
+    up_score = safe_int(
+        analysis.get(
+            "up_score",
+            0
+        )
+    )
+
+    down_score = safe_int(
+        analysis.get(
+            "down_score",
+            0
+        )
+    )
+
+    direction = str(
+        analysis.get(
+            "direction",
+            ""
+        )
+    ).upper().strip()
+
+    # --------------------------------------------------------
+    # 1. إذا Gemini أعطى UP/DOWN صحيح نخليه
+    # --------------------------------------------------------
+
+    if direction not in (
+        "UP",
+        "DOWN"
+    ):
+
+        # ----------------------------------------------------
+        # 2. نختار من أعلى Score
+        # ----------------------------------------------------
+
+        if up_score > down_score:
+
+            direction = "UP"
+
+        elif down_score > up_score:
+
+            direction = "DOWN"
+
+        else:
+
+            # ------------------------------------------------
+            # 3. إذا تعادلوا نرجع للتحليل الفني الحقيقي
+            # ------------------------------------------------
+
+            snapshot = build_technical_snapshot(
+                candles
+            )
+
+            structure = (
+                snapshot
+                .get(
+                    "structure",
+                    {}
+                )
+                .get(
+                    "trend",
+                    ""
+                )
+            )
+
+            if structure in (
+                "UP",
+                "DOWN"
+            ):
+
+                direction = structure
+
+            else:
+
+                ema9 = snapshot.get(
+                    "ema9"
+                )
+
+                ema21 = snapshot.get(
+                    "ema21"
+                )
+
+                if (
+                    ema9 is not None
+                    and ema21 is not None
+                ):
+
+                    direction = (
+                        "UP"
+                        if ema9 >= ema21
+                        else "DOWN"
+                    )
+
+                elif len(candles) >= 2:
+
+                    last_close = candles[-1]["close"]
+                    previous_close = candles[-2]["close"]
+
+                    direction = (
+                        "UP"
+                        if last_close >= previous_close
+                        else "DOWN"
+                    )
+
+                else:
+
+                    direction = "UP"
+
+    # --------------------------------------------------------
+    # دائمًا signal=true للإشارات التلقائية
+    # --------------------------------------------------------
+
+    analysis["signal"] = True
+    analysis["direction"] = direction
+
+    # --------------------------------------------------------
+    # تنظيف Confidence
+    # --------------------------------------------------------
+
+    confidence = safe_float(
+        analysis.get(
+            "confidence",
+            0
+        )
+    )
+
+    confidence = max(
+        0.0,
+        min(
+            100.0,
+            confidence
+        )
+    )
+
+    analysis["confidence"] = confidence
+
+    # --------------------------------------------------------
+    # ضمان وجود Reason
+    # --------------------------------------------------------
+
+    reason = str(
+        analysis.get(
+            "reason",
+            ""
+        )
+    ).strip()
+
+    if len(reason) < 10:
+
+        if direction == "UP":
+
+            reason = (
+                "الاتجاه المختار UP بناءً على "
+                "الجهة الأقوى في المعطيات الفنية."
+            )
+
+        else:
+
+            reason = (
+                "الاتجاه المختار DOWN بناءً على "
+                "الجهة الأقوى في المعطيات الفنية."
+            )
+
+    analysis["reason"] = reason
+
+    return analysis
+
+
+# ============================================================
 # GEMINI PROMPT
 # ============================================================
 
@@ -973,16 +1153,28 @@ Recent closed candles:
 CORE RULE
 ============================================================
 
-Accuracy and setup quality are more important than frequency.
+Every successful analysis MUST choose one direction:
 
-DO NOT force a trade.
+UP or DOWN.
 
-If the setup is weak, mixed, ranging, exhausted,
-or contradictory:
+Never return:
 
-"signal": false
+WAIT
+NO SIGNAL
+NEUTRAL
 
-Never create a signal merely because the user wants one.
+Choose the direction with the stronger evidence from the
+supplied market data.
+
+Do NOT invent data.
+
+Do NOT artificially increase confidence.
+
+If the setup is weak or conflicting, still choose the
+stronger side, but keep confidence and scores honest.
+
+The purpose is to produce a directional signal for every
+successful automatic analysis.
 
 ============================================================
 ANALYSIS PRIORITY
@@ -1031,34 +1223,40 @@ TOTAL = 18
 Calculate UP and DOWN independently.
 
 ============================================================
-SIGNAL FILTER
+DIRECTION SELECTION
 ============================================================
 
-A valid signal normally requires ALL of these:
+Compare UP and DOWN evidence.
 
-- signal = true
-- direction = UP or DOWN
-- selected score >= 11/18
-- score difference >= 5
-- confidence >= 70
-- at least 4 independent confirmations
-- contradictions < 2
-- at least 40 closed candles
-- clear directional structure
-- no obvious exhaustion
+Select the side with the stronger combination of:
 
-If these conditions are not satisfied:
+- Price Action
+- Structure
+- Breakout / Retest
+- Liquidity
+- Momentum
+- Candle behavior
+- RSI
+- Williams %R
+- Keltner
+- ADX / DI
+- EMA 9 / EMA 21
 
-signal = false
+Do not select a direction merely because the last candle
+was green or red.
 
 ============================================================
 CONFIDENCE
 ============================================================
 
+Confidence must be honest.
+
 Do NOT use 90% or higher unless the setup is exceptionally
 strong and several independent factors align.
 
-Avoid artificially high confidence.
+Weak or conflicting evidence must have lower confidence.
+
+Never artificially inflate confidence.
 
 ============================================================
 IMPORTANT REVERSAL RULE
@@ -1085,10 +1283,11 @@ A reversal requires actual evidence such as:
 RANGE RULE
 ============================================================
 
-If structure is RANGE and there is no clear breakout,
-retest, or strong rejection:
+If structure is RANGE, do not pretend that the market is
+strongly trending.
 
-signal = false
+You must still select UP or DOWN for the directional
+output, but confidence should reflect the weakness.
 
 ============================================================
 JSON ONLY
@@ -1117,26 +1316,16 @@ Use exactly these fields:
   "reason": "Short evidence-based explanation"
 }}
 
-For a weak setup:
+Rules:
 
-{{
-  "signal": false,
-  "direction": "UP",
-  "confidence": 58,
-  "up_score": 8,
-  "down_score": 7,
-  "structure_score": 1,
-  "breakout_score": 0,
-  "liquidity_score": 1,
-  "momentum_score": 1,
-  "candle_score": 1,
-  "rsi_score": 1,
-  "summary_score": 1,
-  "oscillators_score": 1,
-  "moving_averages_score": 1,
-  "contradictions": 2,
-  "reason": "Weak and conflicting setup"
-}}
+- signal MUST be true.
+- direction MUST be UP or DOWN.
+- Never return WAIT.
+- Never return NO SIGNAL.
+- Never return NEUTRAL.
+- Do not invent indicator values.
+- Keep confidence honest.
+- Scores must reflect the supplied evidence.
 """
 
 
@@ -1183,9 +1372,11 @@ def analyze_with_gemini(
         )
 
         if not text:
+
             logger.warning(
                 "Gemini returned empty response."
             )
+
             return None
 
         text = text.strip()
@@ -1339,6 +1530,7 @@ def get_signal_rejection_reasons(
     ).strip()
 
     if not signal:
+
         reasons.append(
             f"signal={analysis.get('signal')}"
         )
@@ -1347,41 +1539,49 @@ def get_signal_rejection_reasons(
         "UP",
         "DOWN"
     ):
+
         reasons.append(
             f"direction={direction or 'EMPTY'}"
         )
 
     if selected_score < 11:
+
         reasons.append(
             f"score={selected_score}/18"
         )
 
     if score_difference < 5:
+
         reasons.append(
             f"difference={score_difference}"
         )
 
     if confidence < 70:
+
         reasons.append(
             f"confidence={confidence:.0f}%"
         )
 
     if confirmations < 4:
+
         reasons.append(
             f"confirmations={confirmations}"
         )
 
     if contradictions >= 2:
+
         reasons.append(
             f"contradictions={contradictions}"
         )
 
     if len(candles) < 40:
+
         reasons.append(
             f"closed_candles={len(candles)}"
         )
 
     if len(reason) < 10:
+
         reasons.append(
             "reason_too_short"
         )
@@ -1423,6 +1623,12 @@ def format_signal(
             "UP"
         )
     ).upper()
+
+    if direction not in (
+        "UP",
+        "DOWN"
+    ):
+        direction = "UP"
 
     confidence = safe_float(
         analysis.get(
@@ -1488,12 +1694,6 @@ def format_signal(
             f"{cancellation}"
         )
 
-    timeframe_minutes = (
-        timeframe_to_minutes(
-            timeframe
-        )
-    )
-
     return (
         "🎓 ZinoProSignalAI\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1503,7 +1703,7 @@ def format_signal(
         f"📈 UP Score: {up_score}/18\n"
         f"📉 DOWN Score: {down_score}/18\n\n"
         f"⏳ Entry after: "
-        f"{timeframe_minutes} min\n"
+        f"{ENTRY_DELAY_MINUTES} min\n"
         f"⏰ Entry Time: "
         f"{format_algiers(entry_time)}\n"
         f"💰 Entry Price: "
@@ -1636,6 +1836,10 @@ async def auto_analyze_pair(
         )
     )
 
+    # --------------------------------------------------------
+    # تحليل مرة كل دقيقة فقط لنفس الزوج والفريم
+    # --------------------------------------------------------
+
     if (
         current_time - last_time
         <
@@ -1667,6 +1871,8 @@ async def auto_analyze_pair(
 
         return
 
+    # نسجل وقت التحليل قبل استدعاء Gemini
+    # حتى لا يتم تشغيل عدة تحليلات متزامنة.
     last_auto_analysis[key] = (
         current_time
     )
@@ -1712,6 +1918,26 @@ async def auto_analyze_pair(
     except Exception:
         pass
 
+    # --------------------------------------------------------
+    # ضمان أن التحليل التلقائي يعطي UP أو DOWN
+    # --------------------------------------------------------
+
+    analysis = ensure_directional_signal(
+        analysis,
+        closed
+    )
+
+    if not analysis:
+
+        logger.warning(
+            "Could not prepare directional signal: "
+            "%s %s",
+            symbol,
+            timeframe
+        )
+
+        return
+
     direction = str(
         analysis.get(
             "direction",
@@ -1753,27 +1979,10 @@ async def auto_analyze_pair(
         down_score
     )
 
-    if not evaluate_signal_quality(
-        analysis,
-        closed
-    ):
-
-        reasons = (
-            get_signal_rejection_reasons(
-                analysis,
-                closed
-            )
-        )
-
-        logger.warning(
-            "WEAK SETUP REJECTED | "
-            "%s %s | %s",
-            symbol,
-            timeframe,
-            " | ".join(reasons)
-        )
-
-        return
+    # --------------------------------------------------------
+    # لا يوجد فلتر يمنع الإشارة التلقائية.
+    # البوت يختار الاتجاه الأقوى ويرسله.
+    # --------------------------------------------------------
 
     entry_time = (
         get_next_entry_time(
@@ -2066,6 +2275,11 @@ class MT4Handler(
                     time.time(),
             }
 
+        # ----------------------------------------------------
+        # نستخدمه للتتبع فقط.
+        # لم يعد شرطًا لبدء التحليل.
+        # ----------------------------------------------------
+
         is_new_candle, latest_closed = (
             detect_new_closed_candle(
                 symbol,
@@ -2106,25 +2320,36 @@ class MT4Handler(
             }
         )
 
-        if not is_new_candle:
-            return
+        # ----------------------------------------------------
+        # مهم:
+        # لا يوجد هنا:
+        #
+        # if not is_new_candle:
+        #     return
+        #
+        # لأننا نريد التحليل كل دقيقة.
+        # ----------------------------------------------------
 
         application = (
             telegram_application
         )
 
         if application is None:
+
             logger.warning(
                 "Telegram application "
                 "is not ready."
             )
+
             return
 
         if telegram_loop is None:
+
             logger.warning(
                 "Telegram loop "
                 "is not ready."
             )
+
             return
 
         try:
@@ -2212,6 +2437,8 @@ async def start_command(
         "━━━━━━━━━━━━━━━━━━\n"
         "✅ البوت يعمل\n"
         "📡 MT4 → Render → Gemini → Telegram\n\n"
+        "🤖 التحليل التلقائي: كل دقيقة\n"
+        "⏳ الدخول: بعد دقيقتين\n\n"
         "الأوامر:\n"
         "/analyze\n"
         "/mt4status\n"
@@ -2239,10 +2466,13 @@ async def stats_command(
     total = wins + losses
 
     if total > 0:
+
         winrate = (
             wins / total
         ) * 100
+
     else:
+
         winrate = 0
 
     await update.message.reply_text(
@@ -2484,25 +2714,15 @@ async def analyze_command(
         except Exception:
             pass
 
-        reasons = (
-            get_signal_rejection_reasons(
-                analysis,
-                closed
-            )
+        # نستخدم نفس نظام الاتجاه التلقائي
+        analysis = ensure_directional_signal(
+            analysis,
+            closed
         )
 
-        if reasons:
-
-            logger.warning(
-                "MANUAL ANALYSIS REJECTED | "
-                "%s %s | %s",
-                symbol,
-                timeframe,
-                " | ".join(reasons)
-            )
+        if not analysis:
 
             rejected_count += 1
-
             continue
 
         message = format_signal(
@@ -2537,14 +2757,13 @@ async def analyze_command(
     else:
 
         await update.message.reply_text(
-            "🔎 تم التحليل.\n"
-            "❌ لا يوجد Setup قوي حاليًا.\n\n"
+            "🔎 تم التحليل، "
+            "لكن لم يتم إرسال نتيجة."
+            "\n\n"
             f"📊 أزواج تم تحليلها: "
             f"{analyzed_count}\n"
-            f"🚫 مرفوضة: "
-            f"{rejected_count}\n\n"
-            "📋 السبب التفصيلي موجود في "
-            "Render Logs."
+            f"🚫 فشل التحليل: "
+            f"{rejected_count}"
         )
 
 
@@ -2569,8 +2788,9 @@ async def text_message_handler(
         return
 
     await update.message.reply_text(
-        "📡 بيانات MT4 موجودة.\n"
-        "استخدم /analyze لتحليل آخر البيانات."
+        "🤖 التحليل التلقائي يعمل.\n"
+        "📡 البوت يستقبل بيانات MT4 "
+        "ويحللها كل دقيقة."
     )
 
 
@@ -2632,10 +2852,6 @@ Focus on:
 11. ADX / DI
 
 Do not invent values that cannot be seen.
-
-If the setup is weak, say:
-
-Setup ضعيف.
 
 If the setup is strong, identify UP or DOWN
 and explain the evidence.
@@ -2726,12 +2942,18 @@ def main():
 
     logger.info(
         "Auto analysis interval: "
-        "%s minutes",
+        "%s minute(s)",
         AUTO_ANALYSIS_INTERVAL_MINUTES
     )
 
     logger.info(
-        "Entry delay follows timeframe."
+        "Entry delay: %s minute(s)",
+        ENTRY_DELAY_MINUTES
+    )
+
+    logger.info(
+        "H1 and other timeframes are "
+        "used for analysis only."
     )
 
     logger.info(
