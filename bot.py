@@ -4,6 +4,7 @@ import logging
 import threading
 import asyncio
 import time
+import html
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -40,7 +41,9 @@ PORT = int(os.getenv("PORT", "10000"))
 ALGIERS = ZoneInfo("Africa/Algiers")
 
 ENTRY_DELAY_MINUTES = 2
-SIGNAL_COOLDOWN_SECONDS = 120
+SIGNAL_COOLDOWN_SECONDS = 180
+SUPPORTED_SIGNAL_TIMEFRAMES = {"M1", "M2", "M3"}
+SIGNAL_LOCK = threading.Lock()
 
 MIN_CLOSED_CANDLES = 40
 HISTORY_DISPLAY_COUNT = 10
@@ -1333,7 +1336,7 @@ def gemini_confirm(
             )
 
         prompt = f"""
-You are confirming a technical H1 market analysis.
+You are confirming a technical short-timeframe market analysis. Use the supplied M1/M2/M3 timeframe exactly.
 
 Symbol: {symbol}
 Timeframe: {timeframe}
@@ -1462,7 +1465,7 @@ def store_mt4_data(payload):
     timeframe = str(
         payload.get(
             "timeframe",
-            "H1",
+            "M1",
         )
     ).upper()
 
@@ -1496,61 +1499,31 @@ def choose_best_pair():
     candidates = []
 
     for symbol, data in mt4_data.items():
+        timeframe = str(data.get("timeframe", "M1")).upper()
 
-        timeframe = str(
-            data.get(
-                "timeframe",
-                "H1",
-            )
-        ).upper()
-
-        if timeframe != "H1":
+        if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
             continue
 
-        candles = data.get(
-            "candles",
-            [],
-        )
-
-        closed = remove_forming_candle(
-            candles
-        )
+        candles = data.get("candles", [])
+        closed = remove_forming_candle(candles)
 
         if len(closed) < MIN_CLOSED_CANDLES:
             continue
 
         result = analyze_local(closed)
-
         if not result:
             continue
 
         if active_cycle["active"]:
-
-            if (
-                symbol
-                == active_cycle.get("symbol")
-            ):
-                return {
-                    "symbol": symbol,
-                    "timeframe": "H1",
-                    "analysis": result,
-                }
-
             continue
 
-        gap = abs(
-            result["up_score"]
-            - result["down_score"]
-        )
-
-        candidates.append(
-            {
-                "symbol": symbol,
-                "timeframe": "H1",
-                "analysis": result,
-                "gap": gap,
-            }
-        )
+        gap = abs(result["up_score"] - result["down_score"])
+        candidates.append({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "analysis": result,
+            "gap": gap,
+        })
 
     if not candidates:
         return None
@@ -1558,10 +1531,7 @@ def choose_best_pair():
     candidates.sort(
         key=lambda x: (
             x["analysis"]["confidence"],
-            max(
-                x["analysis"]["up_score"],
-                x["analysis"]["down_score"],
-            ),
+            max(x["analysis"]["up_score"], x["analysis"]["down_score"]),
             x["gap"],
         ),
         reverse=True,
@@ -1602,10 +1572,10 @@ def format_signal(
     return f"""
 🎓 ZinoProSignalAI
 ━━━━━━━━━━━━━━━━━━
-📊 {symbol} | {timeframe}
+📊 {html.escape(str(symbol))} | {html.escape(str(timeframe))}
 
-{cycle_text}
-{direction_icon}
+{html.escape(cycle_text)}
+{html.escape(direction_icon)}
 
 🎯 Confidence: {confidence}%
 
@@ -1613,13 +1583,13 @@ def format_signal(
 📉 DOWN Score: {down_score}/18
 
 ⏱️ Entry after {ENTRY_DELAY_MINUTES} min
-🕐 Entry Time: {entry_time}
+🕐 <b>{html.escape(str(entry_time))}</b>
 
 💰 Entry Price: {entry_price:.6f}
 
 ⚠️ {cancellation_text}
 
-🧠 {reason}
+🧠 {html.escape(str(reason))}
 ━━━━━━━━━━━━━━━━━━
 """.strip()
 
@@ -1636,6 +1606,7 @@ async def send_message(text):
         await telegram_application.bot.send_message(
             chat_id=int(OWNER_ID),
             text=text,
+            parse_mode="HTML",
         )
 
         return True
@@ -1683,9 +1654,9 @@ def send_signal_safely(text):
 # AUTO ANALYSIS
 # ============================================================
 
-def auto_analyze_pair(
+def _auto_analyze_pair(
     symbol,
-    timeframe="H1",
+    timeframe="M1",
 ):
     global last_signal_sent_at
 
@@ -1693,7 +1664,7 @@ def auto_analyze_pair(
         timeframe
     ).upper()
 
-    if timeframe != "H1":
+    if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
         return
 
     # --------------------------------------------------------
@@ -1872,6 +1843,12 @@ def auto_analyze_pair(
     )
 
 
+def auto_analyze_pair(symbol, timeframe="M1"):
+    """Single-signal gate: only one analysis can create a signal at a time."""
+    with SIGNAL_LOCK:
+        return _auto_analyze_pair(symbol, timeframe)
+
+
 # ============================================================
 # RECOVERY ANALYSIS
 # ============================================================
@@ -1900,7 +1877,7 @@ def send_recovery_signal():
 
     timeframe = active_cycle.get(
         "timeframe",
-        "H1",
+        "M1",
     )
 
     if not symbol:
@@ -2097,10 +2074,10 @@ async def win_command(
         reset_cycle()
 
         await update.message.reply_text(
-            "🟢 RECOVERY WIN\n\n"
-            "📚 تم تسجيل الصفقة: WIN\n"
-            "تم تعويض الصفقة الأساسية.\n"
-            "🔎 سيتم البحث عن زوج جديد."
+            "✅ RECOVERY WIN\n"
+            "🏁 Recovery 1/1 انتهت بـ WIN.\n"
+            "🚫 لا توجد Recovery ثانية.\n"
+            "🔒 الدورة أغلقت نهائياً."
         )
 
         return
@@ -2152,20 +2129,17 @@ async def loss_command(
 
         save_state()
 
-        # Only Recovery 1/1.
-        if not active_cycle.get(
-            "recovery_used"
-        ):
-
-            start_recovery_cycle()
+        # Only Recovery 1/1. Do NOT mark it used before sending.
+        if not active_cycle.get("recovery_used"):
 
             await update.message.reply_text(
-                "🔴 BASE LOSS\n"
-                "🔁 Recovery 1/1 مسموح\n"
-                "⏳ سيتم إنشاء إشارة Recovery واحدة فقط."
+                "🔴 BASE LOSS\n\n"
+                "📚 تم تسجيل الصفقة: LOSS\n\n"
+                "🔁 Recovery 1/1 مسموح.\n"
+                "⏱️ ستبقى مهلة الإشارات دقيقتين.\n"
+                "🚫 لا توجد مضاعفة ثانية."
             )
 
-            # Send Recovery immediately.
             threading.Thread(
                 target=send_recovery_signal,
                 daemon=True,
@@ -2199,10 +2173,9 @@ async def loss_command(
         reset_cycle()
 
         await update.message.reply_text(
-            "🔴 RECOVERY LOSS\n\n"
-            "📚 تم تسجيل الصفقة: LOSS\n"
-            "❌ انتهت محاولات Recovery.\n"
-            "🔎 سيتم البحث عن زوج جديد."
+            "🔴 RECOVERY LOSS\n"
+            "🚫 لا توجد Recovery ثانية.\n"
+            "🔒 الدورة أغلقت نهائياً."
         )
 
         return
@@ -2395,7 +2368,7 @@ async def mt4status_command(
         )
 
         lines.append(
-            f"📊 {symbol} | {timeframe} | "
+            f"📊 {html.escape(str(symbol))} | {html.escape(str(timeframe))} | "
             f"{len(candles)} candles"
         )
 
@@ -2451,7 +2424,7 @@ async def analyze_command(
 
     threading.Thread(
         target=auto_analyze_pair,
-        args=(symbol, "H1"),
+        args=(symbol, best["timeframe"]),
         daemon=True,
     ).start()
 
@@ -2533,7 +2506,7 @@ def background_analysis_loop():
 
                 auto_analyze_pair(
                     symbol,
-                    "H1",
+                    best["timeframe"],
                 )
 
         except Exception as e:
@@ -2710,7 +2683,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                             target=auto_analyze_pair,
                             args=(
                                 symbol,
-                                "H1",
+                                str(payload.get("timeframe", "M1")).upper(),
                             ),
                             daemon=True,
                         ).start()
