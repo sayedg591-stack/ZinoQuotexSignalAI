@@ -40,7 +40,7 @@ PORT = int(os.getenv("PORT", "10000"))
 ALGIERS = ZoneInfo("Africa/Algiers")
 
 ENTRY_DELAY_MINUTES = 2
-SIGNAL_COOLDOWN_SECONDS = 180
+SIGNAL_COOLDOWN_SECONDS = 120
 
 MIN_CLOSED_CANDLES = 40
 HISTORY_DISPLAY_COUNT = 10
@@ -76,8 +76,6 @@ telegram_application = None
 telegram_loop = None
 
 last_signal_sent_at = 0.0
-next_signal_allowed_at = 0.0
-pending_recovery = False
 
 gemini_last_call = 0.0
 gemini_disabled_until = 0.0
@@ -198,8 +196,6 @@ def save_state():
             "active_cycle": active_cycle,
             "stats_data": stats_data,
             "current_trade_id": current_trade_id,
-            "next_signal_allowed_at": next_signal_allowed_at,
-            "pending_recovery": pending_recovery,
         }
 
         atomic_write_json(
@@ -218,8 +214,6 @@ def load_state():
     global active_cycle
     global stats_data
     global current_trade_id
-    global next_signal_allowed_at
-    global pending_recovery
 
     try:
         if not os.path.exists(STATE_FILE):
@@ -243,8 +237,6 @@ def load_state():
             stats_data.update(saved_stats)
 
         current_trade_id = state.get("current_trade_id")
-        next_signal_allowed_at = float(state.get("next_signal_allowed_at", 0.0) or 0.0)
-        pending_recovery = bool(state.get("pending_recovery", False))
 
         logger.info(
             "Bot state loaded | active=%s | trade_id=%s",
@@ -369,9 +361,6 @@ def create_trade_record(
     entry_price,
     cancellation_level,
     reason,
-    message_id=None,
-    signal_text="",
-    recovery_level=0,
 ):
     global current_trade_id
 
@@ -383,7 +372,6 @@ def create_trade_record(
         "symbol": symbol,
         "timeframe": timeframe,
         "trade_type": trade_type,
-        "recovery_level": recovery_level,
         "direction": direction,
         "confidence": confidence,
         "up_score": up_score,
@@ -394,26 +382,44 @@ def create_trade_record(
         "reason": reason,
         "result": "PENDING",
         "result_time": None,
-        "message_id": message_id,
-        "signal_text": signal_text,
     }
 
     trade_history.append(record)
+
     current_trade_id = trade_id
 
     save_history()
     save_state()
 
     logger.info(
-        "Trade created | id=%s | type=%s | recovery=%s | %s | %s",
+        "Trade created | id=%s | %s | %s | %s",
         trade_id,
         trade_type,
-        recovery_level,
         symbol,
         direction,
     )
 
     return record
+
+
+def find_trade_by_id(trade_id):
+    if not trade_id:
+        return None
+
+    for record in trade_history:
+        if record.get("id") == trade_id:
+            return record
+
+    return None
+
+
+def get_latest_pending_trade():
+    for record in reversed(trade_history):
+        if record.get("result") == "PENDING":
+            return record
+
+    return None
+
 
 # ============================================================
 # RESULT UPDATE
@@ -427,10 +433,21 @@ def update_current_trade_result(result):
 
     record = None
 
+    # --------------------------------------------------------
+    # FIRST: exact current trade
+    # --------------------------------------------------------
+
     if current_trade_id:
-        candidate = find_trade_by_id(current_trade_id)
+        candidate = find_trade_by_id(
+            current_trade_id
+        )
+
         if candidate and candidate.get("result") == "PENDING":
             record = candidate
+
+    # --------------------------------------------------------
+    # FALLBACK: latest pending
+    # --------------------------------------------------------
 
     if record is None:
         record = get_latest_pending_trade()
@@ -442,18 +459,20 @@ def update_current_trade_result(result):
         )
         return False
 
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Record result on THIS exact BASE/RECOVERY trade.
+    # --------------------------------------------------------
+
     record["result"] = result
-    record["result_time"] = format_dt(now_algiers())
+    record["result_time"] = format_dt(
+        now_algiers()
+    )
+
     current_trade_id = record.get("id")
 
     save_history()
     save_state()
-
-    # Update the original signal card so the result appears at its bottom.
-    try:
-        edit_signal_result_safely(record, result)
-    except Exception:
-        logger.exception("Failed to update signal card result.")
 
     logger.info(
         "Trade result recorded | id=%s | type=%s | result=%s",
@@ -463,6 +482,7 @@ def update_current_trade_result(result):
     )
 
     return True
+
 
 # ============================================================
 # CYCLE
@@ -538,6 +558,7 @@ def reset_cycle():
     save_state()
 
     logger.info("Cycle reset")
+
 
 # ============================================================
 # STATISTICS
@@ -1553,13 +1574,6 @@ def choose_best_pair():
 # SIGNAL FORMAT
 # ============================================================
 
-def bold_digits(value):
-    normal = "0123456789"
-    bold = "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
-    table = str.maketrans(normal, bold)
-    return str(value).translate(table)
-
-
 def format_signal(
     symbol,
     timeframe,
@@ -1572,26 +1586,25 @@ def format_signal(
     entry_price,
     cancellation_text,
     reason,
-    recovery_level=0,
 ):
+    if trade_type == "BASE":
+        cycle_text = "🟢 BASE"
+
+    else:
+        cycle_text = "🔁 RECOVERY 1/1"
+
     direction_icon = (
         "🟢 UP"
         if direction == "UP"
         else "🔴 DOWN"
     )
 
-    recovery_text = "🔄 Recovery: 1" if recovery_level else "🔄 Recovery: 0"
-
-    try:
-        time_part = str(entry_time).split(" ")[-1]
-    except Exception:
-        time_part = str(entry_time)
-
     return f"""
 🎓 ZinoProSignalAI
 ━━━━━━━━━━━━━━━━━━
 📊 {symbol} | {timeframe}
 
+{cycle_text}
 {direction_icon}
 
 🎯 Confidence: {confidence}%
@@ -1600,19 +1613,16 @@ def format_signal(
 📉 DOWN Score: {down_score}/18
 
 ⏱️ Entry after {ENTRY_DELAY_MINUTES} min
-
-🕐 𝗘𝗡𝗧𝗥𝗬 𝗧𝗜𝗠𝗘
-🕐 {bold_digits(time_part)}
+🕐 Entry Time: {entry_time}
 
 💰 Entry Price: {entry_price:.6f}
 
 ⚠️ {cancellation_text}
 
 🧠 {reason}
-
-{recovery_text}
 ━━━━━━━━━━━━━━━━━━
 """.strip()
+
 
 # ============================================================
 # TELEGRAM SEND
@@ -1620,21 +1630,23 @@ def format_signal(
 
 async def send_message(text):
     if telegram_application is None:
-        return None
+        return False
 
     try:
-        message = await telegram_application.bot.send_message(
+        await telegram_application.bot.send_message(
             chat_id=int(OWNER_ID),
             text=text,
         )
-        return message.message_id
+
+        return True
 
     except Exception as e:
         logger.exception(
             "Telegram send failed: %s",
             e,
         )
-        return None
+
+        return False
 
 
 def send_signal_safely(text):
@@ -1644,7 +1656,7 @@ def send_signal_safely(text):
         logger.warning(
             "Telegram loop unavailable."
         )
-        return None
+        return False
 
     try:
         future = asyncio.run_coroutine_threadsafe(
@@ -1652,71 +1664,20 @@ def send_signal_safely(text):
             telegram_loop,
         )
 
-        return future.result(timeout=30)
+        future.result(
+            timeout=30
+        )
+
+        return True
 
     except Exception as e:
         logger.exception(
             "Safe Telegram send failed: %s",
             e,
         )
-        return None
 
-
-async def edit_signal_result(record, result):
-    if telegram_application is None:
         return False
 
-    message_id = record.get("message_id")
-    if not message_id:
-        return False
-
-    icon = "✅" if result == "WIN" else "❌"
-    label = "ربح" if result == "WIN" else "خسارة"
-
-    base_text = record.get("signal_text", "")
-    if not base_text:
-        return False
-
-    result_block = (
-        "\n\n━━━━━━━━━━━━━━━━━━\n"
-        f"{icon} النتيجة: {label}\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    try:
-        await telegram_application.bot.edit_message_text(
-            chat_id=int(OWNER_ID),
-            message_id=int(message_id),
-            text=base_text + result_block,
-        )
-        return True
-
-    except Exception as e:
-        logger.exception(
-            "Telegram result edit failed: %s",
-            e,
-        )
-        return False
-
-
-def edit_signal_result_safely(record, result):
-    global telegram_loop
-
-    if telegram_loop is None:
-        return False
-
-    try:
-        future = asyncio.run_coroutine_threadsafe(
-            edit_signal_result(record, result),
-            telegram_loop,
-        )
-        return bool(future.result(timeout=30))
-    except Exception as e:
-        logger.exception(
-            "Safe result edit failed: %s",
-            e,
-        )
-        return False
 
 # ============================================================
 # AUTO ANALYSIS
@@ -1727,92 +1688,143 @@ def auto_analyze_pair(
     timeframe="H1",
 ):
     global last_signal_sent_at
-    global next_signal_allowed_at
-    global pending_recovery
 
-    timeframe = str(timeframe).upper()
+    timeframe = str(
+        timeframe
+    ).upper()
 
     if timeframe != "H1":
         return
 
-    # Only one unresolved trade at a time.
+    # --------------------------------------------------------
+    # If a pending trade exists, do not create another one.
+    # --------------------------------------------------------
+
     if active_cycle["active"]:
+
         logger.info(
-            "Active trade waiting for /win or /loss | id=%s",
+            "Active cycle waiting for result | type=%s | id=%s",
+            active_cycle.get("trade_type"),
             current_trade_id,
         )
-        return
 
-    now_ts = time.time()
-
-    # Signals are spaced exactly by at least 3 minutes.
-    if now_ts < next_signal_allowed_at:
         return
 
     data = mt4_data.get(symbol)
+
     if not data:
         return
 
-    candles = remove_forming_candle(
-        data.get("candles", [])
+    candles = data.get(
+        "candles",
+        [],
     )
 
-    if len(candles) < MIN_CLOSED_CANDLES:
+    closed = remove_forming_candle(
+        candles
+    )
+
+    if len(closed) < MIN_CLOSED_CANDLES:
         logger.info(
             "Not enough closed candles | %s | %s",
             symbol,
-            len(candles),
+            len(closed),
         )
         return
 
-    local_result = analyze_local(candles)
+    local_result = analyze_local(
+        closed
+    )
+
     if not local_result:
         return
 
     gemini_result = gemini_confirm(
         symbol,
         timeframe,
-        candles,
+        closed,
         local_result,
     )
 
-    if gemini_result and gemini_result["direction"] == local_result["direction"]:
-        local_result["confidence"] = min(
-            local_result["confidence"],
-            gemini_result["confidence"],
-        )
+    if gemini_result:
 
-        if gemini_result.get("comment"):
-            local_result["reason"] += (
-                " | " + gemini_result["comment"]
+        # Gemini only confirms the local direction.
+        if (
+            gemini_result["direction"]
+            == local_result["direction"]
+        ):
+            local_result["confidence"] = min(
+                local_result["confidence"],
+                gemini_result["confidence"],
             )
 
-    direction = local_result["direction"]
-    confidence = local_result["confidence"]
-    up_score = local_result["up_score"]
-    down_score = local_result["down_score"]
+            if gemini_result.get("comment"):
+                local_result["reason"] += (
+                    " | "
+                    + gemini_result["comment"]
+                )
 
-    last_closed = candles[-1]
-    entry_price = last_closed["close"]
+    direction = local_result[
+        "direction"
+    ]
+
+    confidence = local_result[
+        "confidence"
+    ]
+
+    up_score = local_result[
+        "up_score"
+    ]
+
+    down_score = local_result[
+        "down_score"
+    ]
+
+    # --------------------------------------------------------
+    # Cooldown
+    # --------------------------------------------------------
+
+    now_ts = time.time()
+
+    if (
+        now_ts - last_signal_sent_at
+        < SIGNAL_COOLDOWN_SECONDS
+    ):
+        logger.info(
+            "Signal cooldown active."
+        )
+        return
+
+    last_closed = closed[-1]
+
+    entry_price = last_closed[
+        "close"
+    ]
 
     entry_dt = (
         now_algiers()
-        + timedelta(minutes=ENTRY_DELAY_MINUTES)
+        + timedelta(
+            minutes=ENTRY_DELAY_MINUTES
+        )
     )
-    entry_time = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    entry_time = entry_dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     cancellation_level, cancellation_text = (
         calculate_cancellation_level(
-            candles,
+            closed,
             direction,
             entry_price,
         )
     )
 
-    # Recovery is manual: it is only marked on the next signal
-    # after the owner records LOSS. No automatic multiplier is used.
-    recovery_level = 1 if pending_recovery else 0
-    trade_type = "RECOVERY" if recovery_level else "BASE"
+    # --------------------------------------------------------
+    # BASE signal
+    # --------------------------------------------------------
+
+    trade_type = "BASE"
 
     text = format_signal(
         symbol=symbol,
@@ -1826,21 +1838,17 @@ def auto_analyze_pair(
         entry_price=entry_price,
         cancellation_text=cancellation_text,
         reason=local_result["reason"],
-        recovery_level=recovery_level,
     )
 
-    message_id = send_signal_safely(text)
-
-    if not message_id:
+    if not send_signal_safely(text):
         return
 
     last_signal_sent_at = now_ts
-    next_signal_allowed_at = now_ts + SIGNAL_COOLDOWN_SECONDS
 
-    record = create_trade_record(
+    create_trade_record(
         symbol=symbol,
         timeframe=timeframe,
-        trade_type=trade_type,
+        trade_type="BASE",
         direction=direction,
         confidence=confidence,
         up_score=up_score,
@@ -1849,13 +1857,7 @@ def auto_analyze_pair(
         entry_price=entry_price,
         cancellation_level=cancellation_level,
         reason=local_result["reason"],
-        message_id=message_id,
-        signal_text=text,
-        recovery_level=recovery_level,
     )
-
-    pending_recovery = False
-    save_state()
 
     start_base_cycle(
         symbol,
@@ -1863,22 +1865,12 @@ def auto_analyze_pair(
         direction,
     )
 
-    # Keep the actual trade type for stats/history.
-    active_cycle["trade_type"] = trade_type
-    active_cycle["trade_number"] = 2 if recovery_level else 1
-    active_cycle["recovery_used"] = bool(recovery_level)
-    save_state()
-
     logger.info(
-        "SIGNAL SENT | %s | %s | recovery=%s | next=%s",
+        "BASE SIGNAL SENT | %s | %s",
         symbol,
         direction,
-        recovery_level,
-        datetime.fromtimestamp(
-            next_signal_allowed_at,
-            ALGIERS,
-        ).strftime("%Y-%m-%d %H:%M:%S"),
     )
+
 
 # ============================================================
 # RECOVERY ANALYSIS
@@ -2056,9 +2048,17 @@ async def win_command(
         )
         return
 
-    trade_type = active_cycle.get("trade_type")
+    trade_type = active_cycle.get(
+        "trade_type"
+    )
 
-    updated = update_current_trade_result("WIN")
+    # --------------------------------------------------------
+    # EXACT pending trade result
+    # --------------------------------------------------------
+
+    updated = update_current_trade_result(
+        "WIN"
+    )
 
     if not updated:
         await update.message.reply_text(
@@ -2066,21 +2066,45 @@ async def win_command(
         )
         return
 
-    stats_data["wins"] += 1
+    if trade_type == "BASE":
 
-    if trade_type == "RECOVERY":
-        stats_data["recovery_wins"] += 1
-    else:
+        stats_data["wins"] += 1
         stats_data["base_wins"] += 1
 
-    save_state()
-    reset_cycle()
+        save_state()
 
-    await update.message.reply_text(
-        "✅ تم تسجيل الربح.\n"
-        "🔄 Recovery القادم: 0\n"
-        "⏱️ الإشارة التالية بعد انتهاء 3 دقائق من آخر إشارة."
-    )
+        reset_cycle()
+
+        await update.message.reply_text(
+            "✅ BASE WIN\n"
+            "🏁 الدورة أغلقت بنجاح.\n"
+            "🚫 لا توجد Recovery."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RECOVERY WIN
+    # --------------------------------------------------------
+
+    if trade_type == "RECOVERY":
+
+        stats_data["wins"] += 1
+        stats_data["recovery_wins"] += 1
+
+        save_state()
+
+        reset_cycle()
+
+        await update.message.reply_text(
+            "🟢 RECOVERY WIN\n\n"
+            "📚 تم تسجيل الصفقة: WIN\n"
+            "تم تعويض الصفقة الأساسية.\n"
+            "🔎 سيتم البحث عن زوج جديد."
+        )
+
+        return
+
 
 # ============================================================
 # /LOSS
@@ -2090,8 +2114,6 @@ async def loss_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    global pending_recovery
-
     if not is_owner(update):
         return
 
@@ -2101,9 +2123,17 @@ async def loss_command(
         )
         return
 
-    trade_type = active_cycle.get("trade_type")
+    trade_type = active_cycle.get(
+        "trade_type"
+    )
 
-    updated = update_current_trade_result("LOSS")
+    # --------------------------------------------------------
+    # EXACT pending trade result
+    # --------------------------------------------------------
+
+    updated = update_current_trade_result(
+        "LOSS"
+    )
 
     if not updated:
         await update.message.reply_text(
@@ -2111,25 +2141,72 @@ async def loss_command(
         )
         return
 
-    stats_data["losses"] += 1
+    # --------------------------------------------------------
+    # BASE LOSS
+    # --------------------------------------------------------
+
+    if trade_type == "BASE":
+
+        stats_data["losses"] += 1
+        stats_data["base_losses"] += 1
+
+        save_state()
+
+        # Only Recovery 1/1.
+        if not active_cycle.get(
+            "recovery_used"
+        ):
+
+            start_recovery_cycle()
+
+            await update.message.reply_text(
+                "🔴 BASE LOSS\n"
+                "🔁 Recovery 1/1 مسموح\n"
+                "⏳ سيتم إنشاء إشارة Recovery واحدة فقط."
+            )
+
+            # Send Recovery immediately.
+            threading.Thread(
+                target=send_recovery_signal,
+                daemon=True,
+            ).start()
+
+            return
+
+        # Safety fallback.
+        reset_cycle()
+
+        await update.message.reply_text(
+            "🔴 BASE LOSS\n"
+            "🚫 لا توجد Recovery ثانية.\n"
+            "🔒 الدورة أغلقت."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RECOVERY LOSS
+    # --------------------------------------------------------
 
     if trade_type == "RECOVERY":
+
+        stats_data["losses"] += 1
         stats_data["recovery_losses"] += 1
-        pending_recovery = False
-        recovery_message = "🚫 Recovery انتهت. لا توجد Recovery ثانية."
-    else:
-        stats_data["base_losses"] += 1
-        pending_recovery = True
-        recovery_message = "🔄 الإشارة القادمة ستكون Recovery: 1 (يدوية)."
 
-    save_state()
-    reset_cycle()
+        save_state()
 
-    await update.message.reply_text(
-        "❌ تم تسجيل الخسارة.\n"
-        f"{recovery_message}\n"
-        "⏱️ الإشارة التالية تبقى على دورة 3 دقائق، بدون مضاعفة تلقائية."
-    )
+        # NEVER create another recovery.
+        reset_cycle()
+
+        await update.message.reply_text(
+            "🔴 RECOVERY LOSS\n\n"
+            "📚 تم تسجيل الصفقة: LOSS\n"
+            "❌ انتهت محاولات Recovery.\n"
+            "🔎 سيتم البحث عن زوج جديد."
+        )
+
+        return
+
 
 # ============================================================
 # /STATS
@@ -2144,20 +2221,31 @@ async def stats_command(
 
     stats = calculate_history_stats()
 
-    total = stats["wins"] + stats["losses"]
+    total = (
+        stats["wins"]
+        + stats["losses"]
+    )
 
     if total > 0:
-        win_rate = (stats["wins"] / total) * 100
+        win_rate = (
+            stats["wins"]
+            / total
+        ) * 100
     else:
         win_rate = 0
 
-    if next_signal_allowed_at > time.time():
-        next_text = datetime.fromtimestamp(
-            next_signal_allowed_at,
-            ALGIERS,
-        ).strftime("%H:%M:%S")
-    else:
-        next_text = "READY"
+    cycle_status = (
+        "ACTIVE"
+        if active_cycle["active"]
+        else "IDLE"
+    )
+
+    trade_type = (
+        active_cycle.get(
+            "trade_type"
+        )
+        or "-"
+    )
 
     message = (
         "📊 ZinoProSignalAI STATS\n"
@@ -2172,12 +2260,14 @@ async def stats_command(
         f"🔁 Recovery Wins: {stats['recovery_wins']}\n"
         f"🔁 Recovery Losses: {stats['recovery_losses']}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 Next Recovery: {'1' if pending_recovery else '0'}\n"
-        f"⏱️ Next signal: {next_text}\n"
-        "📌 Signal interval: 3 minutes"
+        f"🔄 Cycle: {cycle_status}\n"
+        f"📌 Type: {trade_type}\n"
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(
+        message
+    )
+
 
 # ============================================================
 # /HISTORY
@@ -2196,7 +2286,9 @@ async def history_command(
         )
         return
 
-    records = trade_history[-HISTORY_DISPLAY_COUNT:]
+    records = trade_history[
+        -HISTORY_DISPLAY_COUNT:
+    ]
 
     lines = [
         "📜 ZinoProSignalAI HISTORY",
@@ -2204,17 +2296,31 @@ async def history_command(
     ]
 
     for record in reversed(records):
-        result = record.get("result", "PENDING")
-        icon = "✅" if result == "WIN" else "❌" if result == "LOSS" else "⏳"
-        recovery = record.get("recovery_level", 0)
 
-        lines.append(
-            f"{icon} {record.get('symbol')} | "
-            f"{record.get('direction')} | "
-            f"Recovery {recovery} | {result}"
+        result = record.get(
+            "result",
+            "PENDING",
         )
 
-    await update.message.reply_text("\n".join(lines))
+        if result == "WIN":
+            icon = "✅"
+        elif result == "LOSS":
+            icon = "❌"
+        else:
+            icon = "⏳"
+
+        lines.append(
+            f"{icon} "
+            f"{record.get('trade_type')} | "
+            f"{record.get('symbol')} | "
+            f"{record.get('direction')} | "
+            f"{result}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
 
 # ============================================================
 # /RESET
@@ -2227,8 +2333,6 @@ async def reset_command(
     global trade_history
     global stats_data
     global current_trade_id
-    global next_signal_allowed_at
-    global pending_recovery
 
     if not is_owner(update):
         return
@@ -2245,8 +2349,6 @@ async def reset_command(
     reset_cycle()
 
     current_trade_id = None
-    next_signal_allowed_at = 0.0
-    pending_recovery = False
 
     trade_history = []
 
@@ -2256,6 +2358,7 @@ async def reset_command(
     await update.message.reply_text(
         "♻️ تم تصفير الإحصائيات والسجل والدورة."
     )
+
 
 # ============================================================
 # /MT4STATUS
@@ -2368,9 +2471,7 @@ async def start_command(
         "🎓 ZinoProSignalAI\n\n"
         "✅ Bot running\n"
         "📡 MT4 connected mode\n"
-        "🤖 Gemini analysis enabled\n"
-        "⏱️ Signal interval: 3 minutes\n"
-        "🔄 Recovery: manual only\n\n"
+        "🤖 Gemini analysis enabled\n\n"
         "الأوامر:\n"
         "/analyze\n"
         "/stats\n"
@@ -2388,25 +2489,41 @@ async def start_command(
 
 def background_analysis_loop():
     while True:
+
         try:
+
+            # ------------------------------------------------
+            # If active cycle:
+            # wait for /win or /loss.
+            # ------------------------------------------------
+
             if active_cycle["active"]:
+
                 logger.info(
-                    "Active trade waiting | type=%s | symbol=%s | trade_id=%s",
-                    active_cycle.get("trade_type"),
-                    active_cycle.get("symbol"),
+                    "Active cycle waiting | "
+                    "type=%s | symbol=%s | "
+                    "trade_id=%s",
+                    active_cycle.get(
+                        "trade_type"
+                    ),
+                    active_cycle.get(
+                        "symbol"
+                    ),
                     current_trade_id,
                 )
-                time.sleep(15)
+
+                time.sleep(60)
+
                 continue
 
-            # Do not send more than one signal every 3 minutes.
-            if time.time() < next_signal_allowed_at:
-                time.sleep(10)
-                continue
+            # ------------------------------------------------
+            # Find best pair
+            # ------------------------------------------------
 
             best = choose_best_pair()
 
             if best:
+
                 symbol = best["symbol"]
 
                 logger.info(
@@ -2420,12 +2537,14 @@ def background_analysis_loop():
                 )
 
         except Exception as e:
+
             logger.exception(
                 "Background analysis error: %s",
                 e,
             )
 
-        time.sleep(10)
+        time.sleep(60)
+
 
 # ============================================================
 # HTTP SERVER
