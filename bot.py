@@ -4,7 +4,6 @@ import logging
 import threading
 import asyncio
 import time
-import html
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -42,8 +41,6 @@ ALGIERS = ZoneInfo("Africa/Algiers")
 
 ENTRY_DELAY_MINUTES = 2
 SIGNAL_COOLDOWN_SECONDS = 180
-SUPPORTED_SIGNAL_TIMEFRAMES = {"M1", "M2", "M3"}
-SIGNAL_LOCK = threading.Lock()
 
 MIN_CLOSED_CANDLES = 40
 HISTORY_DISPLAY_COUNT = 10
@@ -55,6 +52,8 @@ GEMINI_MIN_INTERVAL_SECONDS = 900
 GEMINI_429_COOLDOWN_SECONDS = 4 * 60 * 60
 
 LOCAL_GEMINI_MIN_SCORE = 12
+SUPPORTED_SIGNAL_TIMEFRAMES = {"M1", "M2", "M3"}
+SIGNAL_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -1499,31 +1498,61 @@ def choose_best_pair():
     candidates = []
 
     for symbol, data in mt4_data.items():
-        timeframe = str(data.get("timeframe", "M1")).upper()
+
+        timeframe = str(
+            data.get(
+                "timeframe",
+                "M1",
+            )
+        ).upper()
 
         if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
             continue
 
-        candles = data.get("candles", [])
-        closed = remove_forming_candle(candles)
+        candles = data.get(
+            "candles",
+            [],
+        )
+
+        closed = remove_forming_candle(
+            candles
+        )
 
         if len(closed) < MIN_CLOSED_CANDLES:
             continue
 
         result = analyze_local(closed)
+
         if not result:
             continue
 
         if active_cycle["active"]:
+
+            if (
+                symbol
+                == active_cycle.get("symbol")
+            ):
+                return {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "analysis": result,
+                }
+
             continue
 
-        gap = abs(result["up_score"] - result["down_score"])
-        candidates.append({
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "analysis": result,
-            "gap": gap,
-        })
+        gap = abs(
+            result["up_score"]
+            - result["down_score"]
+        )
+
+        candidates.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "analysis": result,
+                "gap": gap,
+            }
+        )
 
     if not candidates:
         return None
@@ -1531,7 +1560,10 @@ def choose_best_pair():
     candidates.sort(
         key=lambda x: (
             x["analysis"]["confidence"],
-            max(x["analysis"]["up_score"], x["analysis"]["down_score"]),
+            max(
+                x["analysis"]["up_score"],
+                x["analysis"]["down_score"],
+            ),
             x["gap"],
         ),
         reverse=True,
@@ -1558,8 +1590,7 @@ def format_signal(
     reason,
 ):
     if trade_type == "BASE":
-        cycle_text = "🟢 BASE"
-
+        cycle_text = ""
     else:
         cycle_text = "🔁 RECOVERY 1/1"
 
@@ -1572,10 +1603,9 @@ def format_signal(
     return f"""
 🎓 ZinoProSignalAI
 ━━━━━━━━━━━━━━━━━━
-📊 {html.escape(str(symbol))} | {html.escape(str(timeframe))}
+📊 {symbol} | {timeframe}
 
-{html.escape(cycle_text)}
-{html.escape(direction_icon)}
+{(cycle_text + chr(10) if cycle_text else "")}{direction_icon}
 
 🎯 Confidence: {confidence}%
 
@@ -1583,13 +1613,13 @@ def format_signal(
 📉 DOWN Score: {down_score}/18
 
 ⏱️ Entry after {ENTRY_DELAY_MINUTES} min
-🕐 <b>{html.escape(str(entry_time))}</b>
+🕐 <b>{entry_time}</b>
 
 💰 Entry Price: {entry_price:.6f}
 
 ⚠️ {cancellation_text}
 
-🧠 {html.escape(str(reason))}
+🧠 {reason}
 ━━━━━━━━━━━━━━━━━━
 """.strip()
 
@@ -1849,6 +1879,7 @@ def auto_analyze_pair(symbol, timeframe="M1"):
         return _auto_analyze_pair(symbol, timeframe)
 
 
+
 # ============================================================
 # RECOVERY ANALYSIS
 # ============================================================
@@ -1877,7 +1908,7 @@ def send_recovery_signal():
 
     timeframe = active_cycle.get(
         "timeframe",
-        "M1",
+        "H1",
     )
 
     if not symbol:
@@ -2129,8 +2160,10 @@ async def loss_command(
 
         save_state()
 
-        # Only Recovery 1/1. Do NOT mark it used before sending.
-        if not active_cycle.get("recovery_used"):
+        # Only Recovery 1/1.
+        if not active_cycle.get(
+            "recovery_used"
+        ):
 
             await update.message.reply_text(
                 "🔴 BASE LOSS\n\n"
@@ -2140,6 +2173,7 @@ async def loss_command(
                 "🚫 لا توجد مضاعفة ثانية."
             )
 
+            # Send Recovery immediately.
             threading.Thread(
                 target=send_recovery_signal,
                 daemon=True,
@@ -2368,7 +2402,7 @@ async def mt4status_command(
         )
 
         lines.append(
-            f"📊 {html.escape(str(symbol))} | {html.escape(str(timeframe))} | "
+            f"📊 {symbol} | {timeframe} | "
             f"{len(candles)} candles"
         )
 
@@ -2424,7 +2458,7 @@ async def analyze_command(
 
     threading.Thread(
         target=auto_analyze_pair,
-        args=(symbol, best["timeframe"]),
+        args=(symbol, "H1"),
         daemon=True,
     ).start()
 
