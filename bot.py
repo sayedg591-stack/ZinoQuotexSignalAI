@@ -50,7 +50,7 @@ ALGIERS = ZoneInfo("Africa/Algiers")
 
 AUTO_ANALYSIS_INTERVAL_MINUTES = 2
 
-MIN_ENTRY_LEAD_SECONDS = 20
+MIN_ENTRY_LEAD_SECONDS = 40
 
 
 # ============================================================
