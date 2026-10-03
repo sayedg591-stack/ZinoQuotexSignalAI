@@ -1,4 +1,3 @@
-````python
 import os
 import io
 import json
@@ -7,12 +6,10 @@ import threading
 import asyncio
 import re
 import time
-
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,6 +30,7 @@ from google.genai import types
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OWNER_ID = os.getenv("OWNER_ID", "").strip()
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
@@ -47,10 +45,10 @@ ALGIERS = ZoneInfo("Africa/Algiers")
 # تحليل تلقائي كل 3 دقائق
 AUTO_ANALYSIS_INTERVAL_MINUTES = 3
 
-# وقت الدخول بعد إنشاء التحليل
+# الدخول بعد التحليل بدقيقتين
 ENTRY_DELAY_MINUTES = 2
 
-# يجب أن يبقى هناك وقت كافٍ للدخول
+# أقل وقت متبقٍ قبل الدخول
 MIN_ENTRY_LEAD_SECONDS = 40
 
 
@@ -98,27 +96,26 @@ gemini_client = genai.Client(
 
 
 # ============================================================
-# GLOBAL MT4 DATA
+# GLOBAL DATA
 # ============================================================
 
 mt4_lock = threading.Lock()
 
 mt4_data = {}
 
-# آخر شمعة مغلقة تمت معالجتها لكل رمز/فريم
 last_processed_closed_candle = {}
 
-# آخر وقت تحليل لكل رمز/فريم
 last_auto_analysis = {}
 
-# لمنع تحليلين في نفس الوقت
-analysis_lock = threading.Lock()
-
-# إحصائيات البوت
 stats_data = {
     "wins": 0,
     "losses": 0,
 }
+
+telegram_application = None
+
+# هذا هو الـ Event Loop الخاص بالبوت
+telegram_loop = None
 
 
 # ============================================================
@@ -143,7 +140,6 @@ def parse_mt4_time(value):
 
         value = int(value)
 
-        # Unix timestamp
         return datetime.fromtimestamp(
             value,
             tz=ZoneInfo("UTC")
@@ -158,6 +154,7 @@ def parse_mt4_time(value):
 # ============================================================
 
 def timeframe_to_minutes(timeframe):
+
     if not timeframe:
         return 1
 
@@ -189,7 +186,10 @@ def timeframe_to_minutes(timeframe):
 # ENTRY TIME
 # ============================================================
 
-def get_next_entry_time(timeframe, delay_minutes=None):
+def get_next_entry_time(
+    timeframe,
+    delay_minutes=None
+):
 
     if delay_minutes is None:
         delay_minutes = ENTRY_DELAY_MINUTES
@@ -204,6 +204,7 @@ def get_next_entry_time(timeframe, delay_minutes=None):
 # ============================================================
 
 def safe_float(value, default=0.0):
+
     try:
         return float(value)
     except Exception:
@@ -211,6 +212,7 @@ def safe_float(value, default=0.0):
 
 
 def safe_int(value, default=0):
+
     try:
         return int(value)
     except Exception:
@@ -244,6 +246,7 @@ def normalize_candles(candles):
     result = []
 
     for candle in candles:
+
         normalized = normalize_candle(candle)
 
         if normalized is not None:
@@ -262,20 +265,13 @@ def normalize_candles(candles):
 
 def get_closed_candles(candles):
 
-    """
-    MT4 sends candles from oldest -> newest.
-
-    The newest candle can be the currently forming candle,
-    therefore we exclude it.
-
-    The remaining candles are closed candles.
-    """
-
     candles = normalize_candles(candles)
 
     if len(candles) < 3:
         return []
 
+    # أحدث شمعة = الحالية غير مغلقة
+    # لذلك نستبعد candles[-1]
     return candles[:-1]
 
 
@@ -290,9 +286,12 @@ def calculate_ema(values, period):
 
     multiplier = 2.0 / (period + 1)
 
-    ema = sum(values[:period]) / period
+    ema = sum(
+        values[:period]
+    ) / period
 
     for price in values[period:]:
+
         ema = (
             (price - ema) * multiplier
         ) + ema
@@ -304,7 +303,10 @@ def calculate_ema(values, period):
 # RSI
 # ============================================================
 
-def calculate_rsi(closes, period=14):
+def calculate_rsi(
+    closes,
+    period=14
+):
 
     if len(closes) < period + 1:
         return None
@@ -313,7 +315,11 @@ def calculate_rsi(closes, period=14):
     losses = []
 
     for i in range(1, period + 1):
-        change = closes[i] - closes[i - 1]
+
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
 
         if change >= 0:
             gains.append(change)
@@ -325,19 +331,27 @@ def calculate_rsi(closes, period=14):
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    for i in range(period + 1, len(closes)):
+    for i in range(
+        period + 1,
+        len(closes)
+    ):
 
-        change = closes[i] - closes[i - 1]
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
 
         gain = max(change, 0)
         loss = max(-change, 0)
 
         avg_gain = (
-            (avg_gain * (period - 1)) + gain
+            (avg_gain * (period - 1))
+            + gain
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1)) + loss
+            (avg_loss * (period - 1))
+            + loss
         ) / period
 
     if avg_loss == 0:
@@ -345,14 +359,19 @@ def calculate_rsi(closes, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
 
 # ============================================================
 # WILLIAMS %R
 # ============================================================
 
-def calculate_williams_r(candles, period=14):
+def calculate_williams_r(
+    candles,
+    period=14
+):
 
     if len(candles) < period:
         return None
@@ -360,11 +379,13 @@ def calculate_williams_r(candles, period=14):
     recent = candles[-period:]
 
     highest = max(
-        c["high"] for c in recent
+        c["high"]
+        for c in recent
     )
 
     lowest = min(
-        c["low"] for c in recent
+        c["low"]
+        for c in recent
     )
 
     close = recent[-1]["close"]
@@ -382,7 +403,10 @@ def calculate_williams_r(candles, period=14):
 # ATR
 # ============================================================
 
-def calculate_atr(candles, period=10):
+def calculate_atr(
+    candles,
+    period=10
+):
 
     if len(candles) < period + 1:
         return None
@@ -395,11 +419,14 @@ def calculate_atr(candles, period=10):
         previous = candles[i - 1]
 
         tr = max(
-            current["high"] - current["low"],
+            current["high"]
+            - current["low"],
+
             abs(
                 current["high"]
                 - previous["close"]
             ),
+
             abs(
                 current["low"]
                 - previous["close"]
@@ -421,9 +448,13 @@ def calculate_atr(candles, period=10):
 # ADX / DI
 # ============================================================
 
-def calculate_adx_di(candles, period=14):
+def calculate_adx_di(
+    candles,
+    period=14
+):
 
     if len(candles) < period + 2:
+
         return {
             "adx": None,
             "plus_di": None,
@@ -451,24 +482,31 @@ def calculate_adx_di(candles, period=14):
 
         plus = (
             up_move
-            if up_move > down_move
-            and up_move > 0
+            if (
+                up_move > down_move
+                and up_move > 0
+            )
             else 0
         )
 
         minus = (
             down_move
-            if down_move > up_move
-            and down_move > 0
+            if (
+                down_move > up_move
+                and down_move > 0
+            )
             else 0
         )
 
         tr = max(
-            current["high"] - current["low"],
+            current["high"]
+            - current["low"],
+
             abs(
                 current["high"]
                 - previous["close"]
             ),
+
             abs(
                 current["low"]
                 - previous["close"]
@@ -480,15 +518,20 @@ def calculate_adx_di(candles, period=14):
         minus_dm.append(minus)
 
     if len(trs) < period:
+
         return {
             "adx": None,
             "plus_di": None,
             "minus_di": None,
         }
 
-    atr = sum(trs[-period:]) / period
+    atr = (
+        sum(trs[-period:])
+        / period
+    )
 
     if atr == 0:
+
         return {
             "adx": 0,
             "plus_di": 0,
@@ -508,16 +551,23 @@ def calculate_adx_di(candles, period=14):
     plus_di = 100 * plus / atr
     minus_di = 100 * minus / atr
 
-    dx_denominator = (
-        plus_di + minus_di
+    denominator = (
+        plus_di
+        + minus_di
     )
 
-    if dx_denominator == 0:
+    if denominator == 0:
+
         adx = 0
+
     else:
+
         adx = (
-            abs(plus_di - minus_di)
-            / dx_denominator
+            abs(
+                plus_di
+                - minus_di
+            )
+            / denominator
         ) * 100
 
     return {
@@ -558,11 +608,13 @@ def calculate_keltner(candles):
 
     return {
         "middle": ema20,
-        "upper": ema20 + (
-            atr10 * multiplier
+        "upper": (
+            ema20
+            + atr10 * multiplier
         ),
-        "lower": ema20 - (
-            atr10 * multiplier
+        "lower": (
+            ema20
+            - atr10 * multiplier
         ),
     }
 
@@ -574,6 +626,7 @@ def calculate_keltner(candles):
 def analyze_structure(candles):
 
     if len(candles) < 10:
+
         return {
             "trend": "UNKNOWN",
             "higher_high": False,
@@ -631,12 +684,15 @@ def analyze_structure(candles):
     )
 
     if higher_high and higher_low:
+
         trend = "UP"
 
     elif lower_high and lower_low:
+
         trend = "DOWN"
 
     else:
+
         trend = "RANGE"
 
     return {
@@ -655,6 +711,7 @@ def analyze_structure(candles):
 def analyze_breakout(candles):
 
     if len(candles) < 12:
+
         return {
             "up": False,
             "down": False,
@@ -674,8 +731,15 @@ def analyze_breakout(candles):
     )
 
     return {
-        "up": last["close"] > resistance,
-        "down": last["close"] < support,
+        "up": (
+            last["close"]
+            > resistance
+        ),
+
+        "down": (
+            last["close"]
+            < support
+        ),
     }
 
 
@@ -826,26 +890,24 @@ Quality is more important than frequency.
 DO NOT force a signal.
 
 If the setup is weak, contradictory, unclear, exhausted,
-or does not have enough confluence, return:
+or does not have enough confluence:
 
 "signal": false
 
-The bot must NOT send a Telegram signal in that case.
+The bot must NOT send a Telegram signal.
 
-A signal is allowed only when there is strong evidence for
+A signal is allowed only when strong evidence supports
 one direction.
 
-Do not create an UP signal simply because the market has
-recently moved down.
+Do not create an UP signal simply because price recently
+moved down.
 
-Do not create a DOWN signal simply because the market has
-recently moved up.
+Do not create a DOWN signal simply because price recently
+moved up.
 
 ============================================================
 ANALYSIS PRIORITY
 ============================================================
-
-Use this priority:
 
 1. Price Action
 2. Market Structure
@@ -865,7 +927,7 @@ Do not invent indicators.
 SCORING
 ============================================================
 
-Total score must be exactly 18.
+Total score for each direction is out of 18.
 
 Structure: 2
 Breakout: 2
@@ -877,42 +939,39 @@ Summary: 2
 Oscillators: 3
 Moving Averages: 3
 
-UP score + DOWN score does not need to equal 18.
-
-However, each selected direction must have a coherent
-score based on actual evidence.
+The UP and DOWN scores are evaluated independently.
 
 ============================================================
 SIGNAL REQUIREMENTS
 ============================================================
 
-A signal should normally require:
+A signal should require:
 
 - selected score >= 11/18
-- difference between selected direction and opposite >= 5
+- difference >= 5
 - confidence >= 70
 - at least 4 independent confirmations
 - fewer than 2 major contradictions
 - no obvious exhaustion
-- enough closed candles
+- at least 40 closed candles
 - clear directional structure
 
-Do NOT use 90%+ confidence unless the confluence is
+Do NOT use 90%+ confidence unless confluence is
 exceptionally strong.
 
 ============================================================
 IMPORTANT
 ============================================================
 
-The bot prefers NO SIGNAL over a weak signal.
+Prefer NO SIGNAL over a weak signal.
 
-Do not use WAIT, NEUTRAL, or ambiguous direction.
-
-Instead use:
+Use:
 
 signal = false
 
 when the setup is not strong enough.
+
+Do not use WAIT or NEUTRAL as a final signal.
 
 ============================================================
 JSON ONLY
@@ -937,11 +996,11 @@ Required structure:
   "summary_score": 2,
   "oscillators_score": 2,
   "moving_averages_score": 1,
-  "reason": "Short evidence-based explanation",
-  "cancellation_reason": "Invalidation below/above recent structure"
+  "contradictions": 0,
+  "reason": "Short evidence-based explanation"
 }}
 
-If the setup is weak:
+Weak setup:
 
 {{
   "signal": false,
@@ -958,8 +1017,8 @@ If the setup is weak:
   "summary_score": 1,
   "oscillators_score": 1,
   "moving_averages_score": 1,
-  "reason": "Weak and conflicting setup",
-  "cancellation_reason": ""
+  "contradictions": 2,
+  "reason": "Weak and conflicting setup"
 }}
 """
 
@@ -1007,8 +1066,8 @@ def analyze_with_gemini(
 
         text = text.strip()
 
-        # حماية إضافية إذا رجع Gemini markdown
         if text.startswith("```"):
+
             text = re.sub(
                 r"^```(?:json)?",
                 "",
@@ -1153,7 +1212,6 @@ def evaluate_signal_quality(
     if contradictions >= 2:
         return False
 
-    # حماية من الإشارات غير المنطقية
     reason = str(
         analysis.get(
             "reason",
@@ -1230,13 +1288,18 @@ def format_signal(
     ).strip()
 
     if direction == "UP":
+
         decision = "🟢 UP"
+
         cancel_text = (
             f"إلغاء إذا أغلقت الشمعة تحت "
             f"{cancellation}"
         )
+
     else:
+
         decision = "🔴 DOWN"
+
         cancel_text = (
             f"إلغاء إذا أغلقت الشمعة فوق "
             f"{cancellation}"
@@ -1289,7 +1352,7 @@ async def send_owner_message(
 
 
 # ============================================================
-# NEW CANDLE DETECTION
+# NEW CLOSED CANDLE DETECTION
 # ============================================================
 
 def detect_new_closed_candle(
@@ -1297,21 +1360,6 @@ def detect_new_closed_candle(
     timeframe,
     candles
 ):
-    """
-    IMPORTANT FIX
-
-    MT4 sends the newest candle as the currently forming candle.
-
-    Therefore the candle that should trigger analysis is:
-
-        candles[-2]
-
-    and NOT:
-
-        candles[-1]
-
-    We remember the timestamp of candles[-2].
-    """
 
     closed = get_closed_candles(
         candles
@@ -1338,14 +1386,25 @@ def detect_new_closed_candle(
         key
     )
 
+    # أول استقبال بعد تشغيل السيرفر:
+    # نضع baseline فقط
     if previous is None:
 
         last_processed_closed_candle[
             key
         ] = candle_time
 
+        logger.info(
+            "Initialized closed candle baseline: "
+            "%s %s | %s",
+            symbol,
+            timeframe,
+            candle_time
+        )
+
         return False, latest_closed
 
+    # شمعة مغلقة جديدة
     if candle_time > previous:
 
         last_processed_closed_candle[
@@ -1380,12 +1439,17 @@ async def auto_analyze_pair(
         0
     )
 
-    # لا نحلل نفس الزوج/الفريم أكثر من مرة
-    # خلال الفترة المحددة
     if (
         current_time - last_time
         < AUTO_ANALYSIS_INTERVAL_MINUTES * 60
     ):
+
+        logger.info(
+            "Auto analysis throttled: %s %s",
+            symbol,
+            timeframe
+        )
+
         return
 
     closed = get_closed_candles(
@@ -1393,18 +1457,20 @@ async def auto_analyze_pair(
     )
 
     if len(closed) < 40:
+
         logger.info(
-            "Not enough closed candles for %s %s: %s",
+            "Not enough closed candles: %s %s | %s",
             symbol,
             timeframe,
             len(closed)
         )
+
         return
 
     last_auto_analysis[key] = current_time
 
     logger.info(
-        "Starting automatic analysis: %s %s",
+        "STARTING AUTOMATIC ANALYSIS: %s %s",
         symbol,
         timeframe
     )
@@ -1419,7 +1485,7 @@ async def auto_analyze_pair(
     if not analysis:
 
         logger.warning(
-            "Gemini returned no analysis for %s %s",
+            "Gemini returned no analysis: %s %s",
             symbol,
             timeframe
         )
@@ -1471,7 +1537,7 @@ async def auto_analyze_pair(
     )
 
     # ========================================================
-    # WEAK SETUP = NO TELEGRAM MESSAGE
+    # WEAK SETUP = NO MESSAGE
     # ========================================================
 
     if not evaluate_signal_quality(
@@ -1480,7 +1546,7 @@ async def auto_analyze_pair(
     ):
 
         logger.info(
-            "Weak setup rejected: %s %s",
+            "WEAK SETUP REJECTED: %s %s",
             symbol,
             timeframe
         )
@@ -1488,7 +1554,7 @@ async def auto_analyze_pair(
         return
 
     # ========================================================
-    # ENTRY TIME
+    # ENTRY
     # ========================================================
 
     entry_time = get_next_entry_time(
@@ -1503,7 +1569,7 @@ async def auto_analyze_pair(
     if seconds_until_entry < MIN_ENTRY_LEAD_SECONDS:
 
         logger.info(
-            "Signal rejected because entry lead is too short."
+            "Signal rejected: entry lead too short."
         )
 
         return
@@ -1523,7 +1589,7 @@ async def auto_analyze_pair(
     if sent:
 
         logger.info(
-            "SIGNAL SENT: %s %s %s %s%%",
+            "SIGNAL SENT: %s %s %s %.0f%%",
             symbol,
             timeframe,
             direction,
@@ -1642,9 +1708,7 @@ class MT4Handler(BaseHTTPRequestHandler):
             )
 
             body = json.loads(
-                raw_body.decode(
-                    "utf-8"
-                )
+                raw_body.decode("utf-8")
             )
 
         except Exception as exc:
@@ -1658,8 +1722,7 @@ class MT4Handler(BaseHTTPRequestHandler):
                 400,
                 {
                     "ok": False,
-                    "error":
-                        "Invalid JSON"
+                    "error": "Invalid JSON"
                 }
             )
 
@@ -1672,8 +1735,6 @@ class MT4Handler(BaseHTTPRequestHandler):
             )
         ).strip()
 
-        # Accept the API key from either
-        # header or JSON body.
         supplied_key = (
             header_key
             or body_key
@@ -1689,8 +1750,7 @@ class MT4Handler(BaseHTTPRequestHandler):
                 401,
                 {
                     "ok": False,
-                    "error":
-                        "Unauthorized"
+                    "error": "Unauthorized"
                 }
             )
 
@@ -1743,7 +1803,6 @@ class MT4Handler(BaseHTTPRequestHandler):
 
             return
 
-        # Store MT4 data
         key = (
             symbol.upper(),
             timeframe.upper()
@@ -1760,7 +1819,7 @@ class MT4Handler(BaseHTTPRequestHandler):
             }
 
         # ====================================================
-        # FIXED NEW CANDLE DETECTION
+        # NEW CLOSED CANDLE
         # ====================================================
 
         is_new_candle, latest_closed = (
@@ -1771,20 +1830,22 @@ class MT4Handler(BaseHTTPRequestHandler):
             )
         )
 
+        closed_time = (
+            latest_closed.get("time")
+            if latest_closed
+            else None
+        )
+
         logger.info(
-            "MT4 received: %s %s | candles=%s | new_closed_candle=%s | closed_time=%s",
+            "MT4 data received: %s | %s | candles=%s | new_candle=%s | closed_time=%s",
             symbol,
             timeframe,
             len(candles),
             is_new_candle,
-            (
-                latest_closed.get("time")
-                if latest_closed
-                else None
-            )
+            closed_time
         )
 
-        # Respond immediately to MT4
+        # الرد مباشرة على MT4
         self._send_json(
             200,
             {
@@ -1801,30 +1862,54 @@ class MT4Handler(BaseHTTPRequestHandler):
         # AUTO ANALYSIS
         # ====================================================
 
-        if is_new_candle:
+        if not is_new_candle:
+            return
 
-            application = telegram_application
+        application = telegram_application
 
-            if application is not None:
+        if application is None:
 
-                try:
+            logger.warning(
+                "Telegram application is not ready."
+            )
 
-                    loop = asyncio.get_running_loop()
+            return
 
-                    asyncio.create_task(
-                        auto_analyze_pair(
-                            application,
-                            symbol,
-                            timeframe,
-                            candles
-                        )
-                    )
+        if telegram_loop is None:
 
-                except RuntimeError:
+            logger.warning(
+                "Telegram event loop is not ready."
+            )
 
-                    logger.warning(
-                        "No running asyncio loop"
-                    )
+            return
+
+        try:
+
+            future = asyncio.run_coroutine_threadsafe(
+                auto_analyze_pair(
+                    application,
+                    symbol,
+                    timeframe,
+                    candles
+                ),
+                telegram_loop
+            )
+
+            logger.info(
+                "Automatic analysis task scheduled: %s %s",
+                symbol,
+                timeframe
+            )
+
+            # لا ننتظر النتيجة هنا
+            # HTTP يجب أن يبقى سريعًا
+
+        except Exception as exc:
+
+            logger.exception(
+                "Failed to schedule automatic analysis: %s",
+                exc
+            )
 
 
 # ============================================================
@@ -1847,11 +1932,8 @@ def start_http_server():
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM COMMANDS
 # ============================================================
-
-telegram_application = None
-
 
 async def owner_only(
     update: Update
@@ -2072,7 +2154,7 @@ async def analyze_command(
 
 
 # ============================================================
-# TEXT ANALYSIS
+# TEXT HANDLER
 # ============================================================
 
 async def text_message_handler(
@@ -2091,8 +2173,6 @@ async def text_message_handler(
     if not text:
         return
 
-    # لا نحلل أي نص عشوائي
-    # إلا إذا كان فيه زوج/فريم واضح
     pair_match = re.search(
         r"\b([A-Z]{3,6})\b",
         text.upper()
@@ -2136,9 +2216,11 @@ async def photo_handler(
         image_bytes = buffer.getvalue()
 
         if not image_bytes:
+
             await update.message.reply_text(
                 "❌ لم أستطع قراءة الصورة."
             )
+
             return
 
         prompt = """
@@ -2186,8 +2268,7 @@ Do not guarantee a winning trade.
         text = (
             response.text
             if response
-            else
-            "لم يتم الحصول على تحليل."
+            else "لم يتم الحصول على تحليل."
         )
 
         await update.message.reply_text(
@@ -2206,6 +2287,23 @@ Do not guarantee a winning trade.
         await update.message.reply_text(
             "❌ حدث خطأ أثناء تحليل الصورة."
         )
+
+
+# ============================================================
+# POST INIT
+# ============================================================
+
+async def post_init(
+    application
+):
+
+    global telegram_loop
+
+    telegram_loop = asyncio.get_running_loop()
+
+    logger.info(
+        "Telegram event loop captured successfully."
+    )
 
 
 # ============================================================
@@ -2235,7 +2333,10 @@ def main():
         ENTRY_DELAY_MINUTES
     )
 
-    # HTTP server
+    # ========================================================
+    # HTTP SERVER
+    # ========================================================
+
     http_thread = threading.Thread(
         target=start_http_server,
         daemon=True
@@ -2243,10 +2344,14 @@ def main():
 
     http_thread.start()
 
-    # Telegram
+    # ========================================================
+    # TELEGRAM
+    # ========================================================
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -2325,6 +2430,9 @@ def main():
     )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
     main()
-````
