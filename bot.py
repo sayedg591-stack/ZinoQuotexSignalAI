@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -52,6 +53,10 @@ GEMINI_MIN_INTERVAL_SECONDS = 900
 GEMINI_429_COOLDOWN_SECONDS = 4 * 60 * 60
 
 LOCAL_GEMINI_MIN_SCORE = 12
+
+# Prevent stale/repeated signals and encourage healthy diversity.
+RECENT_SIGNAL_MEMORY = 8
+DIVERSITY_LOOKBACK = 3
 SUPPORTED_SIGNAL_TIMEFRAMES = {"M1", "M2", "M3"}
 SIGNAL_LOCK = threading.Lock()
 
@@ -94,6 +99,7 @@ active_cycle = {
     "trade_type": None,
     "direction": None,
     "recovery_used": False,
+    "recovery_requested": False,
     "last_trade_time": 0.0,
     "trade_number": 0,
 }
@@ -112,6 +118,8 @@ stats_data = {
 trade_history = []
 
 current_trade_id = None
+
+last_signal_signature = None
 
 
 # ============================================================
@@ -363,6 +371,7 @@ def create_trade_record(
     entry_price,
     cancellation_level,
     reason,
+    data_signature=None,
 ):
     global current_trade_id
 
@@ -382,6 +391,7 @@ def create_trade_record(
         "entry_price": entry_price,
         "cancellation_level": cancellation_level,
         "reason": reason,
+        "data_signature": data_signature,
         "result": "PENDING",
         "result_time": None,
     }
@@ -501,6 +511,7 @@ def start_base_cycle(
     active_cycle["trade_type"] = "BASE"
     active_cycle["direction"] = direction
     active_cycle["recovery_used"] = False
+    active_cycle["recovery_requested"] = False
     active_cycle["last_trade_time"] = time.time()
     active_cycle["trade_number"] = 1
 
@@ -552,10 +563,12 @@ def reset_cycle():
     active_cycle["trade_type"] = None
     active_cycle["direction"] = None
     active_cycle["recovery_used"] = False
+    active_cycle["recovery_requested"] = False
     active_cycle["last_trade_time"] = 0.0
     active_cycle["trade_number"] = 0
 
     current_trade_id = None
+
 
     save_state()
 
@@ -1494,82 +1507,91 @@ def store_mt4_data(payload):
 # BEST PAIR
 # ============================================================
 
-def choose_best_pair():
+def signal_data_signature(symbol, timeframe, candles):
+    """Fingerprint the latest closed candles so stale analysis cannot repeat."""
+    recent = candles[-6:]
+    parts = [symbol, timeframe]
+    for c in recent:
+        parts.append(str(c.get("timestamp")))
+        parts.append(f"{float(c.get('close', 0.0)):.10f}")
+    return "|".join(parts)
+
+
+def recent_signal_records():
+    return [r for r in trade_history[-RECENT_SIGNAL_MEMORY:] if isinstance(r, dict)]
+
+
+def choose_best_pair(for_recovery=False):
     candidates = []
+    recent = recent_signal_records()
+    recent_keys = {(r.get("symbol"), r.get("direction")) for r in recent}
+    recent_symbols = [r.get("symbol") for r in recent[-DIVERSITY_LOOKBACK:]]
+    recent_directions = [r.get("direction") for r in recent[-DIVERSITY_LOOKBACK:]]
+    recent_signatures = {r.get("data_signature") for r in recent if r.get("data_signature")}
 
     for symbol, data in mt4_data.items():
-
-        timeframe = str(
-            data.get(
-                "timeframe",
-                "M1",
-            )
-        ).upper()
-
+        timeframe = str(data.get("timeframe", "M1")).upper()
         if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
             continue
 
-        candles = data.get(
-            "candles",
-            [],
-        )
-
-        closed = remove_forming_candle(
-            candles
-        )
-
-        if len(closed) < MIN_CLOSED_CANDLES:
+        candles = remove_forming_candle(data.get("candles", []))
+        if len(candles) < MIN_CLOSED_CANDLES:
             continue
 
-        result = analyze_local(closed)
+        signature = signal_data_signature(symbol, timeframe, candles)
+        if signature in recent_signatures:
+            logger.info("Skip stale analysis | %s | %s", symbol, timeframe)
+            continue
 
+        result = analyze_local(candles)
         if not result:
             continue
 
-        if active_cycle["active"]:
+        direction = result.get("direction")
+        confidence = result.get("confidence", 0)
+        max_score = max(result.get("up_score", 0), result.get("down_score", 0))
+        gap = abs(result.get("up_score", 0) - result.get("down_score", 0))
 
-            if (
-                symbol
-                == active_cycle.get("symbol")
-            ):
-                return {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "analysis": result,
-                }
+        # Diversity is a tie-break/priority bonus, never a forced direction.
+        pair_penalty = 2 if symbol in recent_symbols else 0
+        direction_penalty = 2 if direction in recent_directions else 0
+        exact_penalty = 3 if (symbol, direction) in recent_keys else 0
 
-            continue
-
-        gap = abs(
-            result["up_score"]
-            - result["down_score"]
-        )
-
-        candidates.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "analysis": result,
-                "gap": gap,
-            }
-        )
+        candidates.append({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "analysis": result,
+            "gap": gap,
+            "signature": signature,
+            "pair_penalty": pair_penalty,
+            "direction_penalty": direction_penalty,
+            "exact_penalty": exact_penalty,
+            "updated_at": data.get("updated_at", 0),
+        })
 
     if not candidates:
         return None
 
     candidates.sort(
         key=lambda x: (
-            x["analysis"]["confidence"],
-            max(
-                x["analysis"]["up_score"],
-                x["analysis"]["down_score"],
-            ),
+            x["analysis"].get("confidence", 0) - x["pair_penalty"] - x["direction_penalty"] - x["exact_penalty"],
+            x["analysis"].get("confidence", 0),
+            max(x["analysis"].get("up_score", 0), x["analysis"].get("down_score", 0)),
             x["gap"],
+            x["updated_at"],
         ),
         reverse=True,
     )
 
-    return candidates[0]
+    best = candidates[0]
+    logger.info(
+        "BEST CANDIDATE | %s | %s | %s | conf=%s | scores=%s/%s | diversity penalties=%s/%s/%s",
+        best["symbol"], best["timeframe"], best["analysis"].get("direction"),
+        best["analysis"].get("confidence"), best["analysis"].get("up_score"),
+        best["analysis"].get("down_score"), best["pair_penalty"],
+        best["direction_penalty"], best["exact_penalty"],
+    )
+    return best
 
 
 # ============================================================
@@ -1733,6 +1755,12 @@ def _auto_analyze_pair(
         )
         return
 
+    data_signature = signal_data_signature(symbol, timeframe, closed)
+
+    if any(r.get("data_signature") == data_signature for r in trade_history[-RECENT_SIGNAL_MEMORY:]):
+        logger.info("STALE SIGNAL BLOCKED | %s | %s", symbol, timeframe)
+        return
+
     local_result = analyze_local(
         closed
     )
@@ -1858,6 +1886,7 @@ def _auto_analyze_pair(
         entry_price=entry_price,
         cancellation_level=cancellation_level,
         reason=local_result["reason"],
+        data_signature=data_signature,
     )
 
     start_base_cycle(
@@ -1885,118 +1914,38 @@ def auto_analyze_pair(symbol, timeframe="M1"):
 # ============================================================
 
 def send_recovery_signal():
-    """
-    Called after BASE LOSS.
-
-    Exactly one Recovery is allowed.
-    """
-
+    """Send exactly one fresh Recovery signal, preferably diversified."""
     global last_signal_sent_at
 
-    if not active_cycle["active"]:
+    if not active_cycle["active"] or active_cycle.get("recovery_used"):
         return False
 
-    if active_cycle.get("recovery_used"):
-        logger.warning(
-            "Recovery already used. No second Recovery."
-        )
+    best = choose_best_pair(for_recovery=True)
+    if not best:
+        logger.warning("No fresh candidate available for Recovery yet.")
         return False
 
-    symbol = active_cycle.get(
-        "symbol"
-    )
+    symbol = best["symbol"]
+    timeframe = best["timeframe"]
+    result = best["analysis"]
+    data_signature = best["signature"]
+    candles = remove_forming_candle(mt4_data[symbol].get("candles", []))
 
-    timeframe = active_cycle.get(
-        "timeframe",
-        "H1",
-    )
-
-    if not symbol:
-        return False
-
-    data = mt4_data.get(symbol)
-
-    if not data:
-        logger.warning(
-            "No MT4 data for Recovery: %s",
-            symbol,
-        )
-        return False
-
-    candles = remove_forming_candle(
-        data.get(
-            "candles",
-            [],
-        )
-    )
-
-    if len(candles) < MIN_CLOSED_CANDLES:
-        return False
-
-    result = analyze_local(
-        candles
-    )
-
-    if not result:
-        return False
-
-    gemini_result = gemini_confirm(
-        symbol,
-        timeframe,
-        candles,
-        result,
-    )
-
-    if gemini_result:
-        if (
-            gemini_result["direction"]
-            == result["direction"]
-        ):
-            result["confidence"] = min(
-                result["confidence"],
-                gemini_result["confidence"],
-            )
-
-            if gemini_result.get("comment"):
-                result["reason"] += (
-                    " | "
-                    + gemini_result["comment"]
-                )
+    gemini_result = gemini_confirm(symbol, timeframe, candles, result)
+    if gemini_result and gemini_result.get("direction") == result.get("direction"):
+        result["confidence"] = min(result["confidence"], gemini_result["confidence"])
+        if gemini_result.get("comment"):
+            result["reason"] += " | " + gemini_result["comment"]
 
     direction = result["direction"]
-
     entry_price = candles[-1]["close"]
-
-    entry_dt = (
-        now_algiers()
-        + timedelta(
-            minutes=ENTRY_DELAY_MINUTES
-        )
-    )
-
-    entry_time = entry_dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    cancellation_level, cancellation_text = (
-        calculate_cancellation_level(
-            candles,
-            direction,
-            entry_price,
-        )
-    )
+    entry_time = (now_algiers() + timedelta(minutes=ENTRY_DELAY_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+    cancellation_level, cancellation_text = calculate_cancellation_level(candles, direction, entry_price)
 
     text = format_signal(
-        symbol=symbol,
-        timeframe=timeframe,
-        trade_type="RECOVERY",
-        direction=direction,
-        confidence=result["confidence"],
-        up_score=result["up_score"],
-        down_score=result["down_score"],
-        entry_time=entry_time,
-        entry_price=entry_price,
-        cancellation_text=cancellation_text,
+        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY", direction=direction,
+        confidence=result["confidence"], up_score=result["up_score"], down_score=result["down_score"],
+        entry_time=entry_time, entry_price=entry_price, cancellation_text=cancellation_text,
         reason=result["reason"],
     )
 
@@ -2004,38 +1953,23 @@ def send_recovery_signal():
         return False
 
     last_signal_sent_at = time.time()
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Mark Recovery as used BEFORE creating the record.
-    # This permanently blocks Recovery 2.
-    # --------------------------------------------------------
-
-    start_recovery_cycle()
+    # Mark Recovery used only AFTER the fresh Recovery was actually sent.
+    active_cycle["symbol"] = symbol
+    active_cycle["timeframe"] = timeframe
+    active_cycle["direction"] = direction
+    active_cycle["trade_type"] = "RECOVERY"
+    active_cycle["recovery_used"] = True
+    active_cycle["trade_number"] = 2
+    active_cycle["last_trade_time"] = time.time()
 
     create_trade_record(
-        symbol=symbol,
-        timeframe=timeframe,
-        trade_type="RECOVERY",
-        direction=direction,
-        confidence=result["confidence"],
-        up_score=result["up_score"],
-        down_score=result["down_score"],
-        entry_time=entry_time,
-        entry_price=entry_price,
-        cancellation_level=cancellation_level,
-        reason=result["reason"],
+        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY", direction=direction,
+        confidence=result["confidence"], up_score=result["up_score"], down_score=result["down_score"],
+        entry_time=entry_time, entry_price=entry_price, cancellation_level=cancellation_level,
+        reason=result["reason"], data_signature=data_signature,
     )
-
     save_state()
-
-    logger.info(
-        "RECOVERY SIGNAL SENT | id=%s | %s | %s",
-        current_trade_id,
-        symbol,
-        direction,
-    )
-
+    logger.info("RECOVERY SIGNAL SENT | %s | %s", symbol, direction)
     return True
 
 
@@ -2173,11 +2107,11 @@ async def loss_command(
                 "🚫 لا توجد مضاعفة ثانية."
             )
 
-            # Send Recovery immediately.
-            threading.Thread(
-                target=send_recovery_signal,
-                daemon=True,
-            ).start()
+            # Request one Recovery. Background waits for fresh MT4 candles
+            # and sends it only when the analysis is genuinely new.
+            active_cycle["recovery_requested"] = True
+            save_state()
+            threading.Thread(target=send_recovery_signal, daemon=True).start()
 
             return
 
@@ -2357,6 +2291,7 @@ async def reset_command(
 
     current_trade_id = None
 
+
     trade_history = []
 
     save_history()
@@ -2506,21 +2441,22 @@ def background_analysis_loop():
 
             if active_cycle["active"]:
 
+                if (
+                    active_cycle.get("trade_type") == "BASE"
+                    and active_cycle.get("recovery_requested")
+                    and not active_cycle.get("recovery_used")
+                ):
+                    if send_recovery_signal():
+                        active_cycle["recovery_requested"] = False
+                        save_state()
+                    time.sleep(10)
+                    continue
+
                 logger.info(
-                    "Active cycle waiting | "
-                    "type=%s | symbol=%s | "
-                    "trade_id=%s",
-                    active_cycle.get(
-                        "trade_type"
-                    ),
-                    active_cycle.get(
-                        "symbol"
-                    ),
-                    current_trade_id,
+                    "Active cycle waiting | type=%s | symbol=%s | trade_id=%s",
+                    active_cycle.get("trade_type"), active_cycle.get("symbol"), current_trade_id,
                 )
-
-                time.sleep(60)
-
+                time.sleep(20)
                 continue
 
             # ------------------------------------------------
