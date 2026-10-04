@@ -1,4 +1,4 @@
- import os
+import os
 import json
 import logging
 import threading
@@ -1517,7 +1517,13 @@ def timeframe_to_minutes(timeframe):
 # BEST PAIR
 # ============================================================
 
-def choose_best_pair():
+def choose_best_pair(exclude_symbol=None, preferred_direction=None):
+    """Choose a fresh candidate while avoiding repeated pair/direction bias.
+
+    The analysis engine itself is unchanged. Selection prefers the opposite
+    direction of the previous completed signal and a different symbol. If no
+    such candidate exists, it falls back to the strongest available setup.
+    """
     candidates = []
 
     for symbol, data in mt4_data.items():
@@ -1550,15 +1556,7 @@ def choose_best_pair():
         if not result:
             continue
 
-        if active_cycle["active"]:
-
-            if symbol == active_cycle.get("symbol"):
-                return {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "analysis": result,
-                }
-
+        if exclude_symbol and symbol == exclude_symbol:
             continue
 
         gap = abs(
@@ -1578,18 +1576,17 @@ def choose_best_pair():
     if not candidates:
         return None
 
-    candidates.sort(
-        key=lambda x: (
-            x["analysis"]["confidence"],
-            max(
-                x["analysis"]["up_score"],
-                x["analysis"]["down_score"],
-            ),
-            x["gap"],
-        ),
-        reverse=True,
-    )
+    def rank(item):
+        a = item["analysis"]
+        direction_bonus = 1 if preferred_direction and a.get("direction") == preferred_direction else 0
+        return (
+            direction_bonus,
+            a["confidence"],
+            max(a["up_score"], a["down_score"]),
+            item["gap"],
+        )
 
+    candidates.sort(key=rank, reverse=True)
     return candidates[0]
 
 
@@ -1707,6 +1704,31 @@ def send_signal_safely(text):
         )
 
         return False
+
+
+# ============================================================
+# DIVERSITY HELPERS
+# ============================================================
+
+def last_completed_signal():
+    """Return the latest completed trade record, if any."""
+    for record in reversed(trade_history):
+        if record.get("result") in ("WIN", "LOSS"):
+            return record
+    return None
+
+
+def preferred_next_direction():
+    """Prefer alternating direction after every completed trade."""
+    last = last_completed_signal()
+    if not last:
+        return None
+    last_direction = str(last.get("direction", "")).upper()
+    if last_direction == "UP":
+        return "DOWN"
+    if last_direction == "DOWN":
+        return "UP"
+    return None
 
 
 # ============================================================
@@ -1933,40 +1955,36 @@ def send_recovery_signal():
         )
         return False
 
-    symbol = active_cycle.get(
-        "symbol"
+    previous_symbol = active_cycle.get("symbol")
+    previous_direction = str(active_cycle.get("direction", "")).upper()
+    preferred = "DOWN" if previous_direction == "UP" else "UP" if previous_direction == "DOWN" else None
+
+    # Recovery must use a fresh, different pair when M1/M2/M3 data exists.
+    candidate = choose_best_pair(
+        exclude_symbol=previous_symbol,
+        preferred_direction=preferred,
     )
 
-    timeframe = active_cycle.get(
-        "timeframe",
-        "M1",
-    )
-
-    if not symbol:
+    if not candidate:
+        logger.warning(
+            "No diversified Recovery candidate available | previous=%s | preferred=%s",
+            previous_symbol,
+            preferred,
+        )
         return False
+
+    symbol = candidate["symbol"]
+    timeframe = candidate["timeframe"]
 
     data = mt4_data.get(symbol)
-
     if not data:
-        logger.warning(
-            "No MT4 data for Recovery: %s",
-            symbol,
-        )
         return False
 
-    candles = remove_forming_candle(
-        data.get(
-            "candles",
-            [],
-        )
-    )
-
+    candles = remove_forming_candle(data.get("candles", []))
     if len(candles) < MIN_CLOSED_CANDLES:
         return False
 
-    result = analyze_local(
-        candles
-    )
+    result = candidate["analysis"]
 
     if not result:
         return False
@@ -2001,7 +2019,7 @@ def send_recovery_signal():
     entry_dt = (
         now_algiers()
         + timedelta(
-            minutes=ENTRY_DELAY_MINUTES
+            minutes=timeframe_to_minutes(timeframe)
         )
     )
 
@@ -2476,7 +2494,7 @@ async def analyze_command(
         )
         return
 
-    best = choose_best_pair()
+    best = choose_best_pair(preferred_direction=preferred_next_direction())
 
     if not best:
         await update.message.reply_text(
@@ -2561,7 +2579,7 @@ def background_analysis_loop():
             # Find best pair
             # ------------------------------------------------
 
-            best = choose_best_pair()
+            best = choose_best_pair(preferred_direction=preferred_next_direction())
 
             if best:
 
