@@ -1,4 +1,4 @@
-import os
+ import os
 import json
 import logging
 import threading
@@ -42,7 +42,7 @@ PORT = int(os.getenv("PORT", "10000"))
 ALGIERS = ZoneInfo("Africa/Algiers")
 
 ENTRY_DELAY_MINUTES = 2
-SIGNAL_COOLDOWN_SECONDS = 180
+SIGNAL_COOLDOWN_SECONDS = 120
 
 SUPPORTED_SIGNAL_TIMEFRAMES = {"M1", "M2", "M3"}
 
@@ -1514,105 +1514,83 @@ def timeframe_to_minutes(timeframe):
 
 
 # ============================================================
-# SELECTION MEMORY / DIVERSIFICATION
-# ============================================================
-def recent_completed_trade():
-    for record in reversed(trade_history):
-        if record.get("result") in ("WIN", "LOSS"):
-            return record
-    return None
-
-def select_best_candidate(candidates, recovery=False):
-    if not candidates:
-        return None
-
-    previous = recent_completed_trade()
-    previous_symbol = previous.get("symbol") if previous else None
-    previous_direction = previous.get("direction") if previous else None
-
-    # Prefer a different pair. If another fresh candidate exists, do not reuse
-    # the immediately previous pair. Only fall back to it when it is the only choice.
-    if previous_symbol:
-        different = [c for c in candidates if c["symbol"] != previous_symbol]
-        if different:
-            candidates = different
-
-    for c in candidates:
-        c["selection_score"] = (
-            c["analysis"]["confidence"] * 2
-            + max(c["analysis"]["up_score"], c["analysis"]["down_score"])
-            + c["gap"]
-        )
-        if c["symbol"] == previous_symbol:
-            c["selection_score"] -= 18
-        if recovery and previous_direction:
-            if c["analysis"]["direction"] != previous_direction:
-                c["selection_score"] += 10
-            else:
-                c["selection_score"] -= 4
-
-    candidates.sort(key=lambda x: x["selection_score"], reverse=True)
-    best = candidates[0]
-
-    # If another direction is genuinely close in strength, prefer it after
-    # repeating the same direction. This is diversification, not forced inversion.
-    if previous_direction:
-        opposite = [
-            c for c in candidates
-            if c["analysis"]["direction"] != previous_direction
-            and c["analysis"]["confidence"] >= best["analysis"]["confidence"] - 8
-            and c["gap"] >= 2
-        ]
-        if opposite:
-            opposite.sort(key=lambda x: x["selection_score"], reverse=True)
-            if best["analysis"]["direction"] == previous_direction:
-                best = opposite[0]
-
-    return best
-
-
-# ============================================================
 # BEST PAIR
 # ============================================================
 
-def choose_best_pair(recovery=False, exclude_symbol=None):
+def choose_best_pair():
     candidates = []
-    now_ts = time.time()
 
     for symbol, data in mt4_data.items():
-        if exclude_symbol and symbol == exclude_symbol:
-            continue
 
-        timeframe = str(data.get("timeframe", "M1")).upper().strip()
+        timeframe = str(
+            data.get(
+                "timeframe",
+                "M1",
+            )
+        ).upper().strip()
+
+        # Only use the short trading timeframes sent by MT4.
         if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
             continue
 
-        # Do not analyze stale MT4 data. EA normally refreshes every few seconds.
-        if now_ts - float(data.get("updated_at", 0)) > 90:
-            continue
+        candles = data.get(
+            "candles",
+            [],
+        )
 
-        candles = data.get("candles", [])
-        closed = remove_forming_candle(candles)
+        closed = remove_forming_candle(
+            candles
+        )
+
         if len(closed) < MIN_CLOSED_CANDLES:
             continue
 
         result = analyze_local(closed)
+
         if not result:
             continue
 
-        gap = abs(result["up_score"] - result["down_score"])
-        strength = max(result["up_score"], result["down_score"])
-        if strength < 8 or gap < 2:
+        if active_cycle["active"]:
+
+            if symbol == active_cycle.get("symbol"):
+                return {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "analysis": result,
+                }
+
             continue
 
-        candidates.append({
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "analysis": result,
-            "gap": gap,
-        })
+        gap = abs(
+            result["up_score"]
+            - result["down_score"]
+        )
 
-    return select_best_candidate(candidates, recovery=recovery)
+        candidates.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "analysis": result,
+                "gap": gap,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x: (
+            x["analysis"]["confidence"],
+            max(
+                x["analysis"]["up_score"],
+                x["analysis"]["down_score"],
+            ),
+            x["gap"],
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]
 
 
 # ============================================================
@@ -1734,14 +1712,6 @@ def send_signal_safely(text):
 # ============================================================
 # AUTO ANALYSIS
 # ============================================================
-def auto_analyze_best(recovery=False, exclude_symbol=None):
-    best = choose_best_pair(recovery=recovery, exclude_symbol=exclude_symbol)
-    if not best:
-        logger.info("No suitable fresh candidate found")
-        return
-    auto_analyze_pair(best["symbol"], best["timeframe"])
-
-
 
 def auto_analyze_pair(
     symbol,
@@ -1781,10 +1751,6 @@ def auto_analyze_pair(
         data = mt4_data.get(symbol)
 
         if not data:
-            return
-
-        if time.time() - float(data.get("updated_at", 0)) > 90:
-            logger.info("Stale MT4 data rejected | %s", symbol)
             return
 
         candles = data.get(
@@ -1950,73 +1916,157 @@ def auto_analyze_pair(
 # ============================================================
 
 def send_recovery_signal():
-    """Send exactly one fresh Recovery trade on a different pair when possible."""
+    """
+    Called after BASE LOSS.
+
+    Exactly one Recovery is allowed.
+    """
+
     global last_signal_sent_at
 
-    if not active_cycle["active"] or active_cycle.get("recovery_used"):
+    if not active_cycle["active"]:
         return False
 
-    previous_symbol = active_cycle.get("symbol")
-    best = choose_best_pair(recovery=True, exclude_symbol=previous_symbol)
-
-    # If no different fresh pair exists, use the strongest fresh pair.
-    if not best:
-        best = choose_best_pair(recovery=True)
-    if not best:
-        logger.warning("No fresh candidate available for Recovery")
+    if active_cycle.get("recovery_used"):
+        logger.warning(
+            "Recovery already used. No second Recovery."
+        )
         return False
 
-    symbol = best["symbol"]
-    timeframe = best["timeframe"]
-    candles = remove_forming_candle(mt4_data[symbol].get("candles", []))
+    symbol = active_cycle.get(
+        "symbol"
+    )
+
+    timeframe = active_cycle.get(
+        "timeframe",
+        "M1",
+    )
+
+    if not symbol:
+        return False
+
+    data = mt4_data.get(symbol)
+
+    if not data:
+        logger.warning(
+            "No MT4 data for Recovery: %s",
+            symbol,
+        )
+        return False
+
+    candles = remove_forming_candle(
+        data.get(
+            "candles",
+            [],
+        )
+    )
+
     if len(candles) < MIN_CLOSED_CANDLES:
         return False
 
-    result = analyze_local(candles)
+    result = analyze_local(
+        candles
+    )
+
     if not result:
         return False
 
-    gemini_result = gemini_confirm(symbol, timeframe, candles, result)
-    if gemini_result and gemini_result["direction"] == result["direction"]:
-        result["confidence"] = min(result["confidence"], gemini_result["confidence"])
-        if gemini_result.get("comment"):
-            result["reason"] += " | " + gemini_result["comment"]
+    gemini_result = gemini_confirm(
+        symbol,
+        timeframe,
+        candles,
+        result,
+    )
+
+    if gemini_result:
+        if (
+            gemini_result["direction"]
+            == result["direction"]
+        ):
+            result["confidence"] = min(
+                result["confidence"],
+                gemini_result["confidence"],
+            )
+
+            if gemini_result.get("comment"):
+                result["reason"] += (
+                    " | "
+                    + gemini_result["comment"]
+                )
 
     direction = result["direction"]
+
     entry_price = candles[-1]["close"]
-    entry_dt = now_algiers() + timedelta(minutes=timeframe_to_minutes(timeframe))
-    entry_time = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
-    cancellation_level, cancellation_text = calculate_cancellation_level(candles, direction, entry_price)
+
+    entry_dt = (
+        now_algiers()
+        + timedelta(
+            minutes=ENTRY_DELAY_MINUTES
+        )
+    )
+
+    entry_time = entry_dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    cancellation_level, cancellation_text = (
+        calculate_cancellation_level(
+            candles,
+            direction,
+            entry_price,
+        )
+    )
 
     text = format_signal(
-        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY",
-        direction=direction, confidence=result["confidence"],
-        up_score=result["up_score"], down_score=result["down_score"],
-        entry_time=entry_time, entry_price=entry_price,
-        cancellation_text=cancellation_text, reason=result["reason"],
+        symbol=symbol,
+        timeframe=timeframe,
+        trade_type="RECOVERY",
+        direction=direction,
+        confidence=result["confidence"],
+        up_score=result["up_score"],
+        down_score=result["down_score"],
+        entry_time=entry_time,
+        entry_price=entry_price,
+        cancellation_text=cancellation_text,
+        reason=result["reason"],
     )
 
     if not send_signal_safely(text):
         return False
 
-    # Only after Telegram confirms delivery do we switch the cycle to Recovery
-    # and create the NEW PENDING record. This fixes the missing Recovery PENDING bug.
+    last_signal_sent_at = time.time()
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Mark Recovery as used BEFORE creating the record.
+    # This permanently blocks Recovery 2.
+    # --------------------------------------------------------
+
     start_recovery_cycle()
-    active_cycle["symbol"] = symbol
-    active_cycle["timeframe"] = timeframe
-    active_cycle["direction"] = direction
 
     create_trade_record(
-        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY",
-        direction=direction, confidence=result["confidence"],
-        up_score=result["up_score"], down_score=result["down_score"],
-        entry_time=entry_time, entry_price=entry_price,
-        cancellation_level=cancellation_level, reason=result["reason"],
+        symbol=symbol,
+        timeframe=timeframe,
+        trade_type="RECOVERY",
+        direction=direction,
+        confidence=result["confidence"],
+        up_score=result["up_score"],
+        down_score=result["down_score"],
+        entry_time=entry_time,
+        entry_price=entry_price,
+        cancellation_level=cancellation_level,
+        reason=result["reason"],
     )
 
-    last_signal_sent_at = time.time()
     save_state()
-    logger.info("RECOVERY SIGNAL SENT | id=%s | %s | %s", current_trade_id, symbol, direction)
+
+    logger.info(
+        "RECOVERY SIGNAL SENT | id=%s | %s | %s",
+        current_trade_id,
+        symbol,
+        direction,
+    )
+
     return True
 
 
@@ -2146,6 +2196,8 @@ async def loss_command(
             "recovery_used"
         ):
 
+            start_recovery_cycle()
+
             await update.message.reply_text(
                 "🔴 BASE LOSS\n\n"
                 "📚 تم تسجيل الصفقة: LOSS\n\n"
@@ -2154,9 +2206,11 @@ async def loss_command(
                 "🚫 لا توجد مضاعفة ثانية."
             )
 
-            # Send Recovery immediately and wait until its NEW PENDING record
-            # is created, preventing a fast second /loss from seeing no PENDING.
-            await asyncio.to_thread(send_recovery_signal)
+            # Send Recovery immediately.
+            threading.Thread(
+                target=send_recovery_signal,
+                daemon=True,
+            ).start()
 
             return
 
@@ -2694,8 +2748,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                     if symbol:
 
                         threading.Thread(
-                            target=auto_analyze_best,
-                            kwargs={"recovery": False},
+                            target=auto_analyze_pair,
+                            args=(
+                                symbol,
+                                str(payload.get("timeframe", "M1")).upper(),
+                            ),
                             daemon=True,
                         ).start()
 
