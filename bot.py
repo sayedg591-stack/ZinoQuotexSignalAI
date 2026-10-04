@@ -1456,47 +1456,21 @@ async def send_signal(
 # ============================================================
 # PROCESS COMPLETE BATCH
 # ============================================================
-
-async def process_complete_batch(
-    application
-):
+async def process_complete_batch(application):
+    global recovery_pending
+    global recovery_wait_until
+    global recovery_number
+    global active_trade
+    global latest_batch_id
     global processing_batch_id
 
     with state_lock:
-        if not latest_batch_complete:
-            return
-
-        batch_id = latest_batch_id
-
-        if not batch_id:
-            return
-
-        if processing_batch_id == batch_id:
-            return
-
-        processing_batch_id = batch_id
-
-        # ----------------------------------------------------
-        # HARD LOCK:
-        # If a trade is active, DO NOT send anything.
-        # ----------------------------------------------------
-
-        if active_trade is not None:
-            processing_batch_id = None
-            return
-
-    try:
-        # ----------------------------------------------------
-        # Recovery waiting period
-        # ----------------------------------------------------
-
-        with state_lock:
-            recovery_active = (
-                recovery_pending
-            )
-            wait_until = (
-                recovery_wait_until
-            )
+        recovery_active = (
+            recovery_pending
+        )
+        wait_until = (
+            recovery_wait_until
+        )  )
 
         if recovery_active:
             if (
