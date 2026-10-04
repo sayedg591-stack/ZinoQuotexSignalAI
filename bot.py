@@ -1,4 +1,4 @@
- import os
+import os
 import io
 import json
 import logging
@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-
 from telegram import Update
 from telegram.ext import (
     Application,
