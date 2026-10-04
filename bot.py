@@ -1,5 +1,4 @@
-
-import os
+ import os
 import io
 import json
 import logging
@@ -1341,19 +1340,16 @@ async def analyze_mt4_data(market_data):
 
         text = text.strip()
 
-        if text.startswith("
-"):
+        if text.startswith("```"):
             text = re.sub(
-                r"^
-(?:json)?",
+                r"^```(?:json)?",
                 "",
                 text,
                 flags=re.IGNORECASE,
             )
 
             text = re.sub(
-                r"
-$",
+                r"```$",
                 "",
                 text,
             )
@@ -3050,20 +3046,17 @@ async def analyze_chart(
 
         text = text.strip()
 
-        if text.startswith("
-"):
+        if text.startswith("```"):
 
             text = re.sub(
-                r"^
-(?:json)?",
+                r"^```(?:json)?",
                 "",
                 text,
                 flags=re.IGNORECASE,
             )
 
             text = re.sub(
-                r"
-$",
+                r"```$",
                 "",
                 text,
             )
@@ -3465,31 +3458,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-وصلني الكود كامل. 👍
-
-راجعت الهيكل، وهو نسخة البوت الحالية وفيها:
-
-MT4 → /mt4 → تخزين الشموع.
-
-دورة تلقائية كل 3 دقائق.
-
-إشارة أولى، ثم محاولة إشارة ثانية بعد دقيقتين.
-
-الزوج الثاني مختلف عن الأول.
-
-Quality Filter.
-
-توقيت الدخول Africa/Algiers.
-
-/win و/loss و/stats و/reset.
-
-تحليل يدوي /analyze.
-
-تحليل الصور أيضًا.
-
-لكن عندي ملاحظة مهمة جدًا قبل ما نعدلها: الكود الحالي ما زال يسمح عمليًا بإرسال إشارتين في الدورة، بينما من كلامك السابق كنت تريد صفقة واحدة دقيقة فقط كل 3 دقائق مع بقاء Recovery للمضاعفة. كذلك نظام /win و/loss الحالي مجرد عدّاد عام، وليس مربوطًا بالصفقة التي أرسلها البوت.
-
-إذا هدفك الآن هو إعادة بناء هذا البوت من الصفر وتصحيح نظام الصفقة + Recovery + تسجيل WIN/LOSS، نقدر نبدل المنطق كامل بدل الترقيع على هذه النسخة.
-
-
