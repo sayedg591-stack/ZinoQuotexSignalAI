@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -149,6 +148,16 @@ same_direction_streak = 0
 
 # آخر زوج
 last_signal_symbol = None
+
+
+# ============================================================
+# BACKGROUND TASK CONTROL
+# ============================================================
+
+# يتم تشغيل background scanner كـ asyncio task مستقل
+# ويتم إلغاؤه بشكل نظيف عند إيقاف التطبيق.
+background_task = None
+background_stop_event = None
 
 
 # ============================================================
@@ -2304,27 +2313,90 @@ async def process_complete_batch(
 # ============================================================
 
 async def background_loop(
-    application
+    application,
+    stop_event
 ):
     logger.info(
         "Background scanner started"
     )
 
-    while True:
+    try:
+        while not stop_event.is_set():
+
+            try:
+                await process_complete_batch(
+                    application
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as e:
+                logger.exception(
+                    "Background loop error: %s",
+                    e
+                )
+
+            # بدل sleep عادي:
+            # ننتظر إما انتهاء 3 ثواني أو طلب الإيقاف.
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=BACKGROUND_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    except asyncio.CancelledError:
+        logger.info(
+            "Background scanner cancellation received"
+        )
+
+    finally:
+        logger.info(
+            "Background scanner stopped"
+        )
+
+
+# ============================================================
+# STOP BACKGROUND TASK
+# ============================================================
+
+async def stop_background_task():
+    global background_task
+    global background_stop_event
+
+    task = background_task
+    stop_event = background_stop_event
+
+    if stop_event is not None:
+        stop_event.set()
+
+    if task is not None:
+
+        if not task.done():
+            task.cancel()
+
         try:
-            await process_complete_batch(
-                application
+            await task
+
+        except asyncio.CancelledError:
+            logger.info(
+                "Background scanner task cancelled cleanly"
             )
 
         except Exception as e:
             logger.exception(
-                "Background loop error: %s",
+                "Background scanner shutdown error: %s",
                 e
             )
 
-        await asyncio.sleep(
-            BACKGROUND_INTERVAL
-        )
+    background_task = None
+    background_stop_event = None
+
+    logger.info(
+        "Background task cleanup complete"
+    )
 
 
 # ============================================================
@@ -2826,6 +2898,15 @@ class HealthHandler(
 
     def do_POST(self):
 
+        # ====================================================
+        # FIX:
+        # هذه المتغيرات Global لأنها تُقرأ وتُعدّل داخل do_POST
+        # ====================================================
+
+        global latest_batch_id
+        global latest_batch_started_at
+        global latest_batch_complete
+
         parsed = urlparse(
             self.path
         )
@@ -2847,9 +2928,9 @@ class HealthHandler(
 
             return
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # API KEY
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         received_key = (
             self.headers.get(
@@ -2886,9 +2967,9 @@ class HealthHandler(
 
             return
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # CONTENT LENGTH
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         try:
             content_length = int(
@@ -2922,9 +3003,9 @@ class HealthHandler(
 
             return
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # READ BODY
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         try:
             raw = self.rfile.read(
@@ -2955,9 +3036,9 @@ class HealthHandler(
 
             return
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # VALIDATE
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         symbol = str(
             payload.get(
@@ -3042,9 +3123,9 @@ class HealthHandler(
 
             return
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # VALIDATE CANDLES
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         clean_candles = []
 
@@ -3121,9 +3202,9 @@ class HealthHandler(
             key=lambda x: x["time"]
         )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # CLOSED CANDLE
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         supplied_closed_time = safe_int(
             payload.get(
@@ -3140,9 +3221,9 @@ class HealthHandler(
                 clean_candles[-1]["time"]
             )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # CURRENT PRICE
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         current_bid = safe_float(
             payload.get(
@@ -3172,9 +3253,9 @@ class HealthHandler(
             )
         )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # STORE
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         with state_lock:
 
@@ -3264,14 +3345,59 @@ def start_http_server():
 async def post_init(
     application
 ):
-    application.create_task(
+    global background_task
+    global background_stop_event
+
+    # إنشاء Event خاص بإيقاف Scanner
+    background_stop_event = asyncio.Event()
+
+    # ========================================================
+    # مهم:
+    # نستخدم asyncio.create_task بدل application.create_task
+    # حتى لا يبقى Task لا نهائي مسجلاً داخل Application
+    # أثناء عملية الإيقاف.
+    # ========================================================
+
+    background_task = asyncio.create_task(
         background_loop(
-            application
+            application,
+            background_stop_event
         )
     )
 
     logger.info(
         "ZinoProSignalAI background task started"
+    )
+
+
+# ============================================================
+# POST STOP
+# ============================================================
+
+async def post_stop(
+    application
+):
+    logger.info(
+        "Application stopping; cleaning background scanner..."
+    )
+
+    await stop_background_task()
+
+
+# ============================================================
+# POST SHUTDOWN
+# ============================================================
+
+async def post_shutdown(
+    application
+):
+    # احتياط إضافي:
+    # إذا لم يتم تنظيف task لأي سبب أثناء post_stop،
+    # يتم تنظيفه هنا قبل إغلاق event loop.
+    await stop_background_task()
+
+    logger.info(
+        "ZinoProSignalAI shutdown complete"
     )
 
 
@@ -3315,6 +3441,8 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_stop(post_stop)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
