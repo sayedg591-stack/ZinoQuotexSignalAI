@@ -117,6 +117,7 @@ stats_data = {
 trade_history = []
 
 current_trade_id = None
+last_signal_direction = None
 
 
 # ============================================================
@@ -203,6 +204,7 @@ def save_state():
             "active_cycle": active_cycle,
             "stats_data": stats_data,
             "current_trade_id": current_trade_id,
+            "last_signal_direction": last_signal_direction,
         }
 
         atomic_write_json(
@@ -221,6 +223,7 @@ def load_state():
     global active_cycle
     global stats_data
     global current_trade_id
+    global last_signal_direction
 
     try:
         if not os.path.exists(STATE_FILE):
@@ -244,6 +247,7 @@ def load_state():
             stats_data.update(saved_stats)
 
         current_trade_id = state.get("current_trade_id")
+        last_signal_direction = state.get("last_signal_direction")
 
         logger.info(
             "Bot state loaded | active=%s | trade_id=%s",
@@ -1517,77 +1521,70 @@ def timeframe_to_minutes(timeframe):
 # BEST PAIR
 # ============================================================
 
-def choose_best_pair(exclude_symbol=None, preferred_direction=None):
-    """Choose a fresh candidate while avoiding repeated pair/direction bias.
-
-    The analysis engine itself is unchanged. Selection prefers the opposite
-    direction of the previous completed signal and a different symbol. If no
-    such candidate exists, it falls back to the strongest available setup.
-    """
+def choose_best_pair(recovery=False, exclude_symbol=None):
+    """Choose a fresh M1/M2/M3 candidate while diversifying symbol and direction."""
     candidates = []
+    preferred_direction = None
+
+    # Normal signals alternate direction when a valid candidate exists.
+    # Recovery also prefers the opposite direction of the losing trade.
+    if recovery:
+        previous = active_cycle.get("direction")
+        if previous in ("UP", "DOWN"):
+            preferred_direction = "DOWN" if previous == "UP" else "UP"
+    elif last_signal_direction in ("UP", "DOWN"):
+        preferred_direction = "DOWN" if last_signal_direction == "UP" else "UP"
+
+    recent_symbols = set()
+    for record in reversed(trade_history):
+        if record.get("result") in ("WIN", "LOSS"):
+            sym = record.get("symbol")
+            if sym:
+                recent_symbols.add(sym)
+            if len(recent_symbols) >= 3:
+                break
 
     for symbol, data in mt4_data.items():
-
-        timeframe = str(
-            data.get(
-                "timeframe",
-                "M1",
-            )
-        ).upper().strip()
-
-        # Only use the short trading timeframes sent by MT4.
+        timeframe = str(data.get("timeframe", "M1")).upper().strip()
         if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
             continue
-
-        candles = data.get(
-            "candles",
-            [],
-        )
-
-        closed = remove_forming_candle(
-            candles
-        )
-
-        if len(closed) < MIN_CLOSED_CANDLES:
-            continue
-
-        result = analyze_local(closed)
-
-        if not result:
-            continue
-
         if exclude_symbol and symbol == exclude_symbol:
             continue
 
-        gap = abs(
-            result["up_score"]
-            - result["down_score"]
-        )
+        candles = remove_forming_candle(data.get("candles", []))
+        if len(candles) < MIN_CLOSED_CANDLES:
+            continue
 
-        candidates.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "analysis": result,
-                "gap": gap,
-            }
-        )
+        result = analyze_local(candles)
+        if not result or result.get("direction") not in ("UP", "DOWN"):
+            continue
+
+        candidates.append({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "analysis": result,
+            "gap": abs(result["up_score"] - result["down_score"]),
+            "direction_match": result["direction"] == preferred_direction,
+            "recent_penalty": symbol in recent_symbols,
+        })
 
     if not candidates:
         return None
 
-    def rank(item):
-        a = item["analysis"]
-        direction_bonus = 1 if preferred_direction and a.get("direction") == preferred_direction else 0
-        return (
-            direction_bonus,
-            a["confidence"],
-            max(a["up_score"], a["down_score"]),
-            item["gap"],
-        )
+    # First prefer the required direction, then a fresh symbol, then quality.
+    preferred = [c for c in candidates if c["direction_match"]]
+    pool = preferred if preferred else candidates
 
-    candidates.sort(key=rank, reverse=True)
-    return candidates[0]
+    fresh = [c for c in pool if not c["recent_penalty"]]
+    if fresh:
+        pool = fresh
+
+    pool.sort(key=lambda x: (
+        x["analysis"]["confidence"],
+        max(x["analysis"]["up_score"], x["analysis"]["down_score"]),
+        x["gap"],
+    ), reverse=True)
+    return pool[0]
 
 
 # ============================================================
@@ -1707,31 +1704,6 @@ def send_signal_safely(text):
 
 
 # ============================================================
-# DIVERSITY HELPERS
-# ============================================================
-
-def last_completed_signal():
-    """Return the latest completed trade record, if any."""
-    for record in reversed(trade_history):
-        if record.get("result") in ("WIN", "LOSS"):
-            return record
-    return None
-
-
-def preferred_next_direction():
-    """Prefer alternating direction after every completed trade."""
-    last = last_completed_signal()
-    if not last:
-        return None
-    last_direction = str(last.get("direction", "")).upper()
-    if last_direction == "UP":
-        return "DOWN"
-    if last_direction == "DOWN":
-        return "UP"
-    return None
-
-
-# ============================================================
 # AUTO ANALYSIS
 # ============================================================
 
@@ -1741,6 +1713,7 @@ def auto_analyze_pair(
 ):
     with SIGNAL_LOCK:
         global last_signal_sent_at
+        global last_signal_direction
 
         timeframe = str(
             timeframe
@@ -1904,6 +1877,7 @@ def auto_analyze_pair(
             return
 
         last_signal_sent_at = now_ts
+        last_signal_direction = direction
 
         create_trade_record(
             symbol=symbol,
@@ -1938,153 +1912,82 @@ def auto_analyze_pair(
 # ============================================================
 
 def send_recovery_signal():
-    """
-    Called after BASE LOSS.
-
-    Exactly one Recovery is allowed.
-    """
-
+    """Send exactly one fresh Recovery on a different symbol when possible."""
     global last_signal_sent_at
+    global last_signal_direction
 
-    if not active_cycle["active"]:
+    if not active_cycle["active"] or active_cycle.get("recovery_used") is False:
         return False
-
-    if active_cycle.get("recovery_used"):
-        logger.warning(
-            "Recovery already used. No second Recovery."
-        )
+    if active_cycle.get("trade_type") != "RECOVERY":
         return False
 
     previous_symbol = active_cycle.get("symbol")
-    previous_direction = str(active_cycle.get("direction", "")).upper()
+    previous_direction = active_cycle.get("direction")
     preferred = "DOWN" if previous_direction == "UP" else "UP" if previous_direction == "DOWN" else None
 
-    # Recovery must use a fresh, different pair when M1/M2/M3 data exists.
-    candidate = choose_best_pair(
-        exclude_symbol=previous_symbol,
-        preferred_direction=preferred,
-    )
+    # Search all fresh candidates, excluding the losing symbol.
+    candidates = []
+    for symbol, data in mt4_data.items():
+        if symbol == previous_symbol:
+            continue
+        timeframe = str(data.get("timeframe", "M1")).upper().strip()
+        if timeframe not in SUPPORTED_SIGNAL_TIMEFRAMES:
+            continue
+        candles = remove_forming_candle(data.get("candles", []))
+        if len(candles) < MIN_CLOSED_CANDLES:
+            continue
+        result = analyze_local(candles)
+        if not result or result.get("direction") not in ("UP", "DOWN"):
+            continue
+        candidates.append((result.get("direction") == preferred, result["confidence"], abs(result["up_score"]-result["down_score"]), symbol, timeframe, candles, result))
 
-    if not candidate:
-        logger.warning(
-            "No diversified Recovery candidate available | previous=%s | preferred=%s",
-            previous_symbol,
-            preferred,
-        )
+    if not candidates:
+        logger.warning("No different M1/M2/M3 pair available for Recovery")
         return False
 
-    symbol = candidate["symbol"]
-    timeframe = candidate["timeframe"]
+    preferred_candidates = [c for c in candidates if c[0]]
+    pool = preferred_candidates if preferred_candidates else candidates
+    pool.sort(key=lambda c: (c[1], max(c[5][-1].get("close", 0) and c[6]["up_score"], c[6]["down_score"]), c[2]), reverse=True)
+    _, _, _, symbol, timeframe, candles, result = pool[0]
 
-    data = mt4_data.get(symbol)
-    if not data:
-        return False
-
-    candles = remove_forming_candle(data.get("candles", []))
-    if len(candles) < MIN_CLOSED_CANDLES:
-        return False
-
-    result = candidate["analysis"]
-
-    if not result:
-        return False
-
-    gemini_result = gemini_confirm(
-        symbol,
-        timeframe,
-        candles,
-        result,
-    )
-
-    if gemini_result:
-        if (
-            gemini_result["direction"]
-            == result["direction"]
-        ):
-            result["confidence"] = min(
-                result["confidence"],
-                gemini_result["confidence"],
-            )
-
-            if gemini_result.get("comment"):
-                result["reason"] += (
-                    " | "
-                    + gemini_result["comment"]
-                )
+    gemini_result = gemini_confirm(symbol, timeframe, candles, result)
+    if gemini_result and gemini_result.get("direction") == result.get("direction"):
+        result["confidence"] = min(result["confidence"], gemini_result.get("confidence", result["confidence"]))
+        if gemini_result.get("comment"):
+            result["reason"] += " | " + gemini_result["comment"]
 
     direction = result["direction"]
-
     entry_price = candles[-1]["close"]
-
-    entry_dt = (
-        now_algiers()
-        + timedelta(
-            minutes=timeframe_to_minutes(timeframe)
-        )
-    )
-
-    entry_time = entry_dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    cancellation_level, cancellation_text = (
-        calculate_cancellation_level(
-            candles,
-            direction,
-            entry_price,
-        )
-    )
+    entry_time = (now_algiers() + timedelta(minutes=timeframe_to_minutes(timeframe))).strftime("%Y-%m-%d %H:%M:%S")
+    cancellation_level, cancellation_text = calculate_cancellation_level(candles, direction, entry_price)
 
     text = format_signal(
-        symbol=symbol,
-        timeframe=timeframe,
-        trade_type="RECOVERY",
-        direction=direction,
-        confidence=result["confidence"],
-        up_score=result["up_score"],
-        down_score=result["down_score"],
-        entry_time=entry_time,
-        entry_price=entry_price,
-        cancellation_text=cancellation_text,
-        reason=result["reason"],
+        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY", direction=direction,
+        confidence=result["confidence"], up_score=result["up_score"], down_score=result["down_score"],
+        entry_time=entry_time, entry_price=entry_price, cancellation_text=cancellation_text, reason=result["reason"]
     )
-
     if not send_signal_safely(text):
         return False
 
     last_signal_sent_at = time.time()
+    last_signal_direction = direction
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Mark Recovery as used BEFORE creating the record.
-    # This permanently blocks Recovery 2.
-    # --------------------------------------------------------
-
-    start_recovery_cycle()
-
+    # Keep the active cycle as Recovery and create a NEW pending trade ID.
     create_trade_record(
-        symbol=symbol,
-        timeframe=timeframe,
-        trade_type="RECOVERY",
-        direction=direction,
-        confidence=result["confidence"],
-        up_score=result["up_score"],
-        down_score=result["down_score"],
-        entry_time=entry_time,
-        entry_price=entry_price,
-        cancellation_level=cancellation_level,
-        reason=result["reason"],
+        symbol=symbol, timeframe=timeframe, trade_type="RECOVERY", direction=direction,
+        confidence=result["confidence"], up_score=result["up_score"], down_score=result["down_score"],
+        entry_time=entry_time, entry_price=entry_price, cancellation_level=cancellation_level, reason=result["reason"]
     )
-
+    active_cycle["symbol"] = symbol
+    active_cycle["timeframe"] = timeframe
+    active_cycle["direction"] = direction
+    active_cycle["trade_type"] = "RECOVERY"
+    active_cycle["recovery_used"] = True
+    active_cycle["trade_number"] = 2
+    active_cycle["last_trade_time"] = time.time()
     save_state()
 
-    logger.info(
-        "RECOVERY SIGNAL SENT | id=%s | %s | %s",
-        current_trade_id,
-        symbol,
-        direction,
-    )
-
+    logger.info("RECOVERY SIGNAL SENT | id=%s | %s | %s", current_trade_id, symbol, direction)
     return True
 
 
@@ -2494,7 +2397,7 @@ async def analyze_command(
         )
         return
 
-    best = choose_best_pair(preferred_direction=preferred_next_direction())
+    best = choose_best_pair()
 
     if not best:
         await update.message.reply_text(
@@ -2579,7 +2482,7 @@ def background_analysis_loop():
             # Find best pair
             # ------------------------------------------------
 
-            best = choose_best_pair(preferred_direction=preferred_next_direction())
+            best = choose_best_pair()
 
             if best:
 
