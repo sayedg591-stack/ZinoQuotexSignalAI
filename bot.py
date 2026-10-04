@@ -1470,7 +1470,7 @@ async def process_complete_batch(application):
         )
         wait_until = (
             recovery_wait_until
-        )  )
+        )   
 
         if recovery_active:
             if (
