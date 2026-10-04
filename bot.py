@@ -1464,26 +1464,37 @@ async def process_complete_batch(application):
     global latest_batch_id
     global processing_batch_id
 
-    with state_lock:
-        recovery_active = (
-            recovery_pending
-        )
-        wait_until = (
-            recovery_wait_until
-        )   
+    try:
+        # ----------------------------------------------------
+        # CHECK CURRENT STATE
+        # ----------------------------------------------------
+        with state_lock:
+            recovery_active = recovery_pending
+            wait_until = recovery_wait_until
+            current_trade = active_trade
 
+        # ----------------------------------------------------
+        # ACTIVE TRADE = DO NOTHING
+        # ----------------------------------------------------
+        if current_trade is not None:
+            return
+
+        # ----------------------------------------------------
+        # RECOVERY WAIT = KEEP SCANNING SILENTLY
+        # ----------------------------------------------------
         if recovery_active:
             if (
                 wait_until is not None
-                and now_timestamp()
-                < wait_until
+                and now_timestamp() < wait_until
             ):
-                # Continue scanning silently.
                 logger.info(
                     "RECOVERY WAIT: market scanning continues"
                 )
                 return
 
+        # ----------------------------------------------------
+        # GET CANDIDATES
+        # ----------------------------------------------------
         candidates = get_candidates()
 
         if not candidates:
@@ -1495,7 +1506,6 @@ async def process_complete_batch(application):
         # ----------------------------------------------------
         # TOP 5 ONLY
         # ----------------------------------------------------
-
         top_candidates = candidates[
             :TOP_CANDIDATES_FOR_AI
         ]
@@ -1516,38 +1526,40 @@ async def process_complete_batch(application):
             return
 
         # ----------------------------------------------------
-        # Decide BASE or RECOVERY
+        # DECIDE BASE OR RECOVERY
         # ----------------------------------------------------
-
         with state_lock:
+            # Re-check because state may have changed
+            # while Gemini was analyzing.
             if active_trade is not None:
                 return
 
             if recovery_pending:
                 mode = "RECOVERY"
 
-                # Recovery wait is now consumed.
                 recovery_pending = False
                 recovery_wait_until = None
 
             else:
                 mode = "BASE"
 
+        # ----------------------------------------------------
+        # SEND ONLY ONE SIGNAL
+        # ----------------------------------------------------
         await send_signal(
             application,
             signal,
             mode
         )
 
+    except Exception:
+        logger.exception(
+            "process_complete_batch error"
+        )
+
     finally:
         with state_lock:
             processing_batch_id = None
-
-
-# ============================================================
-# BACKGROUND LOOP
-# ============================================================
-
 async def background_loop(
     application
 ):
