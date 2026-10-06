@@ -1,11 +1,10 @@
 import os
 import json
+import math
+import time
+import asyncio
 import logging
 import threading
-import asyncio
-import time
-import urllib.request
-import urllib.parse
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -16,12 +15,18 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
-from google import genai
-from google.genai import types
+# ============================================================
+# OPTIONAL GEMINI
+# ============================================================
+
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
 
 
 # ============================================================
@@ -29,49 +34,63 @@ from google.genai import types
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
+
+try:
+    OWNER_ID = int(OWNER_ID_RAW)
+except Exception:
+    OWNER_ID = 0
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OWNER_ID = os.getenv("OWNER_ID", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
 ).strip()
 
-# يدعم MT4_API_KEY وكذلك ZINO_API_KEY
-MT4_API_KEY = (
-    os.getenv("MT4_API_KEY")
-    or os.getenv("ZINO_API_KEY")
-    or ""
-).strip()
+MT4_API_KEY = os.getenv("MT4_API_KEY", "").strip()
+
+# Backward compatibility
+if not MT4_API_KEY:
+    MT4_API_KEY = os.getenv("ZINO_API_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
-ALGIERS = ZoneInfo("Africa/Algiers")
-
+TIMEZONE = ZoneInfo("Africa/Algiers")
 
 # ============================================================
-# M1 CONFIG
+# TRADING CONFIG
 # ============================================================
 
-ANALYSIS_TIMEFRAME = "M1"
+TIMEFRAME = "M1"
 
-MIN_CLOSED_CANDLES = 40
+MIN_CANDLES = 50
 
-HISTORY_DISPLAY_COUNT = 10
+ENTRY_DELAY_SECONDS = 60
 
-# حماية إضافية: لا توجد إشارة أخرى خلال هذه المدة
-SIGNAL_COOLDOWN_SECONDS = 120
+# Minimum deterministic score
+MIN_SCORE = 16
 
-# نفس setup لا يعاد مباشرة
-SETUP_REPEAT_BLOCK_SECONDS = 360
+MAX_SCORE = 20
 
-# Recovery واحدة فقط
+# Signal cooldown after a completed cycle
+NEW_SIGNAL_COOLDOWN = 30
+
+# Data freshness
+MAX_DATA_AGE_SECONDS = 180
+
+# Only one recovery
 RECOVERY_LIMIT = 1
 
-HISTORY_FILE = "signal_history.json"
+# Don't repeatedly use exactly the same setup
+SETUP_REPEAT_BLOCK_SECONDS = 240
 
-# فحص البيانات كل دقيقة
-AUTO_ANALYSIS_INTERVAL_SECONDS = 60
+# Maximum confidence shown
+MAX_CONFIDENCE = 89
+
+# Minimum confidence
+MIN_CONFIDENCE = 76
 
 
 # ============================================================
@@ -87,414 +106,226 @@ logger = logging.getLogger("ZinoProSignalAI")
 
 
 # ============================================================
-# GEMINI
-# ============================================================
-
-gemini_client = None
-
-if GEMINI_API_KEY:
-    try:
-        gemini_client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
-
-        logger.info("Gemini client initialized")
-
-    except Exception as e:
-        logger.exception(
-            "Gemini initialization failed: %s",
-            e
-        )
-
-else:
-    logger.warning("GEMINI_API_KEY is missing")
-
-
-# ============================================================
 # GLOBAL STATE
 # ============================================================
 
-mt4_lock = threading.Lock()
+data_lock = threading.RLock()
 
-mt4_data = {}
-
-telegram_application = None
-
-last_signal_sent_at = 0.0
-
-signal_send_lock = threading.Lock()
-
-cycle_lock = threading.Lock()
+cycle_lock = threading.RLock()
 
 analysis_lock = threading.Lock()
 
-recent_setups = {}
+data_store = {}
 
-setup_memory_lock = threading.Lock()
+history = []
 
+stats = {
+    "base_win": 0,
+    "base_loss": 0,
+    "recovery_win": 0,
+    "recovery_loss": 0,
+}
 
-# ============================================================
-# ACTIVE CYCLE
-#
-# أهم تغيير:
-#
-# pending_result = True
-# معناها توجد صفقة مرسلة وننتظر /win أو /loss
-#
-# recovery_ready = True
-# معناها BASE خسرت ونسمح بإرسال Recovery واحدة فقط
-# ============================================================
+# ------------------------------------------------------------
+# ONE TRADE CYCLE
+# ------------------------------------------------------------
 
-active_cycle = {
-
+cycle = {
     "active": False,
 
-    "symbol": None,
-
-    "timeframe": None,
-
+    # BASE / RECOVERY
     "trade_type": None,
 
+    # symbol of current trade
+    "symbol": None,
+
+    # direction
     "direction": None,
 
+    # current pending trade
+    "pending": False,
+
+    # recovery already used?
     "recovery_used": False,
 
-    "recovery_ready": False,
+    # generation in progress
+    "generating": False,
 
-    "pending_result": False,
+    # unique setup key
+    "setup_key": None,
 
-    "last_trade_time": 0.0,
+    # last signal time
+    "last_signal_time": 0,
 
-    "trade_number": 0,
+    # base information
+    "base_symbol": None,
+    "base_direction": None,
+
+    # last signal data
+    "last_signal": None,
 }
 
 
 # ============================================================
-# STATS
+# TELEGRAM LOOP
 # ============================================================
 
-stats_data = {
+telegram_loop = None
 
-    "wins": 0,
-    "losses": 0,
-
-    "base_wins": 0,
-    "base_losses": 0,
-
-    "recovery_wins": 0,
-    "recovery_losses": 0,
-}
-
-
-# ============================================================
-# TRADE HISTORY
-# ============================================================
-
-history_lock = threading.Lock()
-
-trade_history = []
-
-current_trade_id = None
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def load_history():
-
-    global trade_history
-
-    try:
-
-        if not os.path.exists(HISTORY_FILE):
-
-            trade_history = []
-
-            return
-
-        with open(
-            HISTORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if isinstance(data, list):
-
-            trade_history = data
-
-        else:
-
-            trade_history = []
-
-        logger.info(
-            "Trade history loaded: %s records",
-            len(trade_history)
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Failed to load trade history: %s",
-            e
-        )
-
-        trade_history = []
-
-
-def save_history():
-
-    try:
-
-        temp_file = HISTORY_FILE + ".tmp"
-
-        with history_lock:
-
-            data = list(trade_history)
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            temp_file,
-            HISTORY_FILE
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Failed to save trade history: %s",
-            e
-        )
+application = None
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def owner_id_int():
-
-    try:
-        return int(OWNER_ID)
-
-    except Exception:
-        return None
+def now_algiers():
+    return datetime.now(TIMEZONE)
 
 
-def is_owner(update: Update) -> bool:
+def now_timestamp():
+    return time.time()
 
-    oid = owner_id_int()
 
-    if oid is None:
+def fmt_time(dt=None):
+    if dt is None:
+        dt = now_algiers()
+
+    return dt.strftime("%H:%M:%S")
+
+
+def is_owner(update: Update):
+    if not update.effective_user:
         return False
 
-    user = update.effective_user
+    return update.effective_user.id == OWNER_ID
 
-    if user is None:
+
+async def owner_only(update: Update):
+    if not is_owner(update):
+        if update.message:
+            await update.message.reply_text(
+                "⛔ هذا الأمر متاح للمالك فقط."
+            )
         return False
 
-    return user.id == oid
+    return True
 
 
-def safe_float(value, default=None):
-
+def safe_float(value, default=0.0):
     try:
-
-        if value is None:
-            return default
-
-        if isinstance(value, str):
-            value = value.strip()
-
         return float(value)
-
     except Exception:
-
         return default
 
 
-def normalize_timeframe(value):
-
-    if value is None:
-        return ""
-
-    value = str(value).upper().strip()
-
-    aliases = {
-
-        "1": "M1",
-        "1M": "M1",
-        "M1": "M1",
-
-        "2": "M2",
-        "2M": "M2",
-        "M2": "M2",
-
-        "3": "M3",
-        "3M": "M3",
-        "M3": "M3",
-
-        "5": "M5",
-        "5M": "M5",
-        "M5": "M5",
-
-        "15": "M15",
-        "15M": "M15",
-        "M15": "M15",
-
-        "30": "M30",
-        "30M": "M30",
-        "M30": "M30",
-
-        "60": "H1",
-        "1H": "H1",
-        "H1": "H1",
-
-        "240": "H4",
-        "4H": "H4",
-        "H4": "H4",
-    }
-
-    return aliases.get(value, value)
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-def timeframe_minutes(timeframe):
+def normalize_direction(direction):
+    direction = str(direction or "").upper().strip()
 
-    values = {
+    if direction in ("UP", "CALL", "BUY"):
+        return "UP"
 
-        "M1": 1,
-        "M2": 2,
-        "M3": 3,
-        "M5": 5,
-        "M15": 15,
-        "M30": 30,
-        "H1": 60,
-        "H4": 240,
-    }
+    if direction in ("DOWN", "PUT", "SELL"):
+        return "DOWN"
 
-    return values.get(
-        normalize_timeframe(timeframe),
-        1
-    )
+    return None
 
 
 # ============================================================
 # CANDLE NORMALIZATION
 # ============================================================
 
-def normalize_candle(candle):
-
-    if not isinstance(candle, dict):
+def normalize_candle(c):
+    if not isinstance(c, dict):
         return None
 
-    timestamp = (
-        candle.get("time")
-        or candle.get("timestamp")
-        or candle.get("datetime")
-        or candle.get("date")
-    )
+    try:
+        t = int(
+            c.get("time")
+            or c.get("timestamp")
+            or c.get("t")
+            or 0
+        )
 
-    open_price = (
-        candle.get("open")
-        if candle.get("open") is not None
-        else candle.get("o")
-    )
+        o = safe_float(
+            c.get("open")
+            if c.get("open") is not None
+            else c.get("o")
+        )
 
-    high_price = (
-        candle.get("high")
-        if candle.get("high") is not None
-        else candle.get("h")
-    )
+        h = safe_float(
+            c.get("high")
+            if c.get("high") is not None
+            else c.get("h")
+        )
 
-    low_price = (
-        candle.get("low")
-        if candle.get("low") is not None
-        else candle.get("l")
-    )
+        l = safe_float(
+            c.get("low")
+            if c.get("low") is not None
+            else c.get("l")
+        )
 
-    close_price = (
-        candle.get("close")
-        if candle.get("close") is not None
-        else candle.get("c")
-    )
+        cl = safe_float(
+            c.get("close")
+            if c.get("close") is not None
+            else c.get("c")
+        )
 
-    volume = (
-        candle.get("volume")
-        if candle.get("volume") is not None
-        else candle.get("v", 0)
-    )
+        if t <= 0:
+            return None
 
-    o = safe_float(open_price)
-    h = safe_float(high_price)
-    l = safe_float(low_price)
-    c = safe_float(close_price)
-    v = safe_float(volume, 0)
+        if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
+            return None
 
-    if (
-        o is None
-        or h is None
-        or l is None
-        or c is None
-    ):
+        if h < max(o, cl):
+            return None
+
+        if l > min(o, cl):
+            return None
+
+        return {
+            "time": t,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": cl,
+        }
+
+    except Exception:
         return None
 
-    if (
-        o <= 0
-        or h <= 0
-        or l <= 0
-        or c <= 0
-    ):
-        return None
 
-    return {
-
-        "time": timestamp,
-
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-
-        "volume": v,
-    }
-
-
-def normalize_candles(candles):
-
-    if not isinstance(candles, list):
+def normalize_candles(raw):
+    if not isinstance(raw, list):
         return []
 
     result = []
 
-    for candle in candles:
+    for c in raw:
+        nc = normalize_candle(c)
 
-        normalized = normalize_candle(candle)
+        if nc:
+            result.append(nc)
 
-        if normalized:
-            result.append(normalized)
+    result.sort(key=lambda x: x["time"])
 
-    result.sort(
-        key=lambda x: (
-            safe_float(
-                x.get("time"),
-                0
-            ) or 0
-        )
-    )
+    # Remove duplicate timestamps
+    clean = []
 
-    return result
+    seen = set()
+
+    for c in result:
+        if c["time"] in seen:
+            continue
+
+        seen.add(c["time"])
+        clean.append(c)
+
+    return clean
 
 
 # ============================================================
@@ -502,610 +333,993 @@ def normalize_candles(candles):
 # ============================================================
 
 def ema(values, period):
-
-    if not values or len(values) < period:
+    if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    multiplier = 2.0 / (period + 1.0)
 
-    current = (
-        sum(values[:period])
-        / period
-    )
+    result = sum(values[:period]) / period
 
-    for price in values[period:]:
+    for value in values[period:]:
+        result = (
+            (value - result) * multiplier
+            + result
+        )
 
+    return result
+
+
+def ema_series(values, period):
+    if len(values) < period:
+        return []
+
+    multiplier = 2.0 / (period + 1.0)
+
+    first = sum(values[:period]) / period
+
+    result = [first]
+
+    prev = first
+
+    for value in values[period:]:
         current = (
-            (price - current)
-            * multiplier
-        ) + current
+            (value - prev) * multiplier
+            + prev
+        )
 
-    return current
+        result.append(current)
+
+        prev = current
+
+    return result
 
 
 def rsi(values, period=14):
-
     if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, period + 1):
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
 
-        diff = (
-            values[i]
-            - values[i - 1]
-        )
-
-        if diff >= 0:
-
+        if diff > 0:
             gains.append(diff)
             losses.append(0)
-
         else:
-
             gains.append(0)
             losses.append(abs(diff))
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    for i in range(
-        period + 1,
-        len(values)
-    ):
-
-        diff = (
-            values[i]
-            - values[i - 1]
+    for i in range(period, len(gains)):
+        avg_gain = (
+            (avg_gain * (period - 1) + gains[i])
+            / period
         )
 
-        gain = max(diff, 0)
-        loss = max(-diff, 0)
-
-        avg_gain = (
-            (
-                avg_gain * (period - 1)
-            ) + gain
-        ) / period
-
         avg_loss = (
-            (
-                avg_loss * (period - 1)
-            ) + loss
-        ) / period
+            (avg_loss * (period - 1) + losses[i])
+            / period
+        )
 
     if avg_loss == 0:
         return 100.0
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
-
-
-def williams_r(candles, period=14):
-
-    if len(candles) < period:
-        return None
-
-    recent = candles[-period:]
-
-    highest = max(
-        x["high"]
-        for x in recent
-    )
-
-    lowest = min(
-        x["low"]
-        for x in recent
-    )
-
-    if highest == lowest:
-        return -50.0
-
-    close = recent[-1]["close"]
-
-    return (
-        (
-            highest - close
-        )
-        /
-        (
-            highest - lowest
-        )
-    ) * -100
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def true_ranges(candles):
-
-    if len(candles) < 2:
-        return []
-
     result = []
 
-    for i in range(1, len(candles)):
+    for i, c in enumerate(candles):
+        if i == 0:
+            tr = c["high"] - c["low"]
+        else:
+            prev_close = candles[i - 1]["close"]
 
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
-        )
+            tr = max(
+                c["high"] - c["low"],
+                abs(c["high"] - prev_close),
+                abs(c["low"] - prev_close),
+            )
 
         result.append(tr)
 
     return result
 
 
-def atr(candles, period=10):
+def atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
 
     trs = true_ranges(candles)
 
-    if len(trs) < period:
-        return None
+    value = sum(trs[:period]) / period
 
-    return sum(
-        trs[-period:]
-    ) / period
+    for tr in trs[period:]:
+        value = (
+            (value * (period - 1) + tr)
+            / period
+        )
+
+    return value
 
 
 def adx_di(candles, period=14):
+    if len(candles) < period * 2 + 5:
+        return None
 
-    if len(candles) < period + 2:
-
-        return (
-            None,
-            None,
-            None
-        )
-
-    trs = []
+    tr_values = []
     plus_dm = []
     minus_dm = []
 
     for i in range(1, len(candles)):
 
         current = candles[i]
-        previous = candles[i - 1]
+        prev = candles[i - 1]
 
-        up_move = (
-            current["high"]
-            - previous["high"]
-        )
+        up_move = current["high"] - prev["high"]
+        down_move = prev["low"] - current["low"]
 
-        down_move = (
-            previous["low"]
-            - current["low"]
-        )
+        if up_move > down_move and up_move > 0:
+            plus = up_move
+        else:
+            plus = 0.0
 
-        plus = (
-            up_move
-            if (
-                up_move > down_move
-                and up_move > 0
-            )
-            else 0
-        )
-
-        minus = (
-            down_move
-            if (
-                down_move > up_move
-                and down_move > 0
-            )
-            else 0
-        )
+        if down_move > up_move and down_move > 0:
+            minus = down_move
+        else:
+            minus = 0.0
 
         tr = max(
-
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
+            current["high"] - current["low"],
+            abs(current["high"] - prev["close"]),
+            abs(current["low"] - prev["close"])
         )
 
-        trs.append(tr)
+        tr_values.append(tr)
         plus_dm.append(plus)
         minus_dm.append(minus)
 
-    if len(trs) < period:
+    if len(tr_values) < period:
+        return None
 
-        return (
-            None,
-            None,
-            None
+    atr_val = sum(tr_values[:period]) / period
+    plus_val = sum(plus_dm[:period]) / period
+    minus_val = sum(minus_dm[:period]) / period
+
+    dx_values = []
+
+    for i in range(period, len(tr_values)):
+
+        atr_val = (
+            (atr_val * (period - 1) + tr_values[i])
+            / period
         )
 
-    tr_avg = (
-        sum(trs[-period:])
-        / period
-    )
-
-    plus_avg = (
-        sum(plus_dm[-period:])
-        / period
-    )
-
-    minus_avg = (
-        sum(minus_dm[-period:])
-        / period
-    )
-
-    if tr_avg == 0:
-
-        return (
-            0.0,
-            0.0,
-            0.0
+        plus_val = (
+            (plus_val * (period - 1) + plus_dm[i])
+            / period
         )
 
-    plus_di = (
-        100
-        * plus_avg
-        / tr_avg
-    )
+        minus_val = (
+            (minus_val * (period - 1) + minus_dm[i])
+            / period
+        )
 
-    minus_di = (
-        100
-        * minus_avg
-        / tr_avg
-    )
+        if atr_val <= 0:
+            continue
 
-    denominator = (
-        plus_di
-        + minus_di
-    )
+        plus_di = 100.0 * plus_val / atr_val
+        minus_di = 100.0 * minus_val / atr_val
 
-    if denominator == 0:
-        dx = 0
+        denominator = plus_di + minus_di
 
-    else:
+        if denominator <= 0:
+            continue
 
         dx = (
-            100
-            * abs(
-                plus_di
-                - minus_di
-            )
+            100.0
+            * abs(plus_di - minus_di)
             / denominator
         )
 
-    return (
-        dx,
-        plus_di,
-        minus_di
-    )
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+
+    adx_val = sum(dx_values[:period]) / period
+
+    for value in dx_values[period:]:
+        adx_val = (
+            (adx_val * (period - 1) + value)
+            / period
+        )
+
+    if atr_val <= 0:
+        return None
+
+    plus_di = 100.0 * plus_val / atr_val
+    minus_di = 100.0 * minus_val / atr_val
+
+    return {
+        "adx": adx_val,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+    }
 
 
 # ============================================================
-# MARKET STRUCTURE
+# PRICE ACTION
 # ============================================================
+
+def candle_features(c):
+    body = abs(c["close"] - c["open"])
+
+    total = c["high"] - c["low"]
+
+    if total <= 0:
+        return {
+            "body": 0,
+            "range": 0,
+            "body_ratio": 0,
+            "upper_wick": 0,
+            "lower_wick": 0,
+        }
+
+    upper = c["high"] - max(c["open"], c["close"])
+
+    lower = min(c["open"], c["close"]) - c["low"]
+
+    return {
+        "body": body,
+        "range": total,
+        "body_ratio": body / total,
+        "upper_wick": upper,
+        "lower_wick": lower,
+    }
+
+
+def recent_average_range(candles, count=14):
+    subset = candles[-count:]
+
+    if not subset:
+        return 0
+
+    return sum(
+        c["high"] - c["low"]
+        for c in subset
+    ) / len(subset)
+
 
 def market_structure(candles):
-
-    if len(candles) < 8:
-        return "UNKNOWN"
+    if len(candles) < 12:
+        return "NEUTRAL"
 
     recent = candles[-8:]
 
-    first_high = max(
-        x["high"]
-        for x in recent[:4]
-    )
+    first = recent[:4]
+    last = recent[4:]
 
-    second_high = max(
-        x["high"]
-        for x in recent[4:]
-    )
+    first_high = max(c["high"] for c in first)
+    first_low = min(c["low"] for c in first)
 
-    first_low = min(
-        x["low"]
-        for x in recent[:4]
-    )
+    last_high = max(c["high"] for c in last)
+    last_low = min(c["low"] for c in last)
 
-    second_low = min(
-        x["low"]
-        for x in recent[4:]
-    )
+    if last_high > first_high and last_low > first_low:
+        return "UP"
 
-    if (
-        second_high > first_high
-        and second_low > first_low
-    ):
-        return "BULLISH"
+    if last_high < first_high and last_low < first_low:
+        return "DOWN"
 
-    if (
-        second_high < first_high
-        and second_low < first_low
-    ):
-        return "BEARISH"
-
-    return "RANGE"
+    return "NEUTRAL"
 
 
-def breakout_state(candles):
-
-    if len(candles) < 10:
+def breakout_status(candles):
+    if len(candles) < 12:
         return "NONE"
+
+    last = candles[-1]
 
     previous = candles[-9:-1]
 
     previous_high = max(
-        x["high"]
-        for x in previous
+        c["high"] for c in previous
     )
 
     previous_low = min(
-        x["low"]
-        for x in previous
+        c["low"] for c in previous
     )
 
-    last_close = candles[-1]["close"]
+    if last["close"] > previous_high:
+        return "UP"
 
-    if last_close > previous_high:
-        return "UP_BREAKOUT"
-
-    if last_close < previous_low:
-        return "DOWN_BREAKOUT"
+    if last["close"] < previous_low:
+        return "DOWN"
 
     return "NONE"
 
 
+def liquidity_status(candles):
+    if len(candles) < 12:
+        return "NONE"
+
+    last = candles[-1]
+
+    previous = candles[-9:-1]
+
+    high = max(c["high"] for c in previous)
+
+    low = min(c["low"] for c in previous)
+
+    features = candle_features(last)
+
+    # Sweep above high then close below
+    if last["high"] > high and last["close"] < high:
+        if features["upper_wick"] > features["body"]:
+            return "DOWN"
+
+    # Sweep below low then close above
+    if last["low"] < low and last["close"] > low:
+        if features["lower_wick"] > features["body"]:
+            return "UP"
+
+    return "NONE"
+
+
+def abnormal_candle(candles):
+    if len(candles) < 16:
+        return False
+
+    avg_range = recent_average_range(
+        candles[-16:-1],
+        15
+    )
+
+    if avg_range <= 0:
+        return False
+
+    last_range = (
+        candles[-1]["high"]
+        - candles[-1]["low"]
+    )
+
+    # Avoid extreme M1 spikes
+    if last_range > avg_range * 2.8:
+        return True
+
+    return False
+
+
+def candle_direction(c):
+    if c["close"] > c["open"]:
+        return "UP"
+
+    if c["close"] < c["open"]:
+        return "DOWN"
+
+    return "NEUTRAL"
+
+
 # ============================================================
-# TECHNICAL SNAPSHOT
+# TECHNICAL ANALYSIS
 # ============================================================
 
-def build_technical_snapshot(candles):
+def calculate_analysis(candles):
 
-    closes = [
-        x["close"]
-        for x in candles
-    ]
+    if len(candles) < MIN_CANDLES:
+        return None
 
-    current = candles[-1]
+    closes = [c["close"] for c in candles]
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
 
-    current_rsi = rsi(closes, 14)
+    rsi14 = rsi(closes, 14)
 
-    current_wr = williams_r(
-        candles,
-        14
-    )
+    adx_data = adx_di(candles, 14)
 
-    current_atr = atr(
-        candles,
-        10
-    )
-
-    adx, plus_di, minus_di = adx_di(
-        candles,
-        14
-    )
-
-    keltner_mid = ema(
-        closes,
-        20
-    )
-
-    keltner_atr = atr(
-        candles,
-        10
-    )
-
-    keltner_upper = None
-    keltner_lower = None
+    atr14 = atr(candles, 14)
 
     if (
-        keltner_mid is not None
-        and keltner_atr is not None
+        ema9 is None
+        or ema21 is None
+        or rsi14 is None
+        or adx_data is None
+        or atr14 is None
     ):
+        return None
 
-        keltner_upper = (
-            keltner_mid
-            + keltner_atr * 5
+    last = candles[-1]
+
+    structure = market_structure(candles)
+
+    breakout = breakout_status(candles)
+
+    liquidity = liquidity_status(candles)
+
+    candle_dir = candle_direction(last)
+
+    candle = candle_features(last)
+
+    avg_range = recent_average_range(candles, 14)
+
+    if avg_range <= 0:
+        return None
+
+    # --------------------------------------------------------
+    # Determine candidate directions
+    # --------------------------------------------------------
+
+    up_score = 0
+    down_score = 0
+
+    # --------------------------------------------------------
+    # EMA 9/21 = 4 points
+    # --------------------------------------------------------
+
+    if ema9 > ema21:
+        up_score += 3
+
+    elif ema9 < ema21:
+        down_score += 3
+
+    # Price alignment
+    if last["close"] > ema9 and last["close"] > ema21:
+        up_score += 1
+
+    elif last["close"] < ema9 and last["close"] < ema21:
+        down_score += 1
+
+    # --------------------------------------------------------
+    # RSI = 3 points
+    # --------------------------------------------------------
+
+    if 53 <= rsi14 <= 68:
+        up_score += 3
+
+    elif 32 <= rsi14 <= 47:
+        down_score += 3
+
+    elif rsi14 > 50:
+        up_score += 1
+
+    elif rsi14 < 50:
+        down_score += 1
+
+    # --------------------------------------------------------
+    # ADX + DI = 4 points
+    # --------------------------------------------------------
+
+    adx_value = adx_data["adx"]
+    plus_di = adx_data["plus_di"]
+    minus_di = adx_data["minus_di"]
+
+    if adx_value >= 25:
+
+        if plus_di > minus_di:
+            up_score += 4
+
+        elif minus_di > plus_di:
+            down_score += 4
+
+    elif adx_value >= 20:
+
+        if plus_di > minus_di:
+            up_score += 2
+
+        elif minus_di > plus_di:
+            down_score += 2
+
+    # --------------------------------------------------------
+    # STRUCTURE = 3 points
+    # --------------------------------------------------------
+
+    if structure == "UP":
+        up_score += 3
+
+    elif structure == "DOWN":
+        down_score += 3
+
+    # --------------------------------------------------------
+    # BREAKOUT = 2 points
+    # --------------------------------------------------------
+
+    if breakout == "UP":
+        up_score += 2
+
+    elif breakout == "DOWN":
+        down_score += 2
+
+    # --------------------------------------------------------
+    # CANDLE = 2 points
+    # --------------------------------------------------------
+
+    if candle["body_ratio"] >= 0.55:
+
+        if candle_dir == "UP":
+            up_score += 2
+
+        elif candle_dir == "DOWN":
+            down_score += 2
+
+    elif candle["body_ratio"] >= 0.35:
+
+        if candle_dir == "UP":
+            up_score += 1
+
+        elif candle_dir == "DOWN":
+            down_score += 1
+
+    # --------------------------------------------------------
+    # LIQUIDITY
+    # --------------------------------------------------------
+
+    # Liquidity sweep is a directional confirmation.
+    if liquidity == "UP":
+        up_score += 2
+
+    elif liquidity == "DOWN":
+        down_score += 2
+
+    # --------------------------------------------------------
+    # ABNORMAL MOVE
+    # --------------------------------------------------------
+
+    abnormal = abnormal_candle(candles)
+
+    # --------------------------------------------------------
+    # Volatility quality
+    # --------------------------------------------------------
+
+    volatility_ok = True
+
+    if atr14 <= 0:
+        volatility_ok = False
+
+    # If candle is extremely tiny, avoid dead market.
+    if (
+        candle["range"] < avg_range * 0.25
+    ):
+        volatility_ok = False
+
+    # If candle is huge, avoid chasing.
+    if candle["range"] > avg_range * 2.8:
+        volatility_ok = False
+
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
+
+    if up_score > down_score:
+        direction = "UP"
+        raw_score = up_score
+
+    elif down_score > up_score:
+        direction = "DOWN"
+        raw_score = down_score
+
+    else:
+        direction = None
+        raw_score = 0
+
+    # --------------------------------------------------------
+    # Conflict filters
+    # --------------------------------------------------------
+
+    conflict = False
+
+    if direction == "UP":
+
+        if ema9 <= ema21:
+            conflict = True
+
+        if plus_di <= minus_di and adx_value >= 25:
+            conflict = True
+
+        if rsi14 < 50:
+            conflict = True
+
+        if structure == "DOWN":
+            conflict = True
+
+        if liquidity == "DOWN":
+            conflict = True
+
+    elif direction == "DOWN":
+
+        if ema9 >= ema21:
+            conflict = True
+
+        if minus_di <= plus_di and adx_value >= 25:
+            conflict = True
+
+        if rsi14 > 50:
+            conflict = True
+
+        if structure == "UP":
+            conflict = True
+
+        if liquidity == "UP":
+            conflict = True
+
+    if abnormal:
+        conflict = True
+
+    if not volatility_ok:
+        conflict = True
+
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
+
+    confidence = 0
+
+    if direction:
+
+        gap = abs(up_score - down_score)
+
+        confidence = (
+            72
+            + raw_score * 0.75
+            + gap * 1.0
         )
 
-        keltner_lower = (
-            keltner_mid
-            - keltner_atr * 5
-        )
+        # ADX strength bonus
+        if adx_value >= 30:
+            confidence += 3
 
-    recent8 = candles[-8:]
+        elif adx_value >= 25:
+            confidence += 2
+
+        # Strong body bonus
+        if candle["body_ratio"] >= 0.65:
+            confidence += 2
+
+        confidence = int(
+            clamp(
+                confidence,
+                MIN_CONFIDENCE,
+                MAX_CONFIDENCE
+            )
+        )
 
     return {
+        "direction": direction,
+        "up_score": up_score,
+        "down_score": down_score,
+        "score": raw_score,
 
-        "price": current["close"],
-        "open": current["open"],
-        "high": current["high"],
-        "low": current["low"],
+        "confidence": confidence,
 
         "ema9": ema9,
         "ema21": ema21,
 
-        "rsi14": current_rsi,
-        "williams_r14": current_wr,
+        "rsi": rsi14,
 
-        "atr10": current_atr,
+        "adx": adx_value,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
 
-        "adx14": adx,
-        "plus_di14": plus_di,
-        "minus_di14": minus_di,
+        "atr": atr14,
 
-        "keltner_mid": keltner_mid,
-        "keltner_upper": keltner_upper,
-        "keltner_lower": keltner_lower,
+        "structure": structure,
+        "breakout": breakout,
+        "liquidity": liquidity,
 
-        "structure": market_structure(candles),
-        "breakout": breakout_state(candles),
+        "candle_direction": candle_dir,
+        "body_ratio": candle["body_ratio"],
+        "candle_range": candle["range"],
+        "average_range": avg_range,
 
-        "recent_low": min(
-            x["low"]
-            for x in recent8
-        ),
+        "abnormal": abnormal,
+        "volatility_ok": volatility_ok,
+        "conflict": conflict,
 
-        "recent_high": max(
-            x["high"]
-            for x in recent8
-        ),
+        "price": last["close"],
+        "candle_time": last["time"],
     }
 
 
 # ============================================================
-# PRE SCORE
+# CANCELLATION PRICE
 # ============================================================
 
-def directional_pre_score(candles):
+def cancellation_price(candles, direction):
 
-    if len(candles) < MIN_CLOSED_CANDLES:
+    recent = candles[-8:]
 
-        return {
-            "score": -999,
-            "direction": "DOWN",
-            "up": 0,
-            "down": 0,
-        }
+    if direction == "UP":
+        return min(
+            c["low"] for c in recent
+        )
 
-    snapshot = build_technical_snapshot(
+    return max(
+        c["high"] for c in recent
+    )
+
+
+# ============================================================
+# SETUP KEY
+# ============================================================
+
+def make_setup_key(symbol, analysis):
+
+    return (
+        f"{symbol}|"
+        f"{analysis['direction']}|"
+        f"{analysis['candle_time']}"
+    )
+
+
+# ============================================================
+# GEMINI REFINEMENT
+# ============================================================
+
+def gemini_refine(symbol, analysis, candles):
+
+    if not GEMINI_AVAILABLE:
+        return analysis
+
+    if not GEMINI_API_KEY:
+        return analysis
+
+    try:
+
+        client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+
+        recent = candles[-20:]
+
+        compact = []
+
+        for c in recent:
+            compact.append({
+                "t": c["time"],
+                "o": round(c["open"], 6),
+                "h": round(c["high"], 6),
+                "l": round(c["low"], 6),
+                "c": round(c["close"], 6),
+            })
+
+        prompt = f"""
+You are a strict M1 forex signal validator.
+
+Symbol: {symbol}
+
+Deterministic technical analysis:
+
+Direction candidate:
+{analysis['direction']}
+
+Score:
+{analysis['score']}/20
+
+UP score:
+{analysis['up_score']}/20
+
+DOWN score:
+{analysis['down_score']}/20
+
+EMA9:
+{analysis['ema9']}
+
+EMA21:
+{analysis['ema21']}
+
+RSI14:
+{analysis['rsi']}
+
+ADX14:
+{analysis['adx']}
+
+DI+:
+{analysis['plus_di']}
+
+DI-:
+{analysis['minus_di']}
+
+Structure:
+{analysis['structure']}
+
+Breakout:
+{analysis['breakout']}
+
+Liquidity:
+{analysis['liquidity']}
+
+Candle:
+{analysis['candle_direction']}
+
+Body ratio:
+{analysis['body_ratio']}
+
+Candles:
+{json.dumps(compact)}
+
+Rules:
+
+1. Do NOT invent information.
+2. Do NOT force a trade.
+3. If the deterministic direction is technically weak or contradictory,
+   reject it.
+4. Reject if the latest candle is abnormal.
+5. Reject if EMA direction, RSI and ADX/DI strongly disagree.
+6. Prefer continuation after a confirmed structure/breakout.
+7. Avoid chasing an extreme candle.
+8. We only want ONE strongest trade.
+9. Never return WAIT as a trade direction.
+10. If rejected, set valid=false.
+
+Return JSON only:
+
+{{
+  "valid": true,
+  "direction": "UP",
+  "confidence": 80,
+  "reason": "short reason",
+  "cancellation_reason": "short reason"
+}}
+"""
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.05,
+                response_mime_type="application/json",
+            )
+        )
+
+        text = response.text.strip()
+
+        data = json.loads(text)
+
+        valid = bool(data.get("valid", False))
+
+        if not valid:
+            analysis["gemini_valid"] = False
+            analysis["gemini_reason"] = (
+                data.get("reason")
+                or "Gemini rejected weak setup."
+            )
+
+            return analysis
+
+        direction = normalize_direction(
+            data.get("direction")
+        )
+
+        if direction != analysis["direction"]:
+            analysis["gemini_valid"] = False
+            analysis["gemini_reason"] = (
+                "Gemini direction disagreed with deterministic analysis."
+            )
+
+            return analysis
+
+        gemini_conf = int(
+            safe_float(
+                data.get("confidence"),
+                analysis["confidence"]
+            )
+        )
+
+        analysis["confidence"] = int(
+            clamp(
+                min(
+                    gemini_conf,
+                    analysis["confidence"] + 4
+                ),
+                MIN_CONFIDENCE,
+                MAX_CONFIDENCE
+            )
+        )
+
+        analysis["gemini_valid"] = True
+
+        analysis["reason"] = (
+            str(
+                data.get("reason")
+                or "Technical conditions aligned."
+            )[:300]
+        )
+
+        analysis["cancellation_reason"] = (
+            str(
+                data.get("cancellation_reason")
+                or "Price crossed the invalidation level."
+            )[:250]
+        )
+
+        return analysis
+
+    except Exception as e:
+
+        logger.warning(
+            "Gemini refinement failed: %s",
+            e
+        )
+
+        # Technical engine remains authoritative.
+        return analysis
+
+
+# ============================================================
+# SIGNAL VALIDATION
+# ============================================================
+
+def validate_signal(symbol, candles):
+
+    analysis = calculate_analysis(candles)
+
+    if not analysis:
+        return None
+
+    if not analysis["direction"]:
+        return None
+
+    if analysis["conflict"]:
+        return None
+
+    if analysis["score"] < MIN_SCORE:
+        return None
+
+    # Strong disagreement is rejected
+    score_gap = abs(
+        analysis["up_score"]
+        - analysis["down_score"]
+    )
+
+    if score_gap < 3:
+        return None
+
+    # If ADX is weak, don't force signal
+    if analysis["adx"] < 20:
+        return None
+
+    # Direction must agree with RSI
+    if analysis["direction"] == "UP":
+        if analysis["rsi"] < 50:
+            return None
+
+    if analysis["direction"] == "DOWN":
+        if analysis["rsi"] > 50:
+            return None
+
+    # Direction must agree with DI
+    if analysis["direction"] == "UP":
+        if analysis["plus_di"] <= analysis["minus_di"]:
+            return None
+
+    if analysis["direction"] == "DOWN":
+        if analysis["minus_di"] <= analysis["plus_di"]:
+            return None
+
+    analysis = gemini_refine(
+        symbol,
+        analysis,
         candles
     )
 
-    up = 0
-    down = 0
+    # Gemini can reject
+    if analysis.get("gemini_valid") is False:
+        return None
 
-    price = snapshot["price"]
+    analysis["cancellation"] = cancellation_price(
+        candles,
+        analysis["direction"]
+    )
 
-    ema9 = snapshot["ema9"]
-    ema21 = snapshot["ema21"]
-
-    if (
-        ema9 is not None
-        and ema21 is not None
-    ):
-
-        if ema9 > ema21:
-            up += 3
-
-        elif ema9 < ema21:
-            down += 3
-
-    if ema9 is not None:
-
-        if price > ema9:
-            up += 1
-
-        elif price < ema9:
-            down += 1
-
-    if ema21 is not None:
-
-        if price > ema21:
-            up += 1
-
-        elif price < ema21:
-            down += 1
-
-    structure = snapshot["structure"]
-
-    if structure == "BULLISH":
-        up += 3
-
-    elif structure == "BEARISH":
-        down += 3
-
-    breakout = snapshot["breakout"]
-
-    if breakout == "UP_BREAKOUT":
-        up += 3
-
-    elif breakout == "DOWN_BREAKOUT":
-        down += 3
-
-    adx_value = snapshot["adx14"]
-    plus_di = snapshot["plus_di14"]
-    minus_di = snapshot["minus_di14"]
-
-    if (
-        adx_value is not None
-        and adx_value >= 20
-        and plus_di is not None
-        and minus_di is not None
-    ):
-
-        if plus_di > minus_di:
-            up += 2
-
-        elif minus_di > plus_di:
-            down += 2
-
-    rsi_value = snapshot["rsi14"]
-
-    if rsi_value is not None:
-
-        if 50 < rsi_value < 70:
-            up += 1
-
-        elif 30 < rsi_value < 50:
-            down += 1
-
-    last = candles[-1]
-
-    if last["close"] > last["open"]:
-        up += 1
-
-    elif last["close"] < last["open"]:
-        down += 1
-
-    if up > down:
-        direction = "UP"
-
-    elif down > up:
-        direction = "DOWN"
-
-    else:
-
-        direction = (
-            "UP"
-            if (
-                ema9 is not None
-                and ema21 is not None
-                and ema9 >= ema21
-            )
-            else "DOWN"
-        )
-
-    return {
-
-        "score": max(up, down),
-
-        "direction": direction,
-
-        "up": up,
-
-        "down": down,
-    }
+    return analysis
 
 
 # ============================================================
@@ -1114,1536 +1328,634 @@ def directional_pre_score(candles):
 
 def choose_best_pair():
 
-    with mt4_lock:
+    candidates = []
 
-        candidates = []
+    current_time = now_timestamp()
 
-        for symbol, timeframes in mt4_data.items():
+    with data_lock:
 
-            if not isinstance(
-                timeframes,
-                dict
-            ):
-                continue
+        items = list(data_store.items())
 
-            candles = timeframes.get(
-                ANALYSIS_TIMEFRAME
-            )
+    for symbol, info in items:
 
-            if not candles:
-                continue
+        candles = info.get("candles", [])
 
-            closed = candles[:-1]
+        received = info.get(
+            "received_at",
+            0
+        )
 
-            if len(closed) < MIN_CLOSED_CANDLES:
-                continue
+        if not candles:
+            continue
 
-            pre = directional_pre_score(
-                closed
-            )
+        if current_time - received > MAX_DATA_AGE_SECONDS:
+            continue
 
-            candidates.append({
+        if len(candles) < MIN_CANDLES:
+            continue
 
-                "symbol": symbol,
+        analysis = calculate_analysis(candles)
 
-                "timeframe": ANALYSIS_TIMEFRAME,
+        if not analysis:
+            continue
 
-                "score": pre["score"],
+        if not analysis["direction"]:
+            continue
 
-                "direction": pre["direction"],
+        if analysis["conflict"]:
+            continue
 
-                "up": pre["up"],
+        if analysis["score"] < MIN_SCORE:
+            continue
 
-                "down": pre["down"],
-            })
+        if analysis["adx"] < 20:
+            continue
+
+        # Small bonus for clean alignment
+        quality = float(
+            analysis["score"]
+        )
+
+        quality += abs(
+            analysis["up_score"]
+            - analysis["down_score"]
+        ) * 0.5
+
+        if analysis["adx"] >= 30:
+            quality += 1.5
+
+        if analysis["structure"] == analysis["direction"]:
+            quality += 1
+
+        if analysis["breakout"] == analysis["direction"]:
+            quality += 1
+
+        candidates.append({
+            "symbol": symbol,
+            "candles": candles,
+            "analysis": analysis,
+            "quality": quality,
+        })
 
     if not candidates:
         return None
 
+    # Highest quality first
     candidates.sort(
-        key=lambda x: (
-            x["score"],
-            abs(
-                x["up"]
-                - x["down"]
-            ),
-        ),
+        key=lambda x: x["quality"],
         reverse=True
     )
 
-    cycle = get_active_cycle()
-
-    if cycle["active"]:
-
-        for candidate in candidates:
-
-            if candidate["symbol"] == cycle["symbol"]:
-                return candidate
-
-        return None
-
     return candidates[0]
-
-
-# ============================================================
-# GEMINI PROMPT
-# ============================================================
-
-def build_gemini_prompt(
-    symbol,
-    timeframe,
-    candles
-):
-
-    snapshot = build_technical_snapshot(
-        candles
-    )
-
-    pre_score = directional_pre_score(
-        candles
-    )
-
-    recent = candles[-30:]
-
-    payload = {
-
-        "symbol": symbol,
-
-        "timeframe": timeframe,
-
-        "candles_count": len(candles),
-
-        "technical_snapshot": snapshot,
-
-        "pre_analysis": pre_score,
-
-        "recent_candles": recent,
-    }
-
-    return f"""
-You are the technical analysis engine for
-ZinoProSignalAI.
-
-Analyze ONLY the supplied closed-candle data.
-
-TIMEFRAME:
-{timeframe}
-
-SYMBOL:
-{symbol}
-
-IMPORTANT RULES:
-
-1. Never invent market data.
-2. Never use external prices.
-3. Never assume indicators that are not supplied.
-4. Direction MUST be exactly UP or DOWN.
-5. Never return WAIT.
-6. Never return NO SIGNAL.
-7. Never return NEUTRAL.
-8. Confidence must reflect actual evidence.
-9. Do not use 90%+ confidence unless the evidence is exceptionally strong.
-10. Confidence is NOT a guarantee.
-11. Price Action has the highest priority.
-12. Market Structure comes next.
-13. Breakout / Retest comes next.
-14. Liquidity comes next.
-15. Momentum comes next.
-16. Candle behavior comes next.
-17. EMA 9/21 comes next.
-18. RSI comes next.
-19. Williams %R comes next.
-20. Keltner comes next.
-21. ADX/DI is supporting evidence only.
-
-Look for multiple independent pieces of confluence.
-
-Check contradictions carefully.
-
-SCORING:
-
-The total score must be exactly 18.
-
-Structure = 2
-Breakout = 2
-Liquidity = 1
-Momentum = 2
-Candle = 2
-RSI = 1
-Summary = 2
-Oscillators = 2
-Moving Averages = 2
-
-The larger score should normally match the selected direction.
-
-Do not manufacture scores from unavailable information.
-
-Return JSON ONLY.
-
-Required JSON:
-
-{{
-  "signal": true,
-  "direction": "UP",
-  "confidence": 75,
-  "up_score": 13,
-  "down_score": 5,
-  "reason": "Short factual reason based only on supplied data.",
-  "cancellation_reason": "Cancel if the next closed candle invalidates the directional structure."
-}}
-
-MARKET DATA:
-
-{json.dumps(
-    payload,
-    ensure_ascii=False
-)}
-"""
-
-
-# ============================================================
-# GEMINI ANALYSIS
-# ============================================================
-
-def analyze_with_gemini(
-    symbol,
-    timeframe,
-    candles
-):
-
-    if gemini_client is None:
-
-        raise RuntimeError(
-            "Gemini client is not initialized"
-        )
-
-    prompt = build_gemini_prompt(
-        symbol,
-        timeframe,
-        candles
-    )
-
-    response = (
-        gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.10,
-                response_mime_type="application/json",
-            ),
-        )
-    )
-
-    text = getattr(
-        response,
-        "text",
-        None
-    )
-
-    if not text:
-
-        raise RuntimeError(
-            "Gemini returned empty response"
-        )
-
-    text = text.strip()
-
-    if text.startswith("```"):
-
-        text = text.replace(
-            "```json",
-            ""
-        )
-
-        text = text.replace(
-            "```",
-            ""
-        )
-
-        text = text.strip()
-
-    return json.loads(text)
-
-
-# ============================================================
-# VALIDATE RESULT
-# ============================================================
-
-def ensure_directional_signal(
-    result,
-    candles
-):
-
-    if not isinstance(result, dict):
-        result = {}
-
-    direction = str(
-        result.get(
-            "direction",
-            ""
-        )
-    ).upper().strip()
-
-    up_score = int(
-        safe_float(
-            result.get("up_score"),
-            0
-        ) or 0
-    )
-
-    down_score = int(
-        safe_float(
-            result.get("down_score"),
-            0
-        ) or 0
-    )
-
-    up_score = max(
-        0,
-        min(18, up_score)
-    )
-
-    down_score = max(
-        0,
-        min(18, down_score)
-    )
-
-    total = up_score + down_score
-
-    if total != 18:
-
-        if total == 0:
-
-            pre = directional_pre_score(
-                candles
-            )
-
-            if pre["up"] >= pre["down"]:
-
-                up_score = 18
-                down_score = 0
-
-            else:
-
-                up_score = 0
-                down_score = 18
-
-        elif total < 18:
-
-            missing = 18 - total
-
-            if up_score >= down_score:
-                up_score += missing
-            else:
-                down_score += missing
-
-        else:
-
-            excess = total - 18
-
-            if up_score >= down_score:
-
-                up_score = max(
-                    0,
-                    up_score - excess
-                )
-
-            else:
-
-                down_score = max(
-                    0,
-                    down_score - excess
-                )
-
-    if up_score > down_score:
-
-        direction = "UP"
-
-    elif down_score > up_score:
-
-        direction = "DOWN"
-
-    else:
-
-        pre = directional_pre_score(
-            candles
-        )
-
-        direction = pre["direction"]
-
-    confidence = safe_float(
-        result.get("confidence"),
-        50
-    )
-
-    confidence = max(
-        1,
-        min(
-            99,
-            int(confidence)
-        )
-    )
-
-    if confidence >= 90:
-
-        score_gap = abs(
-            up_score
-            - down_score
-        )
-
-        if score_gap < 8:
-            confidence = 89
-
-    reason = str(
-        result.get("reason")
-        or
-        "Price action and technical confluence indicate the selected direction."
-    ).strip()
-
-    cancellation_reason = str(
-        result.get("cancellation_reason")
-        or
-        "Cancel if the next closed candle invalidates the current structure."
-    ).strip()
-
-    return {
-
-        "signal": True,
-
-        "direction": direction,
-
-        "confidence": confidence,
-
-        "up_score": up_score,
-
-        "down_score": down_score,
-
-        "reason": reason,
-
-        "cancellation_reason":
-            cancellation_reason,
-    }
-
-
-# ============================================================
-# ENTRY
-# ============================================================
-
-def get_entry_delay_minutes(timeframe):
-
-    return timeframe_minutes(timeframe)
-
-
-def get_entry_price(candles):
-
-    return candles[-1]["close"]
-
-
-def get_cancellation_level(
-    candles,
-    direction
-):
-
-    recent = candles[-8:]
-
-    if direction == "UP":
-
-        return min(
-            x["low"]
-            for x in recent
-        )
-
-    return max(
-        x["high"]
-        for x in recent
-    )
-
-
-def format_price(price):
-
-    if price is None:
-        return "N/A"
-
-    if abs(price) >= 1:
-        return f"{price:.5f}"
-
-    return f"{price:.6f}"
-
-
-# ============================================================
-# SETUP
-# ============================================================
-
-def candle_identity(candle):
-
-    if not candle:
-        return "unknown"
-
-    timestamp = candle.get("time")
-
-    if timestamp is not None:
-        return str(timestamp)
-
-    return (
-        f"{candle.get('open')}_"
-        f"{candle.get('high')}_"
-        f"{candle.get('low')}_"
-        f"{candle.get('close')}"
-    )
-
-
-def setup_key(
-    symbol,
-    timeframe,
-    direction,
-    candles
-):
-
-    return (
-        f"{symbol}|"
-        f"{timeframe}|"
-        f"{direction}|"
-        f"{candle_identity(candles[-1])}"
-    )
-
-
-def cleanup_setup_memory():
-
-    now = time.time()
-
-    with setup_memory_lock:
-
-        expired = [
-
-            key
-
-            for key, timestamp
-            in recent_setups.items()
-
-            if (
-                now - timestamp
-                >= SETUP_REPEAT_BLOCK_SECONDS
-            )
-        ]
-
-        for key in expired:
-
-            recent_setups.pop(
-                key,
-                None
-            )
-
-
-def setup_repeat_blocked(key):
-
-    cleanup_setup_memory()
-
-    with setup_memory_lock:
-
-        timestamp = recent_setups.get(key)
-
-        if timestamp is None:
-            return False, 0
-
-        elapsed = time.time() - timestamp
-
-        if elapsed >= SETUP_REPEAT_BLOCK_SECONDS:
-
-            recent_setups.pop(
-                key,
-                None
-            )
-
-            return False, 0
-
-        remaining = int(
-            SETUP_REPEAT_BLOCK_SECONDS
-            - elapsed
-        )
-
-        return True, remaining
-
-
-def remember_setup(key):
-
-    with setup_memory_lock:
-
-        recent_setups[key] = time.time()
-
-
-# ============================================================
-# SIGNAL FORMAT
-# ============================================================
-
-def format_signal(
-    symbol,
-    timeframe,
-    analysis,
-    candles,
-    trade_type
-):
-
-    direction = analysis["direction"]
-
-    now = datetime.now(ALGIERS)
-
-    delay_minutes = get_entry_delay_minutes(
-        timeframe
-    )
-
-    entry_time = (
-        now.replace(
-            second=0,
-            microsecond=0
-        )
-        + timedelta(
-            minutes=delay_minutes
-        )
-    )
-
-    entry_price = get_entry_price(candles)
-
-    cancellation_level = (
-        get_cancellation_level(
-            candles,
-            direction
-        )
-    )
-
-    if direction == "UP":
-
-        cancel_text = (
-            "إلغاء إذا أغلقت الشمعة تحت "
-            f"{format_price(cancellation_level)}"
-        )
-
-    else:
-
-        cancel_text = (
-            "إلغاء إذا أغلقت الشمعة فوق "
-            f"{format_price(cancellation_level)}"
-        )
-
-    if trade_type == "RECOVERY":
-
-        trade_label = "🔁 RECOVERY 1/1"
-
-    else:
-
-        trade_label = "🎯 BASE TRADE"
-
-    direction_icon = (
-        "🟢 UP"
-        if direction == "UP"
-        else "🔴 DOWN"
-    )
-
-    message = (
-
-        "🎓 ZinoProSignalAI\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"📊 {symbol} | {timeframe}\n"
-
-        f"{trade_label}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"{direction_icon}\n"
-
-        f"🎯 Confidence: "
-        f"{analysis['confidence']}%\n"
-
-        f"📈 UP Score: "
-        f"{analysis['up_score']}/18\n"
-
-        f"📉 DOWN Score: "
-        f"{analysis['down_score']}/18\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"⏳ Entry after: "
-        f"{delay_minutes} min\n"
-
-        f"⏰ ENTRY TIME: "
-        f"{entry_time.strftime('%H:%M:%S')} 🇩🇿\n"
-
-        f"💰 Entry Price: "
-        f"{format_price(entry_price)}\n"
-
-        f"⚠️ {cancel_text}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"🧠 {analysis['reason']}\n"
-    )
-
-    return (
-        message,
-        entry_time,
-        entry_price,
-        cancellation_level
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def create_trade_record(
-    symbol,
-    timeframe,
-    analysis,
-    candles,
-    trade_type,
-    entry_time,
-    entry_price,
-    cancellation_level
-):
-
-    now = datetime.now(ALGIERS)
-
-    trade_id = (
-        f"{now.strftime('%Y%m%d%H%M%S')}"
-        f"-{int(time.time() * 1000) % 1000:03d}"
-    )
-
-    return {
-
-        "id": trade_id,
-
-        "created_at": now.isoformat(),
-
-        "symbol": symbol,
-
-        "timeframe": timeframe,
-
-        "trade_type": trade_type,
-
-        "direction": analysis["direction"],
-
-        "confidence": analysis["confidence"],
-
-        "up_score": analysis["up_score"],
-
-        "down_score": analysis["down_score"],
-
-        "entry_time": entry_time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-
-        "entry_price": entry_price,
-
-        "cancellation_level":
-            cancellation_level,
-
-        "reason": analysis["reason"],
-
-        "cancellation_reason":
-            analysis["cancellation_reason"],
-
-        "result": "PENDING",
-
-        "result_time": None,
-    }
-
-
-def add_trade_record(record):
-
-    global current_trade_id
-
-    with history_lock:
-
-        trade_history.append(record)
-
-        current_trade_id = record["id"]
-
-    save_history()
-
-    logger.info(
-        "TRADE RECORDED | %s | %s | %s",
-        record["symbol"],
-        record["trade_type"],
-        record["direction"]
-    )
-
-
-def update_current_trade_result(result):
-
-    global current_trade_id
-
-    if result not in ("WIN", "LOSS"):
-        return False
-
-    updated = False
-
-    now = datetime.now(ALGIERS)
-
-    with history_lock:
-
-        target_id = current_trade_id
-
-        if target_id is not None:
-
-            for record in reversed(
-                trade_history
-            ):
-
-                if (
-                    record.get("id") == target_id
-                    and record.get("result") == "PENDING"
-                ):
-
-                    record["result"] = result
-
-                    record["result_time"] = (
-                        now.isoformat()
-                    )
-
-                    updated = True
-
-                    break
-
-        if not updated:
-
-            for record in reversed(
-                trade_history
-            ):
-
-                if record.get("result") == "PENDING":
-
-                    record["result"] = result
-
-                    record["result_time"] = (
-                        now.isoformat()
-                    )
-
-                    current_trade_id = (
-                        record.get("id")
-                    )
-
-                    updated = True
-
-                    break
-
-    if updated:
-
-        save_history()
-
-    return updated
-
-
-def history_summary():
-
-    with history_lock:
-
-        records = list(trade_history)
-
-    total = len(records)
-
-    wins = sum(
-        1
-        for x in records
-        if x.get("result") == "WIN"
-    )
-
-    losses = sum(
-        1
-        for x in records
-        if x.get("result") == "LOSS"
-    )
-
-    pending = sum(
-        1
-        for x in records
-        if x.get("result") == "PENDING"
-    )
-
-    return (
-        records,
-        total,
-        wins,
-        losses,
-        pending
-    )
-
-
-# ============================================================
-# CYCLE
-# ============================================================
-
-def get_active_cycle():
-
-    with cycle_lock:
-        return dict(active_cycle)
-
-
-def start_base_cycle(
-    symbol,
-    timeframe,
-    direction
-):
-
-    with cycle_lock:
-
-        active_cycle["active"] = True
-
-        active_cycle["symbol"] = symbol
-
-        active_cycle["timeframe"] = timeframe
-
-        active_cycle["trade_type"] = "BASE"
-
-        active_cycle["direction"] = direction
-
-        active_cycle["recovery_used"] = False
-
-        active_cycle["recovery_ready"] = False
-
-        # الصفقة BASE مرسلة وننتظر نتيجتها
-        active_cycle["pending_result"] = True
-
-        active_cycle["last_trade_time"] = time.time()
-
-        active_cycle["trade_number"] = 1
-
-    logger.info(
-        "BASE CYCLE STARTED | %s | %s",
-        symbol,
-        direction
-    )
-
-
-def start_recovery_cycle():
-
-    with cycle_lock:
-
-        active_cycle["active"] = True
-
-        active_cycle["trade_type"] = "RECOVERY"
-
-        active_cycle["recovery_used"] = True
-
-        # الآن مسموح بإرسال Recovery واحدة
-        active_cycle["recovery_ready"] = True
-
-        # لا توجد صفقة Recovery مرسلة بعد
-        active_cycle["pending_result"] = False
-
-        active_cycle["trade_number"] = 2
-
-        active_cycle["last_trade_time"] = time.time()
-
-    logger.info("RECOVERY IS READY")
-
-
-def mark_recovery_sent(direction):
-
-    with cycle_lock:
-
-        active_cycle["trade_type"] = "RECOVERY"
-
-        active_cycle["recovery_ready"] = False
-
-        # Recovery مرسلة، الآن ننتظر النتيجة
-        active_cycle["pending_result"] = True
-
-        active_cycle["direction"] = direction
-
-        active_cycle["last_trade_time"] = time.time()
-
-        active_cycle["trade_number"] = 2
-
-    logger.info(
-        "RECOVERY SENT | %s",
-        direction
-    )
-
-
-def reset_cycle():
-
-    with cycle_lock:
-
-        active_cycle["active"] = False
-
-        active_cycle["symbol"] = None
-
-        active_cycle["timeframe"] = None
-
-        active_cycle["trade_type"] = None
-
-        active_cycle["direction"] = None
-
-        active_cycle["recovery_used"] = False
-
-        active_cycle["recovery_ready"] = False
-
-        active_cycle["pending_result"] = False
-
-        active_cycle["last_trade_time"] = 0.0
-
-        active_cycle["trade_number"] = 0
-
-    logger.info(
-        "CYCLE RESET - SEARCH FOR NEW PAIR"
-    )
-
-
-# ============================================================
-# SIGNAL COOLDOWN
-# ============================================================
-
-def signal_cooldown_active():
-
-    elapsed = (
-        time.time()
-        - last_signal_sent_at
-    )
-
-    if elapsed < SIGNAL_COOLDOWN_SECONDS:
-
-        remaining = int(
-            SIGNAL_COOLDOWN_SECONDS
-            - elapsed
-        )
-
-        return True, remaining
-
-    return False, 0
 
 
 # ============================================================
 # TELEGRAM SEND
 # ============================================================
 
-def send_telegram_direct(message):
+async def send_message(text):
 
-    if not BOT_TOKEN:
+    global application
 
+    if application is None:
         logger.error(
-            "BOT_TOKEN is missing"
+            "Telegram application is not ready."
         )
-
-        return False
-
-    oid = owner_id_int()
-
-    if oid is None:
-
-        logger.error(
-            "OWNER_ID is invalid"
-        )
-
         return False
 
     try:
 
-        url = (
-            "https://api.telegram.org/bot"
-            f"{BOT_TOKEN}/sendMessage"
+        await application.bot.send_message(
+            chat_id=OWNER_ID,
+            text=text,
+            parse_mode="Markdown"
         )
 
-        data = urllib.parse.urlencode({
-
-            "chat_id": str(oid),
-
-            "text": message,
-
-        }).encode("utf-8")
-
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST"
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            body = response.read().decode(
-                "utf-8"
-            )
-
-        result = json.loads(body)
-
-        if result.get("ok"):
-
-            return True
-
-        logger.error(
-            "Telegram API error: %s",
-            result
-        )
-
-        return False
+        return True
 
     except Exception as e:
 
-        logger.exception(
-            "Telegram direct send failed: %s",
+        logger.error(
+            "Telegram send failed: %s",
             e
         )
 
-        return False
+        # Retry plain text
+        try:
 
+            await application.bot.send_message(
+                chat_id=OWNER_ID,
+                text=text
+            )
 
-def send_signal_safely(message):
+            return True
 
-    global last_signal_sent_at
+        except Exception as e2:
 
-    with signal_send_lock:
-
-        active, remaining = (
-            signal_cooldown_active()
-        )
-
-        if active:
-
-            logger.info(
-                "Signal cooldown active: %ss",
-                remaining
+            logger.error(
+                "Telegram retry failed: %s",
+                e2
             )
 
             return False
 
-        success = send_telegram_direct(
-            message
+
+def send_message_threadsafe(text):
+
+    global telegram_loop
+
+    if telegram_loop is None:
+        logger.error(
+            "Telegram loop unavailable."
+        )
+        return False
+
+    try:
+
+        future = asyncio.run_coroutine_threadsafe(
+            send_message(text),
+            telegram_loop
         )
 
-        if success:
+        future.result(timeout=20)
 
-            last_signal_sent_at = time.time()
+        return True
 
-            return True
+    except Exception as e:
+
+        logger.error(
+            "Threadsafe Telegram send failed: %s",
+            e
+        )
 
         return False
 
 
 # ============================================================
-# AUTO ANALYSIS
+# SIGNAL CARD
 # ============================================================
 
-def auto_analyze_pair(
+def build_signal_text(
     symbol,
-    timeframe
+    analysis,
+    trade_type
 ):
 
-    if not analysis_lock.acquire(
-        blocking=False
-    ):
+    direction = analysis["direction"]
 
-        logger.info(
-            "Analysis already running"
-        )
+    emoji = "🟢 UP" if direction == "UP" else "🔴 DOWN"
 
-        return
+    confidence = analysis["confidence"]
 
-    try:
+    score = analysis["score"]
 
-        timeframe = normalize_timeframe(
-            timeframe
-        )
+    up_score = analysis["up_score"]
 
-        if timeframe != ANALYSIS_TIMEFRAME:
-            return
+    down_score = analysis["down_score"]
 
-        cycle = get_active_cycle()
+    price = analysis["price"]
 
-        # ====================================================
-        # أهم حماية:
-        #
-        # إذا توجد صفقة مرسلة وننتظر /win أو /loss
-        # ممنوع إرسال أي صفقة أخرى.
-        # ====================================================
+    cancellation = analysis["cancellation"]
 
-        if cycle["active"]:
+    entry_time = now_algiers() + timedelta(
+        seconds=ENTRY_DELAY_SECONDS
+    )
 
-            if cycle["pending_result"]:
+    reason = analysis.get(
+        "reason",
+        "EMA + RSI + ADX/DI + Price Action aligned."
+    )
 
-                logger.info(
-                    "BLOCKED: active trade waiting for result"
-                )
+    if trade_type == "BASE":
+        title = "🎯 BASE TRADE"
+    else:
+        title = "♻️ RECOVERY 1/1"
 
-                return
+    text = (
+        "🎓 *ZinoProSignalAI*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *{symbol} | M1*\n\n"
+        f"{title}\n"
+        f"➡️ *{emoji}*\n\n"
+        f"🔥 Confidence: *{confidence}%*\n"
+        f"📈 UP Score: *{up_score}/20*\n"
+        f"📉 DOWN Score: *{down_score}/20*\n\n"
+        f"⏱️ Entry after: *1 minute*\n"
+        f"🕐 *ENTRY TIME: {fmt_time(entry_time)} 🇩🇿*\n\n"
+        f"💰 Price: *{price:.6f}*\n"
+        f"❌ Cancellation: *{cancellation:.6f}*\n\n"
+        f"🧠 *Reason:*\n"
+        f"{reason}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ One trade only — waiting for result."
+    )
 
-            # Recovery ليست جاهزة
-            if (
-                cycle["trade_type"] == "RECOVERY"
-                and not cycle["recovery_ready"]
-            ):
+    return text
 
-                logger.info(
-                    "BLOCKED: recovery already used/sent"
-                )
 
-                return
+# ============================================================
+# SEND ONE SIGNAL
+# ============================================================
 
-            # نفس الزوج فقط داخل الدورة
-            if cycle["symbol"] != symbol:
-                return
+def send_one_signal(
+    symbol,
+    candles,
+    analysis,
+    trade_type
+):
 
-            if cycle["timeframe"] != timeframe:
-                return
+    global cycle
 
-        else:
+    with cycle_lock:
 
-            best = choose_best_pair()
+        # ----------------------------------------------------
+        # HARD ONE-TRADE LOCK
+        # ----------------------------------------------------
 
-            if not best:
-                return
-
-            if best["symbol"] != symbol:
-                return
-
-            if best["timeframe"] != timeframe:
-                return
-
-        # ====================================================
-        # GLOBAL COOLDOWN
-        # ====================================================
-
-        active, remaining = (
-            signal_cooldown_active()
-        )
-
-        if active:
-
+        if cycle["pending"]:
             logger.info(
-                "Cooldown active: %ss",
-                remaining
+                "Signal blocked: another trade is pending."
             )
+            return False
 
-            return
-
-        # ====================================================
-        # GET MT4 DATA
-        # ====================================================
-
-        with mt4_lock:
-
-            timeframes = mt4_data.get(symbol)
-
-            if not timeframes:
-                return
-
-            candles = timeframes.get(timeframe)
-
-            if not candles:
-                return
-
-            candles = list(candles)
-
-        if len(candles) < (
-            MIN_CLOSED_CANDLES + 1
-        ):
-
-            logger.info(
-                "%s: not enough candles: %s",
-                symbol,
-                len(candles)
-            )
-
-            return
-
-        closed = candles[:-1]
-
-        if len(closed) < MIN_CLOSED_CANDLES:
-            return
-
-        # ====================================================
-        # GEMINI
-        # ====================================================
-
-        logger.info(
-            "Analyzing ONE candidate: %s %s",
-            symbol,
-            timeframe
-        )
-
-        analysis = analyze_with_gemini(
-            symbol,
-            timeframe,
-            closed
-        )
-
-        analysis = ensure_directional_signal(
-            analysis,
-            closed
-        )
-
-        logger.info(
-            "GEMINI RESULT | %s | %s | %s%% | %s/%s",
-            symbol,
-            analysis["direction"],
-            analysis["confidence"],
-            analysis["up_score"],
-            analysis["down_score"]
-        )
-
-        # ====================================================
-        # TRADE TYPE
-        # ====================================================
-
-        cycle = get_active_cycle()
-
-        if cycle["active"]:
-
-            trade_type = cycle["trade_type"]
-
-        else:
-
-            trade_type = "BASE"
-
-        # ====================================================
-        # SETUP PROTECTION
-        # ====================================================
-
-        key = setup_key(
-            symbol,
-            timeframe,
-            analysis["direction"],
-            closed
-        )
+        # ----------------------------------------------------
+        # BASE
+        # ----------------------------------------------------
 
         if trade_type == "BASE":
 
-            blocked, remaining = (
-                setup_repeat_blocked(key)
-            )
-
-            if blocked:
-
+            if cycle["active"]:
                 logger.info(
-                    "Same BASE setup blocked: %ss",
-                    remaining
+                    "BASE blocked: cycle already active."
                 )
+                return False
 
-                return
+        # ----------------------------------------------------
+        # RECOVERY
+        # ----------------------------------------------------
 
-        # ====================================================
-        # BUILD ONE SIGNAL
-        # ====================================================
+        if trade_type == "RECOVERY":
 
-        (
-            message,
-            entry_time,
-            entry_price,
-            cancellation_level
-        ) = format_signal(
+            if not cycle["active"]:
+                logger.info(
+                    "Recovery blocked: no active cycle."
+                )
+                return False
+
+            if cycle["recovery_used"]:
+                logger.info(
+                    "Recovery blocked: already used."
+                )
+                return False
+
+            if cycle["trade_type"] != "RECOVERY":
+                logger.info(
+                    "Recovery blocked: wrong cycle state."
+                )
+                return False
+
+        # ----------------------------------------------------
+        # SETUP KEY
+        # ----------------------------------------------------
+
+        setup_key = make_setup_key(
             symbol,
-            timeframe,
-            analysis,
-            closed,
-            trade_type
+            analysis
         )
 
-        # ====================================================
-        # SEND ONLY ONE
-        # ====================================================
+        # ----------------------------------------------------
+        # RESERVE THE TRADE BEFORE TELEGRAM
+        # ----------------------------------------------------
 
-        sent = send_signal_safely(
-            message
-        )
+        cycle["active"] = True
 
-        if not sent:
+        cycle["trade_type"] = trade_type
 
+        cycle["symbol"] = symbol
+
+        cycle["direction"] = analysis["direction"]
+
+        cycle["pending"] = True
+
+        cycle["generating"] = False
+
+        cycle["setup_key"] = setup_key
+
+        cycle["last_signal_time"] = now_timestamp()
+
+        cycle["last_signal"] = {
+            "symbol": symbol,
+            "direction": analysis["direction"],
+            "trade_type": trade_type,
+            "score": analysis["score"],
+            "confidence": analysis["confidence"],
+            "price": analysis["price"],
+            "candle_time": analysis["candle_time"],
+            "sent_at": now_timestamp(),
+        }
+
+        if trade_type == "BASE":
+
+            cycle["base_symbol"] = symbol
+
+            cycle["base_direction"] = analysis["direction"]
+
+        elif trade_type == "RECOVERY":
+
+            cycle["recovery_used"] = True
+
+    # --------------------------------------------------------
+    # Build and send outside lock
+    # --------------------------------------------------------
+
+    text = build_signal_text(
+        symbol,
+        analysis,
+        trade_type
+    )
+
+    success = send_message_threadsafe(text)
+
+    if not success:
+
+        # Telegram failed, release pending state
+        with cycle_lock:
+
+            cycle["pending"] = False
+
+            if trade_type == "BASE":
+                cycle["active"] = False
+                cycle["trade_type"] = None
+                cycle["symbol"] = None
+                cycle["direction"] = None
+                cycle["setup_key"] = None
+
+            elif trade_type == "RECOVERY":
+                cycle["recovery_used"] = False
+
+        return False
+
+    # --------------------------------------------------------
+    # History
+    # --------------------------------------------------------
+
+    with data_lock:
+
+        history.append({
+            "time": now_algiers().isoformat(),
+            "symbol": symbol,
+            "trade_type": trade_type,
+            "direction": analysis["direction"],
+            "score": analysis["score"],
+            "confidence": analysis["confidence"],
+            "price": analysis["price"],
+            "result": "PENDING",
+        })
+
+        if len(history) > 100:
+            del history[:-100]
+
+    logger.info(
+        "SIGNAL SENT | %s | %s | %s | %s/20",
+        symbol,
+        trade_type,
+        analysis["direction"],
+        analysis["score"]
+    )
+
+    return True
+
+
+# ============================================================
+# BASE ANALYSIS
+# ============================================================
+
+def analyze_and_send_base():
+
+    # --------------------------------------------------------
+    # HARD CYCLE CHECK
+    # --------------------------------------------------------
+
+    with cycle_lock:
+
+        if cycle["pending"]:
+            return False
+
+        if cycle["active"]:
+            return False
+
+        if cycle["generating"]:
+            return False
+
+        # Reserve generation
+        cycle["generating"] = True
+
+    try:
+
+        candidate = choose_best_pair()
+
+        if not candidate:
             logger.info(
-                "Signal not sent"
+                "No high-quality setup found."
             )
+            return False
 
-            return
+        symbol = candidate["symbol"]
 
-        # ====================================================
-        # RECORD
-        # ====================================================
+        candles = candidate["candles"]
 
-        record = create_trade_record(
-            symbol=symbol,
-            timeframe=timeframe,
-            analysis=analysis,
-            candles=closed,
-            trade_type=trade_type,
-            entry_time=entry_time,
-            entry_price=entry_price,
-            cancellation_level=cancellation_level,
-        )
-
-        add_trade_record(record)
-
-        remember_setup(key)
-
-        # ====================================================
-        # CYCLE STATE
-        # ====================================================
-
-        if not cycle["active"]:
-
-            # BASE
-            start_base_cycle(
-                symbol,
-                timeframe,
-                analysis["direction"]
-            )
-
-        else:
-
-            # RECOVERY
-            if trade_type == "RECOVERY":
-
-                mark_recovery_sent(
-                    analysis["direction"]
-                )
-
-        logger.info(
-            "ONE SIGNAL SENT | %s | %s | %s",
+        # Full validation
+        analysis = validate_signal(
             symbol,
-            trade_type,
-            analysis["direction"]
+            candles
         )
 
-    except Exception as e:
+        if not analysis:
+            logger.info(
+                "Best candidate failed final validation."
+            )
+            return False
 
-        logger.exception(
-            "Auto analysis failed: %s",
-            e
+        # ----------------------------------------------------
+        # Send exactly ONE
+        # ----------------------------------------------------
+
+        return send_one_signal(
+            symbol,
+            candles,
+            analysis,
+            "BASE"
         )
 
     finally:
 
-        analysis_lock.release()
+        with cycle_lock:
+            cycle["generating"] = False
 
 
 # ============================================================
-# BACKGROUND LOOP
+# RECOVERY
 # ============================================================
 
-def background_analysis_loop():
+def analyze_and_send_recovery():
 
-    logger.info(
-        "Background analysis loop started"
-    )
+    with cycle_lock:
 
-    while True:
+        if not cycle["active"]:
+            return False
 
-        try:
+        if cycle["pending"]:
+            return False
 
-            cleanup_setup_memory()
+        if cycle["recovery_used"]:
+            return False
 
-            cycle = get_active_cycle()
+        if cycle["trade_type"] != "RECOVERY":
+            return False
 
-            # =================================================
-            # توجد صفقة وننتظر نتيجتها
-            # لا تحليل ولا صفقة جديدة
-            # =================================================
+        symbol = cycle["symbol"]
 
-            if (
-                cycle["active"]
-                and cycle["pending_result"]
-            ):
+    # --------------------------------------------------------
+    # Recovery uses freshest data of current pair
+    # --------------------------------------------------------
 
-                logger.info(
-                    "Waiting for /win or /loss | %s",
-                    cycle["trade_type"]
-                )
+    with data_lock:
 
-            elif cycle["active"]:
+        info = data_store.get(symbol)
 
-                if (
-                    cycle["symbol"]
-                    and cycle["recovery_ready"]
-                ):
+        if not info:
+            return False
 
-                    auto_analyze_pair(
-                        cycle["symbol"],
-                        ANALYSIS_TIMEFRAME
-                    )
-
-            else:
-
-                best = choose_best_pair()
-
-                if best:
-
-                    auto_analyze_pair(
-                        best["symbol"],
-                        ANALYSIS_TIMEFRAME
-                    )
-
-                else:
-
-                    logger.info(
-                        "No suitable M1 candidate yet"
-                    )
-
-        except Exception as e:
-
-            logger.exception(
-                "Background loop error: %s",
-                e
-            )
-
-        time.sleep(
-            AUTO_ANALYSIS_INTERVAL_SECONDS
+        candles = list(
+            info.get("candles", [])
         )
 
+    if len(candles) < MIN_CANDLES:
+        return False
+
+    analysis = validate_signal(
+        symbol,
+        candles
+    )
+
+    if not analysis:
+        logger.info(
+            "Recovery setup not strong enough."
+        )
+        return False
+
+    return send_one_signal(
+        symbol,
+        candles,
+        analysis,
+        "RECOVERY"
+    )
+
 
 # ============================================================
-# MT4 DATA
+# MT4 DATA PROCESSING
 # ============================================================
 
-def store_mt4_data(payload):
+def process_mt4_payload(payload):
+
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "error": "Invalid JSON object"
+        }
 
     symbol = str(
         payload.get("symbol")
-        or payload.get("Symbol")
         or ""
-    ).upper().strip()
+    ).strip().upper()
 
-    timeframe = normalize_timeframe(
+    timeframe = str(
         payload.get("timeframe")
-        or payload.get("Timeframe")
         or payload.get("tf")
-    )
+        or "M1"
+    ).upper()
 
-    candles = (
+    candles = normalize_candles(
         payload.get("candles")
-        or payload.get("data")
         or []
     )
 
     if not symbol:
-        raise ValueError("Missing symbol")
+        return {
+            "ok": False,
+            "error": "Missing symbol"
+        }
 
-    if not timeframe:
-        raise ValueError("Missing timeframe")
+    if timeframe != "M1":
+        return {
+            "ok": False,
+            "error": "Only M1 is accepted"
+        }
 
-    normalized = normalize_candles(candles)
+    if len(candles) < 10:
+        return {
+            "ok": False,
+            "error": "Not enough candles"
+        }
 
-    if not normalized:
-        raise ValueError("No valid candles")
+    with data_lock:
 
-    with mt4_lock:
-
-        if symbol not in mt4_data:
-            mt4_data[symbol] = {}
-
-        mt4_data[symbol][timeframe] = normalized
+        data_store[symbol] = {
+            "symbol": symbol,
+            "timeframe": "M1",
+            "candles": candles[-150:],
+            "received_at": now_timestamp(),
+        }
 
     logger.info(
-        "MT4 data stored: %s %s candles=%s",
+        "MT4 DATA | %s | candles=%d",
         symbol,
-        timeframe,
-        len(normalized)
+        len(candles)
     )
 
-    return (
-        symbol,
-        timeframe,
-        normalized
-    )
+    # --------------------------------------------------------
+    # AUTOMATIC SIGNAL ENGINE
+    # --------------------------------------------------------
+
+    # Do NOT create multiple analysis threads.
+    # Only one can enter the analysis lock.
+
+    def background_signal_check():
+
+        if not analysis_lock.acquire(
+            blocking=False
+        ):
+            return
+
+        try:
+
+            with cycle_lock:
+
+                # ABSOLUTE ONE-TRADE RULE
+                if cycle["pending"]:
+                    return
+
+                # Active BASE/RECOVERY cycle
+                if cycle["active"]:
+                    return
+
+            analyze_and_send_base()
+
+        finally:
+
+            analysis_lock.release()
+
+    threading.Thread(
+        target=background_signal_check,
+        daemon=True
+    ).start()
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": len(candles),
+    }
 
 
 # ============================================================
@@ -2652,132 +1964,134 @@ def store_mt4_data(payload):
 
 class MT4Handler(BaseHTTPRequestHandler):
 
-    def do_HEAD(self):
+    def log_message(self, format, *args):
+        return
 
-        parsed = urlparse(self.path)
+    def _send_json(self, code, data):
 
-        if parsed.path in (
-            "/",
-            "/health",
-            "/healthz",
-            "/mt4",
-            "/api/mt4",
-        ):
+        body = json.dumps(
+            data,
+            ensure_ascii=False
+        ).encode("utf-8")
 
-            self.send_response(200)
+        self.send_response(code)
 
-            self.send_header(
-                "Content-Type",
-                "text/plain; charset=utf-8"
-            )
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
 
-            self.end_headers()
-
-            return
-
-        self.send_response(404)
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
 
         self.end_headers()
 
+        self.wfile.write(body)
 
     def do_GET(self):
 
-        parsed = urlparse(self.path)
+        path = urlparse(
+            self.path
+        ).path
 
-        if parsed.path in (
-            "/",
-            "/health",
-            "/healthz",
-        ):
+        if path in ("/", "/health", "/healthz"):
 
-            body = (
-                "ZinoProSignalAI is running"
-            ).encode("utf-8")
-
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain; charset=utf-8"
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "service": "ZinoProSignalAI",
+                    "status": "running",
+                    "mode": "MT4-M1",
+                }
             )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
 
             return
 
-        if parsed.path in (
-            "/mt4",
-            "/api/mt4",
-        ):
+        if path in ("/mt4status", "/status"):
 
-            body = (
-                "ZinoProSignalAI MT4 endpoint"
-            ).encode("utf-8")
+            with data_lock:
 
-            self.send_response(200)
+                symbols = {}
 
-            self.send_header(
-                "Content-Type",
-                "text/plain; charset=utf-8"
+                for symbol, info in data_store.items():
+
+                    symbols[symbol] = {
+                        "candles": len(
+                            info.get("candles", [])
+                        ),
+                        "age_seconds": round(
+                            now_timestamp()
+                            - info.get(
+                                "received_at",
+                                now_timestamp()
+                            ),
+                            1
+                        )
+                    }
+
+            with cycle_lock:
+
+                cycle_copy = {
+                    "active": cycle["active"],
+                    "trade_type": cycle["trade_type"],
+                    "symbol": cycle["symbol"],
+                    "direction": cycle["direction"],
+                    "pending": cycle["pending"],
+                    "recovery_used": cycle["recovery_used"],
+                }
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "cycle": cycle_copy,
+                    "symbols": symbols,
+                }
             )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
 
             return
 
-        self.send_response(404)
-
-        self.end_headers()
-
+        self._send_json(
+            404,
+            {
+                "ok": False,
+                "error": "Not found"
+            }
+        )
 
     def do_POST(self):
 
-        parsed = urlparse(self.path)
+        path = urlparse(
+            self.path
+        ).path
 
-        if parsed.path not in (
+        if path not in (
             "/mt4",
             "/api/mt4"
         ):
-
-            self.send_response(404)
-
-            self.end_headers()
-
+            self._send_json(
+                404,
+                {
+                    "ok": False,
+                    "error": "Not found"
+                }
+            )
             return
 
+        # ----------------------------------------------------
+        # API KEY
+        # ----------------------------------------------------
+
+        header_key = (
+            self.headers.get("X-MT4-API-Key")
+            or self.headers.get("X-API-Key")
+            or ""
+        ).strip()
+
         try:
-
-            # =================================================
-            # API KEY
-            # يدعم Header
-            # ويدعم api_key داخل JSON
-            # =================================================
-
-            received_key = (
-                self.headers.get(
-                    "X-MT4-API-Key"
-                )
-                or
-                self.headers.get(
-                    "X-API-Key"
-                )
-                or
-                ""
-            ).strip()
 
             content_length = int(
                 self.headers.get(
@@ -2786,203 +2100,105 @@ class MT4Handler(BaseHTTPRequestHandler):
                 )
             )
 
-            if content_length <= 0:
+        except Exception:
 
-                body = b"Empty request"
+            content_length = 0
 
-                self.send_response(400)
-
-                self.send_header(
-                    "Content-Type",
-                    "text/plain"
-                )
-
-                self.send_header(
-                    "Content-Length",
-                    str(len(body))
-                )
-
-                self.end_headers()
-
-                self.wfile.write(body)
-
-                return
-
-            raw_body = self.rfile.read(
-                content_length
+        if content_length <= 0:
+            self._send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "Empty body"
+                }
             )
+            return
+
+        raw = self.rfile.read(
+            content_length
+        )
+
+        try:
 
             payload = json.loads(
-                raw_body.decode("utf-8")
+                raw.decode("utf-8")
             )
 
-            # توافق مع EA القديم
-            if not received_key:
+        except Exception:
 
-                received_key = str(
-                    payload.get(
-                        "api_key",
-                        ""
-                    )
-                ).strip()
-
-            if MT4_API_KEY:
-
-                if received_key != MT4_API_KEY:
-
-                    logger.warning(
-                        "Invalid MT4 API key"
-                    )
-
-                    body = b"Invalid API key"
-
-                    self.send_response(401)
-
-                    self.send_header(
-                        "Content-Type",
-                        "text/plain"
-                    )
-
-                    self.send_header(
-                        "Content-Length",
-                        str(len(body))
-                    )
-
-                    self.end_headers()
-
-                    self.wfile.write(body)
-
-                    return
-
-            (
-                symbol,
-                timeframe,
-                candles
-            ) = store_mt4_data(payload)
-
-            # =================================================
-            # فقط M1
-            # =================================================
-
-            if timeframe == ANALYSIS_TIMEFRAME:
-
-                analysis_thread = threading.Thread(
-
-                    target=auto_analyze_pair,
-
-                    args=(
-                        symbol,
-                        timeframe,
-                    ),
-
-                    daemon=True,
-                )
-
-                analysis_thread.start()
-
-            response = {
-
-                "ok": True,
-
-                "symbol": symbol,
-
-                "timeframe": timeframe,
-
-                "candles": len(candles),
-
-                "analysis_timeframe":
-                    ANALYSIS_TIMEFRAME,
-            }
-
-            body = json.dumps(
-                response
-            ).encode("utf-8")
-
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8"
+            self._send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "Invalid JSON"
+                }
             )
+            return
 
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
+        # ----------------------------------------------------
+        # Backward compatible API key
+        # ----------------------------------------------------
 
-            self.end_headers()
+        json_key = str(
+            payload.get("api_key")
+            or ""
+        ).strip()
 
-            self.wfile.write(body)
-
-        except json.JSONDecodeError:
-
-            body = b"Invalid JSON"
-
-            self.send_response(400)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
-
-        except Exception as e:
-
-            logger.exception(
-                "MT4 POST error: %s",
-                e
-            )
-
-            body = (
-                f"Server error: {e}"
-            ).encode("utf-8")
-
-            self.send_response(500)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(body)
-
-
-    def log_message(
-        self,
-        format_string,
-        *args
-    ):
-
-        logger.info(
-            "HTTP %s - %s",
-            self.address_string(),
-            format_string % args
+        received_key = (
+            header_key
+            or json_key
         )
+
+        if MT4_API_KEY:
+
+            if received_key != MT4_API_KEY:
+
+                self._send_json(
+                    401,
+                    {
+                        "ok": False,
+                        "error": "Unauthorized"
+                    }
+                )
+                return
+
+        # ----------------------------------------------------
+        # PROCESS
+        # ----------------------------------------------------
+
+        result = process_mt4_payload(
+            payload
+        )
+
+        if result.get("ok"):
+
+            result["accepted"] = True
+
+            result["batch_complete"] = True
+
+            result["batch_id"] = (
+                f"{result['symbol']}_"
+                f"{int(time.time())}"
+            )
+
+            self._send_json(
+                200,
+                result
+            )
+
+        else:
+
+            self._send_json(
+                400,
+                result
+            )
 
 
 def start_http_server():
 
     server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
-        MT4Handler,
+        ("0.0.0.0", PORT),
+        MT4Handler
     )
 
     logger.info(
@@ -3002,245 +2218,139 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
     await update.message.reply_text(
-
         "🎓 ZinoProSignalAI\n\n"
-
-        "✅ Bot is running\n\n"
-
-        "📡 MT4 M1 → Render → Gemini → Telegram\n\n"
-
-        "🎯 ONE BEST SIGNAL ONLY\n"
-
-        "⏱️ Entry delay: 1 min\n"
-
-        "🔁 Recovery: 1/1 فقط\n"
-
-        "🛑 انتظار /win أو /loss بعد كل صفقة\n\n"
-
+        "✅ MT4 M1 engine ready.\n"
+        "🎯 One strongest trade only.\n"
+        "♻️ One recovery maximum.\n\n"
+        "Commands:\n"
         "/stats\n"
         "/history\n"
         "/win\n"
         "/loss\n"
         "/reset\n"
         "/mt4status\n"
-        "/analyze"
+        "/analyze SYMBOL M1"
     )
 
-
-# ============================================================
-# STATS
-# ============================================================
 
 async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    total = (
-        stats_data["wins"]
-        + stats_data["losses"]
-    )
+    with cycle_lock:
 
-    winrate = (
-        (
-            stats_data["wins"]
-            / total
-        ) * 100
-        if total > 0
-        else 0
-    )
-
-    cycle = get_active_cycle()
-
-    if cycle["active"]:
-
-        if cycle["pending_result"]:
-
-            state = "⏳ WAITING RESULT"
-
-        elif cycle["recovery_ready"]:
-
-            state = "🔁 RECOVERY READY"
-
-        else:
-
-            state = "ACTIVE"
-
-        cycle_text = (
-            f"{state} | "
-            f"{cycle['trade_type']} | "
-            f"{cycle['symbol']} | "
-            f"{cycle['timeframe']}"
+        current = (
+            "NONE"
+            if not cycle["active"]
+            else (
+                f"{cycle['trade_type']} "
+                f"{cycle['symbol']} "
+                f"{cycle['direction']}"
+            )
         )
 
-    else:
+        pending = cycle["pending"]
 
-        cycle_text = "🔎 SEARCHING NEW PAIR"
+        recovery_used = cycle["recovery_used"]
 
-    (
-        records,
-        history_total,
-        history_wins,
-        history_losses,
-        history_pending
-    ) = history_summary()
-
-    history_winrate = (
-        (
-            history_wins
-            /
-            (
-                history_wins
-                + history_losses
-            )
-        ) * 100
-        if (
-            history_wins
-            + history_losses
-        ) > 0
-        else 0
+    total_wins = (
+        stats["base_win"]
+        + stats["recovery_win"]
     )
+
+    total_losses = (
+        stats["base_loss"]
+        + stats["recovery_loss"]
+    )
+
+    total = total_wins + total_losses
+
+    if total > 0:
+        winrate = (
+            total_wins
+            / total
+            * 100
+        )
+    else:
+        winrate = 0
 
     text = (
-
-        "📊 ZinoProSignalAI Stats\n"
-
+        "📊 *ZinoProSignalAI STATS*\n"
         "━━━━━━━━━━━━━━━━━━\n"
-
-        f"Session trades: {total}\n"
-
-        f"🟢 Wins: {stats_data['wins']}\n"
-
-        f"🔴 Losses: {stats_data['losses']}\n"
-
-        f"📈 Win rate: {winrate:.1f}%\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"Base wins: {stats_data['base_wins']}\n"
-
-        f"Base losses: {stats_data['base_losses']}\n"
-
-        f"Recovery wins: {stats_data['recovery_wins']}\n"
-
-        f"Recovery losses: {stats_data['recovery_losses']}\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"History: {history_total}\n"
-
-        f"🟢 WIN: {history_wins}\n"
-
-        f"🔴 LOSS: {history_losses}\n"
-
-        f"⏳ Pending: {history_pending}\n"
-
-        f"📈 History win rate: "
-        f"{history_winrate:.1f}%\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"Cycle: {cycle_text}"
+        f"🟢 BASE WIN: {stats['base_win']}\n"
+        f"🔴 BASE LOSS: {stats['base_loss']}\n"
+        f"♻️ RECOVERY WIN: {stats['recovery_win']}\n"
+        f"♻️ RECOVERY LOSS: {stats['recovery_loss']}\n\n"
+        f"🏆 TOTAL WIN: {total_wins}\n"
+        f"❌ TOTAL LOSS: {total_losses}\n"
+        f"📈 WIN RATE: {winrate:.1f}%\n\n"
+        f"🔄 CURRENT CYCLE: {current}\n"
+        f"⏳ PENDING: {'YES' if pending else 'NO'}\n"
+        f"♻️ RECOVERY USED: "
+        f"{'YES' if recovery_used else 'NO'}"
     )
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown"
+    )
 
-
-# ============================================================
-# HISTORY
-# ============================================================
 
 async def history_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    with history_lock:
+    with data_lock:
 
-        records = list(
-            trade_history[
-                -HISTORY_DISPLAY_COUNT:
-            ]
-        )
+        items = history[-10:]
 
-    if not records:
+    if not items:
 
         await update.message.reply_text(
-            "📚 لا توجد صفقات مسجلة حتى الآن."
+            "📚 History empty."
         )
 
         return
 
     lines = [
-
-        "📚 ZinoProSignalAI HISTORY",
-
+        "📚 *ZinoProSignalAI HISTORY*",
         "━━━━━━━━━━━━━━━━━━"
     ]
 
-    for record in reversed(records):
+    for item in reversed(items):
 
-        result = record.get(
-            "result",
-            "PENDING"
-        )
+        direction = item["direction"]
 
-        if result == "WIN":
-            result_icon = "🟢"
-
-        elif result == "LOSS":
-            result_icon = "🔴"
-
-        else:
-            result_icon = "⏳"
-
-        direction = record.get(
-            "direction",
-            "?"
-        )
-
-        direction_icon = (
+        icon = (
             "🟢"
             if direction == "UP"
             else "🔴"
         )
 
         lines.append(
-
-            f"{result_icon} "
-            f"{record.get('symbol', '?')} "
-            f"{record.get('timeframe', '?')}\n"
-
-            f"   {record.get('trade_type', '?')} | "
-            f"{direction_icon} {direction}\n"
-
-            f"   🎯 {record.get('confidence', '?')}% | "
-            f"📈 {record.get('up_score', '?')}/18 "
-            f"📉 {record.get('down_score', '?')}/18\n"
-
-            f"   💰 "
-            f"{format_price(safe_float(record.get('entry_price')))}\n"
-
-            f"   ⏰ "
-            f"{record.get('entry_time', '?')}"
-        )
-
-        lines.append(
-            "━━━━━━━━━━━━━━━━━━"
+            f"{icon} {item['symbol']} "
+            f"{item['trade_type']}\n"
+            f"   {direction} | "
+            f"{item['score']}/20 | "
+            f"{item['confidence']}%\n"
+            f"   Result: {item['result']}"
         )
 
     await update.message.reply_text(
-        "\n".join(lines)
+        "\n".join(lines),
+        parse_mode="Markdown"
     )
 
 
@@ -3253,68 +2363,84 @@ async def win_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    cycle = get_active_cycle()
+    global cycle
 
-    if not cycle["active"]:
+    with cycle_lock:
 
-        await update.message.reply_text(
-            "ℹ️ لا توجد صفقة نشطة."
-        )
+        if not cycle["pending"]:
 
-        return
+            await update.message.reply_text(
+                "⚠️ لا توجد صفقة معلقة حالياً."
+            )
 
-    if not cycle["pending_result"]:
+            return
 
-        await update.message.reply_text(
-            "ℹ️ لا توجد صفقة تنتظر النتيجة."
-        )
+        trade_type = cycle["trade_type"]
 
-        return
+        symbol = cycle["symbol"]
 
-    trade_type = cycle["trade_type"]
+        direction = cycle["direction"]
 
-    update_current_trade_result("WIN")
+        # ----------------------------------------------------
+        # Record stats
+        # ----------------------------------------------------
 
-    stats_data["wins"] += 1
+        if trade_type == "BASE":
 
-    if trade_type == "BASE":
+            stats["base_win"] += 1
 
-        stats_data["base_wins"] += 1
+        elif trade_type == "RECOVERY":
 
-        text = (
+            stats["recovery_win"] += 1
 
-            "🟢 BASE WIN\n\n"
+        # ----------------------------------------------------
+        # Update history
+        # ----------------------------------------------------
 
-            "📚 تم تسجيل الصفقة: WIN\n\n"
+        with data_lock:
 
-            "🏁 انتهت الدورة بنجاح.\n\n"
+            for item in reversed(history):
 
-            "🔎 البحث عن أفضل صفقة جديدة."
-        )
+                if (
+                    item["result"] == "PENDING"
+                    and item["symbol"] == symbol
+                    and item["trade_type"] == trade_type
+                ):
 
-    else:
+                    item["result"] = "WIN"
 
-        stats_data["recovery_wins"] += 1
+                    break
 
-        text = (
+        # ----------------------------------------------------
+        # CLOSE CYCLE
+        # ----------------------------------------------------
 
-            "🟢 RECOVERY WIN\n\n"
+        cycle["active"] = False
 
-            "📚 تم تسجيل Recovery: WIN\n\n"
+        cycle["trade_type"] = None
 
-            "💰 تم تعويض خسارة BASE.\n\n"
+        cycle["symbol"] = None
 
-            "🏁 انتهت الدورة.\n"
+        cycle["direction"] = None
 
-            "🔎 البحث عن أفضل صفقة جديدة."
-        )
+        cycle["pending"] = False
 
-    reset_cycle()
+        cycle["recovery_used"] = False
 
-    await update.message.reply_text(text)
+        cycle["setup_key"] = None
+
+        cycle["last_signal"] = None
+
+    await update.message.reply_text(
+        f"🟢 *{trade_type} WIN*\n\n"
+        f"📊 {symbol} | {direction}\n\n"
+        "✅ الدورة انتهت.\n"
+        "🔎 البوت الآن يبحث عن أقوى فرصة جديدة.",
+        parse_mode="Markdown"
+    )
 
 
 # ============================================================
@@ -3326,80 +2452,159 @@ async def loss_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    cycle = get_active_cycle()
+    global cycle
 
-    if not cycle["active"]:
+    with cycle_lock:
 
-        await update.message.reply_text(
-            "ℹ️ لا توجد صفقة نشطة."
-        )
+        if not cycle["pending"]:
 
-        return
+            await update.message.reply_text(
+                "⚠️ لا توجد صفقة معلقة حالياً."
+            )
 
-    if not cycle["pending_result"]:
+            return
 
-        await update.message.reply_text(
-            "ℹ️ لا توجد صفقة تنتظر النتيجة."
-        )
+        trade_type = cycle["trade_type"]
 
-        return
+        symbol = cycle["symbol"]
 
-    trade_type = cycle["trade_type"]
+        direction = cycle["direction"]
 
-    update_current_trade_result("LOSS")
+        # ----------------------------------------------------
+        # BASE LOSS
+        # ----------------------------------------------------
 
-    stats_data["losses"] += 1
+        if trade_type == "BASE":
 
-    # ========================================================
-    # BASE LOSS
-    # ========================================================
+            stats["base_loss"] += 1
+
+            with data_lock:
+
+                for item in reversed(history):
+
+                    if (
+                        item["result"] == "PENDING"
+                        and item["symbol"] == symbol
+                        and item["trade_type"] == "BASE"
+                    ):
+
+                        item["result"] = "LOSS"
+
+                        break
+
+            # ------------------------------------------------
+            # Convert cycle to recovery
+            # ------------------------------------------------
+
+            cycle["trade_type"] = "RECOVERY"
+
+            cycle["pending"] = False
+
+            cycle["recovery_used"] = False
+
+            cycle["last_signal"] = None
+
+            # Same pair, fresh M1 data.
+            # Recovery must be independently validated.
+            recovery_symbol = symbol
+
+        # ----------------------------------------------------
+        # RECOVERY LOSS
+        # ----------------------------------------------------
+
+        else:
+
+            stats["recovery_loss"] += 1
+
+            with data_lock:
+
+                for item in reversed(history):
+
+                    if (
+                        item["result"] == "PENDING"
+                        and item["symbol"] == symbol
+                        and item["trade_type"] == "RECOVERY"
+                    ):
+
+                        item["result"] = "LOSS"
+
+                        break
+
+            # END ENTIRE CYCLE
+
+            cycle["active"] = False
+
+            cycle["trade_type"] = None
+
+            cycle["symbol"] = None
+
+            cycle["direction"] = None
+
+            cycle["pending"] = False
+
+            cycle["recovery_used"] = False
+
+            cycle["setup_key"] = None
+
+            cycle["last_signal"] = None
+
+            recovery_symbol = None
+
+    # --------------------------------------------------------
+    # BASE LOSS -> ONE RECOVERY
+    # --------------------------------------------------------
 
     if trade_type == "BASE":
 
-        stats_data["base_losses"] += 1
-
-        start_recovery_cycle()
-
         await update.message.reply_text(
-
-            "🔴 BASE LOSS\n\n"
-
-            "📚 تم تسجيل الصفقة: LOSS\n\n"
-
-            "🔁 Recovery 1/1 مسموح.\n\n"
-
-            "🎯 سيتم البحث عن Recovery واحدة فقط.\n"
-
-            "⏳ بعدها سأتوقف وأنتظر /win أو /loss.\n\n"
-
-            "🚫 لا توجد Recovery ثانية."
+            "🔴 *BASE LOSS*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {symbol} | {direction}\n\n"
+            "♻️ Recovery 1/1 مسموحة.\n"
+            "🔍 سيتم فحص الحركة الجديدة بدقة.\n"
+            "⚠️ لن يتم إرسال Recovery إذا كانت الشروط ضعيفة.",
+            parse_mode="Markdown"
         )
 
-        return
+        # Give MT4 data a moment to refresh.
+        await asyncio.sleep(2)
 
-    # ========================================================
-    # RECOVERY LOSS
-    # ========================================================
+        # Run recovery outside Telegram handler state lock.
+        def recovery_worker():
 
-    stats_data["recovery_losses"] += 1
+            if not analysis_lock.acquire(
+                blocking=False
+            ):
+                logger.info(
+                    "Recovery analysis already running."
+                )
+                return
 
-    reset_cycle()
+            try:
+                analyze_and_send_recovery()
 
-    await update.message.reply_text(
+            finally:
+                analysis_lock.release()
 
-        "🔴 RECOVERY LOSS\n\n"
+        threading.Thread(
+            target=recovery_worker,
+            daemon=True
+        ).start()
 
-        "📚 تم تسجيل Recovery: LOSS\n\n"
+    else:
 
-        "⛔ انتهت الدورة.\n\n"
-
-        "🚫 لا توجد Recovery ثانية.\n"
-
-        "🔎 سيتم البحث عن أفضل صفقة جديدة."
-    )
+        await update.message.reply_text(
+            "🔴 *RECOVERY LOSS*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {symbol} | {direction}\n\n"
+            "⛔ Recovery 1/1 انتهت.\n"
+            "❌ لا توجد Recovery ثانية.\n"
+            "🔎 الدورة انتهت، والبحث القادم سيكون عن صفقة BASE جديدة.",
+            parse_mode="Markdown"
+        )
 
 
 # ============================================================
@@ -3411,38 +2616,43 @@ async def reset_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    for key in stats_data:
-        stats_data[key] = 0
+    global cycle
 
-    reset_cycle()
+    with cycle_lock:
 
-    global last_signal_sent_at
-    global current_trade_id
+        cycle["active"] = False
 
-    last_signal_sent_at = 0.0
+        cycle["trade_type"] = None
 
-    current_trade_id = None
+        cycle["symbol"] = None
 
-    with setup_memory_lock:
-        recent_setups.clear()
+        cycle["direction"] = None
 
-    with history_lock:
-        trade_history.clear()
+        cycle["pending"] = False
 
-    save_history()
+        cycle["recovery_used"] = False
+
+        cycle["generating"] = False
+
+        cycle["setup_key"] = None
+
+        cycle["last_signal"] = None
+
+    with data_lock:
+
+        history.clear()
+
+        stats["base_win"] = 0
+        stats["base_loss"] = 0
+        stats["recovery_win"] = 0
+        stats["recovery_loss"] = 0
 
     await update.message.reply_text(
-
-        "♻️ تم التصفير:\n\n"
-
-        "• الإحصائيات\n"
-        "• الدورة\n"
-        "• Recovery\n"
-        "• ذاكرة الإشارات\n"
-        "• سجل الصفقات"
+        "♻️ تم Reset بالكامل.\n"
+        "🎯 البوت جاهز للبحث عن أقوى BASE جديدة."
     )
 
 
@@ -3455,51 +2665,72 @@ async def mt4status_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    with mt4_lock:
+    with data_lock:
 
-        data_copy = {
+        if not data_store:
 
-            symbol: dict(timeframes)
-
-            for symbol, timeframes
-            in mt4_data.items()
-        }
-
-    if not data_copy:
-
-        await update.message.reply_text(
-            "📡 لا توجد بيانات MT4."
-        )
-
-        return
-
-    lines = [
-
-        "📡 MT4 STATUS",
-
-        "━━━━━━━━━━━━━━━━━━"
-    ]
-
-    for symbol, timeframes in data_copy.items():
-
-        for timeframe, candles in timeframes.items():
-
-            lines.append(
-
-                f"📊 {symbol} {timeframe}: "
-                f"{len(candles)} candles"
+            await update.message.reply_text(
+                "🔴 لا توجد بيانات MT4 حتى الآن."
             )
 
+            return
+
+        lines = [
+            "📡 *MT4 STATUS*",
+            "━━━━━━━━━━━━━━━━━━"
+        ]
+
+        for symbol, info in data_store.items():
+
+            candles = len(
+                info.get("candles", [])
+            )
+
+            age = (
+                now_timestamp()
+                - info.get(
+                    "received_at",
+                    now_timestamp()
+                )
+            )
+
+            status = (
+                "🟢"
+                if age <= MAX_DATA_AGE_SECONDS
+                else "🔴"
+            )
+
+            lines.append(
+                f"{status} {symbol} | "
+                f"M1 | candles={candles} | "
+                f"age={age:.0f}s"
+            )
+
+    with cycle_lock:
+
+        lines.append("")
+
+        lines.append(
+            f"🔄 Cycle: "
+            f"{cycle['trade_type'] or 'NONE'}"
+        )
+
+        lines.append(
+            f"⏳ Pending: "
+            f"{'YES' if cycle['pending'] else 'NO'}"
+        )
+
     await update.message.reply_text(
-        "\n".join(lines)
+        "\n".join(lines),
+        parse_mode="Markdown"
     )
 
 
 # ============================================================
-# ANALYZE
+# MANUAL ANALYZE
 # ============================================================
 
 async def analyze_command(
@@ -3507,144 +2738,129 @@ async def analyze_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    if not await owner_only(update):
         return
 
-    cycle = get_active_cycle()
+    # --------------------------------------------------------
+    # HARD LOCK
+    # --------------------------------------------------------
 
-    if cycle["active"]:
+    with cycle_lock:
 
-        if cycle["pending_result"]:
+        if cycle["pending"]:
 
             await update.message.reply_text(
-
-                "⏳ توجد صفقة نشطة.\n\n"
-
-                "أرسل /win أو /loss أولًا."
+                "⛔ توجد صفقة معلقة.\n"
+                "استعمل /win أو /loss أولاً."
             )
 
             return
 
-        if cycle["recovery_ready"]:
+        if cycle["active"]:
 
             await update.message.reply_text(
-
-                "🔁 Recovery 1/1 جاهزة.\n\n"
-
-                "لا حاجة لإرسال /analyze."
+                "⛔ توجد دورة نشطة.\n"
+                "لا يمكن إنشاء BASE جديدة الآن."
             )
 
             return
 
-    best = choose_best_pair()
+    args = context.args
 
-    if not best:
+    if not args:
 
         await update.message.reply_text(
-            "⏳ لا توجد بيانات M1 كافية."
+            "استعمل:\n"
+            "/analyze EURUSD M1"
         )
 
         return
 
-    await update.message.reply_text(
+    symbol = args[0].upper()
 
-        "🔎 أفضل مرشح حاليًا:\n\n"
-
-        f"📊 {best['symbol']} | M1\n"
-
-        f"📈 Pre-score: {best['score']}\n"
-
-        f"🧭 Bias: {best['direction']}\n\n"
-
-        "🧠 سيتم إرسال صفقة واحدة فقط."
+    timeframe = (
+        args[1].upper()
+        if len(args) > 1
+        else "M1"
     )
 
-    thread = threading.Thread(
+    if timeframe != "M1":
 
-        target=auto_analyze_pair,
-
-        args=(
-            best["symbol"],
-            ANALYSIS_TIMEFRAME,
-        ),
-
-        daemon=True,
-    )
-
-    thread.start()
-
-
-# ============================================================
-# TEXT / PHOTO
-# ============================================================
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-        return
-
-    text = update.message.text or ""
-
-    if text.startswith("/"):
-        return
-
-    await update.message.reply_text(
-
-        "📡 النظام يعمل من بيانات MT4 المباشرة.\n\n"
-
-        "MT4 M1 → Render → Gemini → Telegram\n\n"
-
-        "🎯 صفقة واحدة فقط في كل دورة."
-    )
-
-
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-        return
-
-    await update.message.reply_text(
-
-        "📸 التحليل الحالي لا يعتمد على الصور.\n\n"
-
-        "📡 MT4 M1 → Render → Gemini"
-    )
-
-
-# ============================================================
-# TELEGRAM ERROR
-# ============================================================
-
-async def telegram_error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    logger.error(
-        "Telegram error: %s",
-        context.error
-    )
-
-
-# ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
-
-def build_telegram_application():
-
-    global telegram_application
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN is missing"
+        await update.message.reply_text(
+            "⛔ هذا الإصدار يعمل على M1 فقط."
         )
+
+        return
+
+    with data_lock:
+
+        info = data_store.get(symbol)
+
+    if not info:
+
+        await update.message.reply_text(
+            f"🔴 لا توجد بيانات MT4 لـ {symbol}."
+        )
+
+        return
+
+    candles = info.get("candles", [])
+
+    if len(candles) < MIN_CANDLES:
+
+        await update.message.reply_text(
+            f"⚠️ {symbol} عنده فقط "
+            f"{len(candles)} شمعة.\n"
+            f"المطلوب {MIN_CANDLES}."
+        )
+
+        return
+
+    analysis = validate_signal(
+        symbol,
+        candles
+    )
+
+    if not analysis:
+
+        await update.message.reply_text(
+            f"❌ {symbol} لا يملك حالياً "
+            f"إشارة بجودة {MIN_SCORE}/20 أو أكثر.\n\n"
+            "البوت لن يجبر السوق على إعطاء صفقة."
+        )
+
+        return
+
+    sent = send_one_signal(
+        symbol,
+        candles,
+        analysis,
+        "BASE"
+    )
+
+    if sent:
+
+        await update.message.reply_text(
+            "✅ تم إرسال BASE واحدة فقط."
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "⚠️ لم يتم إرسال الإشارة."
+        )
+
+
+# ============================================================
+# TELEGRAM MAIN
+# ============================================================
+
+async def telegram_main():
+
+    global application
+    global telegram_loop
+
+    telegram_loop = asyncio.get_running_loop()
 
     application = (
         Application.builder()
@@ -3708,118 +2924,90 @@ def build_telegram_application():
         )
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo_handler
-        )
+    await application.initialize()
+
+    await application.start()
+
+    await application.updater.start_polling(
+        drop_pending_updates=True
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler
-        )
+    logger.info(
+        "Telegram polling started."
     )
 
-    application.add_error_handler(
-        telegram_error_handler
-    )
-
-    telegram_application = application
-
-    return application
+    # Keep loop alive
+    while True:
+        await asyncio.sleep(3600)
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
+
+def validate_config():
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN is missing."
+        )
+
+    if OWNER_ID <= 0:
+
+        raise RuntimeError(
+            "OWNER_ID is missing or invalid."
+        )
+
+    if not MT4_API_KEY:
+
+        logger.warning(
+            "MT4_API_KEY is not configured. "
+            "MT4 requests will be accepted without API authentication."
+        )
+
+    if not GEMINI_API_KEY:
+
+        logger.warning(
+            "GEMINI_API_KEY is not configured. "
+            "Technical engine will work without Gemini."
+        )
+
+    if not GEMINI_AVAILABLE:
+
+        logger.warning(
+            "google-genai is not installed. "
+            "Gemini refinement disabled."
+        )
+
 
 def main():
 
-    logger.info(
-        "========================================"
-    )
+    validate_config()
 
-    logger.info(
-        "Starting ZinoProSignalAI"
-    )
-
-    logger.info(
-        "Model: %s",
-        GEMINI_MODEL
-    )
-
-    logger.info(
-        "Port: %s",
-        PORT
-    )
-
-    logger.info(
-        "Timezone: Africa/Algiers"
-    )
-
-    logger.info(
-        "Analysis timeframe: M1"
-    )
-
-    logger.info(
-        "ONE SIGNAL PER CYCLE"
-    )
-
-    logger.info(
-        "Recovery limit: 1"
-    )
-
-    logger.info(
-        "========================================"
-    )
-
-    load_history()
-
-    # ========================================================
+    # --------------------------------------------------------
     # HTTP
-    # ========================================================
+    # --------------------------------------------------------
 
     http_thread = threading.Thread(
         target=start_http_server,
-        daemon=True,
+        daemon=True
     )
 
     http_thread.start()
 
-    # ========================================================
-    # BACKGROUND ANALYSIS
-    # ========================================================
-
-    analysis_thread = threading.Thread(
-        target=background_analysis_loop,
-        daemon=True,
-    )
-
-    analysis_thread.start()
-
-    # ========================================================
-    # TELEGRAM
-    # ========================================================
-
-    application = (
-        build_telegram_application()
-    )
-
     logger.info(
-        "Telegram bot starting"
+        "ZinoProSignalAI starting..."
     )
 
-    application.run_polling(
-        close_loop=False
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    asyncio.run(
+        telegram_main()
     )
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
