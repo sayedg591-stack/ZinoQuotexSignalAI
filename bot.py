@@ -1,6 +1,6 @@
+```python
 import os
 import json
-import math
 import time
 import asyncio
 import logging
@@ -51,13 +51,13 @@ GEMINI_MODEL = os.getenv(
 
 MT4_API_KEY = os.getenv("MT4_API_KEY", "").strip()
 
-# Backward compatibility
 if not MT4_API_KEY:
     MT4_API_KEY = os.getenv("ZINO_API_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
 TIMEZONE = ZoneInfo("Africa/Algiers")
+
 
 # ============================================================
 # TRADING CONFIG
@@ -69,28 +69,42 @@ MIN_CANDLES = 50
 
 ENTRY_DELAY_SECONDS = 60
 
-# Minimum deterministic score
-MIN_SCORE = 16
+# ------------------------------------------------------------
+# IMPORTANT:
+# Previous value 16 was too strict.
+# 13 gives the engine room to find good setups while the
+# mandatory EMA + RSI + ADX/DI alignment still protects it.
+# ------------------------------------------------------------
+
+MIN_SCORE = 13
 
 MAX_SCORE = 20
 
-# Signal cooldown after a completed cycle
-NEW_SIGNAL_COOLDOWN = 30
-
-# Data freshness
 MAX_DATA_AGE_SECONDS = 180
 
-# Only one recovery
 RECOVERY_LIMIT = 1
 
-# Don't repeatedly use exactly the same setup
-SETUP_REPEAT_BLOCK_SECONDS = 240
-
-# Maximum confidence shown
 MAX_CONFIDENCE = 89
 
-# Minimum confidence
 MIN_CONFIDENCE = 76
+
+# Minimum difference between UP and DOWN scores.
+MIN_SCORE_GAP = 2
+
+# Minimum ADX.
+MIN_ADX = 20.0
+
+# Strong ADX threshold.
+STRONG_ADX = 25.0
+
+# Avoid very weak/flat candles.
+MIN_CANDLE_RANGE_RATIO = 0.25
+
+# Avoid chasing giant candles.
+MAX_CANDLE_RANGE_RATIO = 2.8
+
+# Avoid a repeated exact setup.
+SETUP_REPEAT_BLOCK_SECONDS = 240
 
 
 # ============================================================
@@ -126,48 +140,29 @@ stats = {
     "recovery_loss": 0,
 }
 
-# ------------------------------------------------------------
+
+# ============================================================
 # ONE TRADE CYCLE
-# ------------------------------------------------------------
+# ============================================================
 
 cycle = {
     "active": False,
-
-    # BASE / RECOVERY
     "trade_type": None,
-
-    # symbol of current trade
     "symbol": None,
-
-    # direction
     "direction": None,
-
-    # current pending trade
     "pending": False,
-
-    # recovery already used?
     "recovery_used": False,
-
-    # generation in progress
     "generating": False,
-
-    # unique setup key
     "setup_key": None,
-
-    # last signal time
     "last_signal_time": 0,
-
-    # base information
     "base_symbol": None,
     "base_direction": None,
-
-    # last signal data
     "last_signal": None,
 }
 
 
 # ============================================================
-# TELEGRAM LOOP
+# TELEGRAM
 # ============================================================
 
 telegram_loop = None
@@ -203,10 +198,12 @@ def is_owner(update: Update):
 
 async def owner_only(update: Update):
     if not is_owner(update):
+
         if update.message:
             await update.message.reply_text(
                 "⛔ هذا الأمر متاح للمالك فقط."
             )
+
         return False
 
     return True
@@ -224,7 +221,10 @@ def clamp(value, low, high):
 
 
 def normalize_direction(direction):
-    direction = str(direction or "").upper().strip()
+
+    direction = str(
+        direction or ""
+    ).upper().strip()
 
     if direction in ("UP", "CALL", "BUY"):
         return "UP"
@@ -240,10 +240,12 @@ def normalize_direction(direction):
 # ============================================================
 
 def normalize_candle(c):
+
     if not isinstance(c, dict):
         return None
 
     try:
+
         t = int(
             c.get("time")
             or c.get("timestamp")
@@ -300,29 +302,34 @@ def normalize_candle(c):
 
 
 def normalize_candles(raw):
+
     if not isinstance(raw, list):
         return []
 
     result = []
 
     for c in raw:
+
         nc = normalize_candle(c)
 
         if nc:
             result.append(nc)
 
-    result.sort(key=lambda x: x["time"])
+    result.sort(
+        key=lambda x: x["time"]
+    )
 
-    # Remove duplicate timestamps
     clean = []
 
     seen = set()
 
     for c in result:
+
         if c["time"] in seen:
             continue
 
         seen.add(c["time"])
+
         clean.append(c)
 
     return clean
@@ -333,14 +340,18 @@ def normalize_candles(raw):
 # ============================================================
 
 def ema(values, period):
+
     if len(values) < period:
         return None
 
     multiplier = 2.0 / (period + 1.0)
 
-    result = sum(values[:period]) / period
+    result = sum(
+        values[:period]
+    ) / period
 
     for value in values[period:]:
+
         result = (
             (value - result) * multiplier
             + result
@@ -349,32 +360,8 @@ def ema(values, period):
     return result
 
 
-def ema_series(values, period):
-    if len(values) < period:
-        return []
-
-    multiplier = 2.0 / (period + 1.0)
-
-    first = sum(values[:period]) / period
-
-    result = [first]
-
-    prev = first
-
-    for value in values[period:]:
-        current = (
-            (value - prev) * multiplier
-            + prev
-        )
-
-        result.append(current)
-
-        prev = current
-
-    return result
-
-
 def rsi(values, period=14):
+
     if len(values) < period + 1:
         return None
 
@@ -382,26 +369,50 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
+
+        diff = (
+            values[i]
+            - values[i - 1]
+        )
 
         if diff > 0:
+
             gains.append(diff)
-            losses.append(0)
+            losses.append(0.0)
+
         else:
-            gains.append(0)
+
+            gains.append(0.0)
             losses.append(abs(diff))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    for i in range(period, len(gains)):
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
+
         avg_gain = (
-            (avg_gain * (period - 1) + gains[i])
+            (
+                avg_gain * (period - 1)
+                + gains[i]
+            )
             / period
         )
 
         avg_loss = (
-            (avg_loss * (period - 1) + losses[i])
+            (
+                avg_loss * (period - 1)
+                + losses[i]
+            )
             / period
         )
 
@@ -410,22 +421,44 @@ def rsi(values, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100.0 - (100.0 / (1.0 + rs))
+    return (
+        100.0
+        - (
+            100.0
+            / (1.0 + rs)
+        )
+    )
 
 
 def true_ranges(candles):
+
     result = []
 
     for i, c in enumerate(candles):
+
         if i == 0:
-            tr = c["high"] - c["low"]
+
+            tr = (
+                c["high"]
+                - c["low"]
+            )
+
         else:
-            prev_close = candles[i - 1]["close"]
+
+            prev_close = (
+                candles[i - 1]["close"]
+            )
 
             tr = max(
                 c["high"] - c["low"],
-                abs(c["high"] - prev_close),
-                abs(c["low"] - prev_close),
+                abs(
+                    c["high"]
+                    - prev_close
+                ),
+                abs(
+                    c["low"]
+                    - prev_close
+                ),
             )
 
         result.append(tr)
@@ -434,16 +467,24 @@ def true_ranges(candles):
 
 
 def atr(candles, period=14):
+
     if len(candles) < period + 1:
         return None
 
     trs = true_ranges(candles)
 
-    value = sum(trs[:period]) / period
+    value = (
+        sum(trs[:period])
+        / period
+    )
 
     for tr in trs[period:]:
+
         value = (
-            (value * (period - 1) + tr)
+            (
+                value * (period - 1)
+                + tr
+            )
             / period
         )
 
@@ -451,81 +492,156 @@ def atr(candles, period=14):
 
 
 def adx_di(candles, period=14):
+
     if len(candles) < period * 2 + 5:
         return None
 
     tr_values = []
+
     plus_dm = []
+
     minus_dm = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
         current = candles[i]
+
         prev = candles[i - 1]
 
-        up_move = current["high"] - prev["high"]
-        down_move = prev["low"] - current["low"]
+        up_move = (
+            current["high"]
+            - prev["high"]
+        )
 
-        if up_move > down_move and up_move > 0:
+        down_move = (
+            prev["low"]
+            - current["low"]
+        )
+
+        if (
+            up_move > down_move
+            and up_move > 0
+        ):
+
             plus = up_move
+
         else:
+
             plus = 0.0
 
-        if down_move > up_move and down_move > 0:
+        if (
+            down_move > up_move
+            and down_move > 0
+        ):
+
             minus = down_move
+
         else:
+
             minus = 0.0
 
         tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - prev["close"]),
-            abs(current["low"] - prev["close"])
+            current["high"]
+            - current["low"],
+
+            abs(
+                current["high"]
+                - prev["close"]
+            ),
+
+            abs(
+                current["low"]
+                - prev["close"]
+            ),
         )
 
         tr_values.append(tr)
+
         plus_dm.append(plus)
+
         minus_dm.append(minus)
 
     if len(tr_values) < period:
         return None
 
-    atr_val = sum(tr_values[:period]) / period
-    plus_val = sum(plus_dm[:period]) / period
-    minus_val = sum(minus_dm[:period]) / period
+    atr_val = (
+        sum(tr_values[:period])
+        / period
+    )
+
+    plus_val = (
+        sum(plus_dm[:period])
+        / period
+    )
+
+    minus_val = (
+        sum(minus_dm[:period])
+        / period
+    )
 
     dx_values = []
 
-    for i in range(period, len(tr_values)):
+    for i in range(
+        period,
+        len(tr_values)
+    ):
 
         atr_val = (
-            (atr_val * (period - 1) + tr_values[i])
+            (
+                atr_val * (period - 1)
+                + tr_values[i]
+            )
             / period
         )
 
         plus_val = (
-            (plus_val * (period - 1) + plus_dm[i])
+            (
+                plus_val * (period - 1)
+                + plus_dm[i]
+            )
             / period
         )
 
         minus_val = (
-            (minus_val * (period - 1) + minus_dm[i])
+            (
+                minus_val * (period - 1)
+                + minus_dm[i]
+            )
             / period
         )
 
         if atr_val <= 0:
             continue
 
-        plus_di = 100.0 * plus_val / atr_val
-        minus_di = 100.0 * minus_val / atr_val
+        plus_di = (
+            100.0
+            * plus_val
+            / atr_val
+        )
 
-        denominator = plus_di + minus_di
+        minus_di = (
+            100.0
+            * minus_val
+            / atr_val
+        )
+
+        denominator = (
+            plus_di
+            + minus_di
+        )
 
         if denominator <= 0:
             continue
 
         dx = (
             100.0
-            * abs(plus_di - minus_di)
+            * abs(
+                plus_di
+                - minus_di
+            )
             / denominator
         )
 
@@ -534,19 +650,35 @@ def adx_di(candles, period=14):
     if len(dx_values) < period:
         return None
 
-    adx_val = sum(dx_values[:period]) / period
+    adx_val = (
+        sum(dx_values[:period])
+        / period
+    )
 
     for value in dx_values[period:]:
+
         adx_val = (
-            (adx_val * (period - 1) + value)
+            (
+                adx_val * (period - 1)
+                + value
+            )
             / period
         )
 
     if atr_val <= 0:
         return None
 
-    plus_di = 100.0 * plus_val / atr_val
-    minus_di = 100.0 * minus_val / atr_val
+    plus_di = (
+        100.0
+        * plus_val
+        / atr_val
+    )
+
+    minus_di = (
+        100.0
+        * minus_val
+        / atr_val
+    )
 
     return {
         "adx": adx_val,
@@ -560,11 +692,19 @@ def adx_di(candles, period=14):
 # ============================================================
 
 def candle_features(c):
-    body = abs(c["close"] - c["open"])
 
-    total = c["high"] - c["low"]
+    body = abs(
+        c["close"]
+        - c["open"]
+    )
+
+    total = (
+        c["high"]
+        - c["low"]
+    )
 
     if total <= 0:
+
         return {
             "body": 0,
             "range": 0,
@@ -573,9 +713,21 @@ def candle_features(c):
             "lower_wick": 0,
         }
 
-    upper = c["high"] - max(c["open"], c["close"])
+    upper = (
+        c["high"]
+        - max(
+            c["open"],
+            c["close"]
+        )
+    )
 
-    lower = min(c["open"], c["close"]) - c["low"]
+    lower = (
+        min(
+            c["open"],
+            c["close"]
+        )
+        - c["low"]
+    )
 
     return {
         "body": body,
@@ -586,43 +738,74 @@ def candle_features(c):
     }
 
 
-def recent_average_range(candles, count=14):
+def recent_average_range(
+    candles,
+    count=14
+):
+
     subset = candles[-count:]
 
     if not subset:
         return 0
 
-    return sum(
-        c["high"] - c["low"]
-        for c in subset
-    ) / len(subset)
+    return (
+        sum(
+            c["high"]
+            - c["low"]
+            for c in subset
+        )
+        / len(subset)
+    )
 
 
 def market_structure(candles):
+
     if len(candles) < 12:
         return "NEUTRAL"
 
     recent = candles[-8:]
 
     first = recent[:4]
+
     last = recent[4:]
 
-    first_high = max(c["high"] for c in first)
-    first_low = min(c["low"] for c in first)
+    first_high = max(
+        c["high"]
+        for c in first
+    )
 
-    last_high = max(c["high"] for c in last)
-    last_low = min(c["low"] for c in last)
+    first_low = min(
+        c["low"]
+        for c in first
+    )
 
-    if last_high > first_high and last_low > first_low:
+    last_high = max(
+        c["high"]
+        for c in last
+    )
+
+    last_low = min(
+        c["low"]
+        for c in last
+    )
+
+    if (
+        last_high > first_high
+        and last_low > first_low
+    ):
         return "UP"
 
-    if last_high < first_high and last_low < first_low:
+    if (
+        last_high < first_high
+        and last_low < first_low
+    ):
         return "DOWN"
 
     return "NEUTRAL"
 
 
 def breakout_status(candles):
+
     if len(candles) < 12:
         return "NONE"
 
@@ -631,11 +814,13 @@ def breakout_status(candles):
     previous = candles[-9:-1]
 
     previous_high = max(
-        c["high"] for c in previous
+        c["high"]
+        for c in previous
     )
 
     previous_low = min(
-        c["low"] for c in previous
+        c["low"]
+        for c in previous
     )
 
     if last["close"] > previous_high:
@@ -648,6 +833,7 @@ def breakout_status(candles):
 
 
 def liquidity_status(candles):
+
     if len(candles) < 12:
         return "NONE"
 
@@ -655,26 +841,39 @@ def liquidity_status(candles):
 
     previous = candles[-9:-1]
 
-    high = max(c["high"] for c in previous)
+    high = max(
+        c["high"]
+        for c in previous
+    )
 
-    low = min(c["low"] for c in previous)
+    low = min(
+        c["low"]
+        for c in previous
+    )
 
     features = candle_features(last)
 
-    # Sweep above high then close below
-    if last["high"] > high and last["close"] < high:
-        if features["upper_wick"] > features["body"]:
-            return "DOWN"
+    if (
+        last["high"] > high
+        and last["close"] < high
+        and features["upper_wick"]
+        > features["body"]
+    ):
+        return "DOWN"
 
-    # Sweep below low then close above
-    if last["low"] < low and last["close"] > low:
-        if features["lower_wick"] > features["body"]:
-            return "UP"
+    if (
+        last["low"] < low
+        and last["close"] > low
+        and features["lower_wick"]
+        > features["body"]
+    ):
+        return "UP"
 
     return "NONE"
 
 
 def abnormal_candle(candles):
+
     if len(candles) < 16:
         return False
 
@@ -691,14 +890,17 @@ def abnormal_candle(candles):
         - candles[-1]["low"]
     )
 
-    # Avoid extreme M1 spikes
-    if last_range > avg_range * 2.8:
+    if (
+        last_range
+        > avg_range * MAX_CANDLE_RANGE_RATIO
+    ):
         return True
 
     return False
 
 
 def candle_direction(c):
+
     if c["close"] > c["open"]:
         return "UP"
 
@@ -717,16 +919,35 @@ def calculate_analysis(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
-    closes = [c["close"] for c in candles]
+    closes = [
+        c["close"]
+        for c in candles
+    ]
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
+    ema9 = ema(
+        closes,
+        9
+    )
 
-    rsi14 = rsi(closes, 14)
+    ema21 = ema(
+        closes,
+        21
+    )
 
-    adx_data = adx_di(candles, 14)
+    rsi14 = rsi(
+        closes,
+        14
+    )
 
-    atr14 = atr(candles, 14)
+    adx_data = adx_di(
+        candles,
+        14
+    )
+
+    atr14 = atr(
+        candles,
+        14
+    )
 
     if (
         ema9 is None
@@ -739,180 +960,282 @@ def calculate_analysis(candles):
 
     last = candles[-1]
 
-    structure = market_structure(candles)
+    structure = market_structure(
+        candles
+    )
 
-    breakout = breakout_status(candles)
+    breakout = breakout_status(
+        candles
+    )
 
-    liquidity = liquidity_status(candles)
+    liquidity = liquidity_status(
+        candles
+    )
 
-    candle_dir = candle_direction(last)
+    candle_dir = candle_direction(
+        last
+    )
 
-    candle = candle_features(last)
+    candle = candle_features(
+        last
+    )
 
-    avg_range = recent_average_range(candles, 14)
+    avg_range = recent_average_range(
+        candles,
+        14
+    )
 
     if avg_range <= 0:
         return None
 
-    # --------------------------------------------------------
-    # Determine candidate directions
-    # --------------------------------------------------------
-
     up_score = 0
+
     down_score = 0
 
-    # --------------------------------------------------------
-    # EMA 9/21 = 4 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. EMA 9/21 = 4 points
+    # ========================================================
 
     if ema9 > ema21:
+
         up_score += 3
 
     elif ema9 < ema21:
+
         down_score += 3
 
-    # Price alignment
-    if last["close"] > ema9 and last["close"] > ema21:
+    if (
+        last["close"] > ema9
+        and last["close"] > ema21
+    ):
+
         up_score += 1
 
-    elif last["close"] < ema9 and last["close"] < ema21:
+    elif (
+        last["close"] < ema9
+        and last["close"] < ema21
+    ):
+
         down_score += 1
 
-    # --------------------------------------------------------
-    # RSI = 3 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. RSI14 = 3 points
+    # ========================================================
 
     if 53 <= rsi14 <= 68:
+
         up_score += 3
 
     elif 32 <= rsi14 <= 47:
+
         down_score += 3
 
     elif rsi14 > 50:
+
         up_score += 1
 
     elif rsi14 < 50:
+
         down_score += 1
 
-    # --------------------------------------------------------
-    # ADX + DI = 4 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. ADX + DI = 4 points
+    # ========================================================
 
     adx_value = adx_data["adx"]
+
     plus_di = adx_data["plus_di"]
+
     minus_di = adx_data["minus_di"]
 
     if adx_value >= 25:
 
         if plus_di > minus_di:
+
             up_score += 4
 
         elif minus_di > plus_di:
+
             down_score += 4
 
     elif adx_value >= 20:
 
         if plus_di > minus_di:
+
             up_score += 2
 
         elif minus_di > plus_di:
+
             down_score += 2
 
-    # --------------------------------------------------------
-    # STRUCTURE = 3 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. MARKET STRUCTURE = 3 points
+    # ========================================================
 
     if structure == "UP":
+
         up_score += 3
 
     elif structure == "DOWN":
+
         down_score += 3
 
-    # --------------------------------------------------------
-    # BREAKOUT = 2 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. BREAKOUT = 2 points
+    # ========================================================
 
     if breakout == "UP":
+
         up_score += 2
 
     elif breakout == "DOWN":
+
         down_score += 2
 
-    # --------------------------------------------------------
-    # CANDLE = 2 points
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. CANDLE = 2 points
+    # ========================================================
 
     if candle["body_ratio"] >= 0.55:
 
         if candle_dir == "UP":
+
             up_score += 2
 
         elif candle_dir == "DOWN":
+
             down_score += 2
 
     elif candle["body_ratio"] >= 0.35:
 
         if candle_dir == "UP":
+
             up_score += 1
 
         elif candle_dir == "DOWN":
+
             down_score += 1
 
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. LIQUIDITY = 2 points
+    # ========================================================
 
-    # Liquidity sweep is a directional confirmation.
     if liquidity == "UP":
+
         up_score += 2
 
     elif liquidity == "DOWN":
+
         down_score += 2
 
-    # --------------------------------------------------------
-    # ABNORMAL MOVE
-    # --------------------------------------------------------
+    # ========================================================
+    # ABNORMAL / VOLATILITY
+    # ========================================================
 
-    abnormal = abnormal_candle(candles)
-
-    # --------------------------------------------------------
-    # Volatility quality
-    # --------------------------------------------------------
+    abnormal = abnormal_candle(
+        candles
+    )
 
     volatility_ok = True
 
     if atr14 <= 0:
         volatility_ok = False
 
-    # If candle is extremely tiny, avoid dead market.
     if (
-        candle["range"] < avg_range * 0.25
+        candle["range"]
+        < avg_range
+        * MIN_CANDLE_RANGE_RATIO
     ):
         volatility_ok = False
 
-    # If candle is huge, avoid chasing.
-    if candle["range"] > avg_range * 2.8:
+    if (
+        candle["range"]
+        > avg_range
+        * MAX_CANDLE_RANGE_RATIO
+    ):
         volatility_ok = False
 
-    # --------------------------------------------------------
-    # Direction
-    # --------------------------------------------------------
+    # ========================================================
+    # DETERMINE DIRECTION
+    # ========================================================
 
     if up_score > down_score:
+
         direction = "UP"
+
         raw_score = up_score
 
     elif down_score > up_score:
+
         direction = "DOWN"
+
         raw_score = down_score
 
     else:
+
         direction = None
+
         raw_score = 0
 
-    # --------------------------------------------------------
-    # Conflict filters
-    # --------------------------------------------------------
+    # ========================================================
+    # CORE INDICATOR ALIGNMENT
+    #
+    # This is the most important change.
+    #
+    # EMA + RSI + ADX/DI must agree.
+    # Price action is confirmation, not a mandatory condition.
+    # ========================================================
+
+    core_aligned = False
+
+    if direction == "UP":
+
+        ema_ok = (
+            ema9 > ema21
+        )
+
+        rsi_ok = (
+            rsi14 >= 50
+        )
+
+        di_ok = (
+            plus_di > minus_di
+        )
+
+        core_aligned = (
+            ema_ok
+            and rsi_ok
+            and di_ok
+            and adx_value >= MIN_ADX
+        )
+
+    elif direction == "DOWN":
+
+        ema_ok = (
+            ema9 < ema21
+        )
+
+        rsi_ok = (
+            rsi14 <= 50
+        )
+
+        di_ok = (
+            minus_di > plus_di
+        )
+
+        core_aligned = (
+            ema_ok
+            and rsi_ok
+            and di_ok
+            and adx_value >= MIN_ADX
+        )
+
+    # ========================================================
+    # CONFLICT
+    #
+    # We no longer reject simply because structure is neutral.
+    # We reject only real contradictions.
+    # ========================================================
 
     conflict = False
 
@@ -921,15 +1244,17 @@ def calculate_analysis(candles):
         if ema9 <= ema21:
             conflict = True
 
-        if plus_di <= minus_di and adx_value >= 25:
-            conflict = True
-
         if rsi14 < 50:
             conflict = True
 
+        if plus_di <= minus_di:
+            conflict = True
+
+        # Strong opposite structure is a real warning.
         if structure == "DOWN":
             conflict = True
 
+        # Strong opposite liquidity sweep is a warning.
         if liquidity == "DOWN":
             conflict = True
 
@@ -938,10 +1263,10 @@ def calculate_analysis(candles):
         if ema9 >= ema21:
             conflict = True
 
-        if minus_di <= plus_di and adx_value >= 25:
+        if rsi14 > 50:
             conflict = True
 
-        if rsi14 > 50:
+        if minus_di <= plus_di:
             conflict = True
 
         if structure == "UP":
@@ -956,32 +1281,44 @@ def calculate_analysis(candles):
     if not volatility_ok:
         conflict = True
 
-    # --------------------------------------------------------
-    # Confidence
-    # --------------------------------------------------------
+    # ========================================================
+    # CONFIDENCE
+    # ========================================================
 
     confidence = 0
 
     if direction:
 
-        gap = abs(up_score - down_score)
+        gap = abs(
+            up_score
+            - down_score
+        )
 
         confidence = (
             72
-            + raw_score * 0.75
-            + gap * 1.0
+            + raw_score * 0.70
+            + gap * 0.90
         )
 
-        # ADX strength bonus
         if adx_value >= 30:
+
             confidence += 3
 
         elif adx_value >= 25:
+
             confidence += 2
 
-        # Strong body bonus
         if candle["body_ratio"] >= 0.65:
+
             confidence += 2
+
+        if structure == direction:
+
+            confidence += 1
+
+        if breakout == direction:
+
+            confidence += 1
 
         confidence = int(
             clamp(
@@ -993,37 +1330,53 @@ def calculate_analysis(candles):
 
     return {
         "direction": direction,
+
         "up_score": up_score,
+
         "down_score": down_score,
+
         "score": raw_score,
 
         "confidence": confidence,
 
         "ema9": ema9,
+
         "ema21": ema21,
 
         "rsi": rsi14,
 
         "adx": adx_value,
+
         "plus_di": plus_di,
+
         "minus_di": minus_di,
 
         "atr": atr14,
 
         "structure": structure,
+
         "breakout": breakout,
+
         "liquidity": liquidity,
 
         "candle_direction": candle_dir,
+
         "body_ratio": candle["body_ratio"],
+
         "candle_range": candle["range"],
+
         "average_range": avg_range,
 
         "abnormal": abnormal,
+
         "volatility_ok": volatility_ok,
+
+        "core_aligned": core_aligned,
+
         "conflict": conflict,
 
         "price": last["close"],
+
         "candle_time": last["time"],
     }
 
@@ -1032,17 +1385,23 @@ def calculate_analysis(candles):
 # CANCELLATION PRICE
 # ============================================================
 
-def cancellation_price(candles, direction):
+def cancellation_price(
+    candles,
+    direction
+):
 
     recent = candles[-8:]
 
     if direction == "UP":
+
         return min(
-            c["low"] for c in recent
+            c["low"]
+            for c in recent
         )
 
     return max(
-        c["high"] for c in recent
+        c["high"]
+        for c in recent
     )
 
 
@@ -1050,7 +1409,10 @@ def cancellation_price(candles, direction):
 # SETUP KEY
 # ============================================================
 
-def make_setup_key(symbol, analysis):
+def make_setup_key(
+    symbol,
+    analysis
+):
 
     return (
         f"{symbol}|"
@@ -1060,10 +1422,14 @@ def make_setup_key(symbol, analysis):
 
 
 # ============================================================
-# GEMINI REFINEMENT
+# GEMINI
 # ============================================================
 
-def gemini_refine(symbol, analysis, candles):
+def gemini_refine(
+    symbol,
+    analysis,
+    candles
+):
 
     if not GEMINI_AVAILABLE:
         return analysis
@@ -1082,12 +1448,25 @@ def gemini_refine(symbol, analysis, candles):
         compact = []
 
         for c in recent:
+
             compact.append({
                 "t": c["time"],
-                "o": round(c["open"], 6),
-                "h": round(c["high"], 6),
-                "l": round(c["low"], 6),
-                "c": round(c["close"], 6),
+                "o": round(
+                    c["open"],
+                    6
+                ),
+                "h": round(
+                    c["high"],
+                    6
+                ),
+                "l": round(
+                    c["low"],
+                    6
+                ),
+                "c": round(
+                    c["close"],
+                    6
+                ),
             })
 
         prompt = f"""
@@ -1095,9 +1474,7 @@ You are a strict M1 forex signal validator.
 
 Symbol: {symbol}
 
-Deterministic technical analysis:
-
-Direction candidate:
+Candidate direction:
 {analysis['direction']}
 
 Score:
@@ -1142,22 +1519,27 @@ Candle:
 Body ratio:
 {analysis['body_ratio']}
 
+Core indicators aligned:
+{analysis['core_aligned']}
+
 Candles:
 {json.dumps(compact)}
 
 Rules:
 
-1. Do NOT invent information.
-2. Do NOT force a trade.
-3. If the deterministic direction is technically weak or contradictory,
-   reject it.
-4. Reject if the latest candle is abnormal.
-5. Reject if EMA direction, RSI and ADX/DI strongly disagree.
-6. Prefer continuation after a confirmed structure/breakout.
-7. Avoid chasing an extreme candle.
-8. We only want ONE strongest trade.
-9. Never return WAIT as a trade direction.
-10. If rejected, set valid=false.
+1. Do not invent information.
+2. Do not force a trade.
+3. EMA9/EMA21, RSI14 and ADX/DI are the primary indicators.
+4. The three primary indicators should support the candidate direction.
+5. Neutral structure is allowed.
+6. A breakout is NOT mandatory.
+7. Reject abnormal candles.
+8. Reject extreme chasing.
+9. Reject clear contradiction between the primary indicators.
+10. We want the strongest available M1 setup.
+11. Do not require every secondary condition to be present.
+12. If valid=false, the setup is rejected.
+13. Never invent a direction.
 
 Return JSON only:
 
@@ -1179,36 +1561,57 @@ Return JSON only:
             )
         )
 
-        text = response.text.strip()
+        text = (
+            response.text
+            or ""
+        ).strip()
 
-        data = json.loads(text)
+        data = json.loads(
+            text
+        )
 
-        valid = bool(data.get("valid", False))
+        valid = bool(
+            data.get(
+                "valid",
+                False
+            )
+        )
 
         if not valid:
+
             analysis["gemini_valid"] = False
+
             analysis["gemini_reason"] = (
-                data.get("reason")
-                or "Gemini rejected weak setup."
+                data.get(
+                    "reason"
+                )
+                or
+                "Gemini rejected weak setup."
             )
 
             return analysis
 
         direction = normalize_direction(
-            data.get("direction")
+            data.get(
+                "direction"
+            )
         )
 
         if direction != analysis["direction"]:
+
             analysis["gemini_valid"] = False
+
             analysis["gemini_reason"] = (
-                "Gemini direction disagreed with deterministic analysis."
+                "Gemini direction disagreed."
             )
 
             return analysis
 
         gemini_conf = int(
             safe_float(
-                data.get("confidence"),
+                data.get(
+                    "confidence"
+                ),
                 analysis["confidence"]
             )
         )
@@ -1226,19 +1629,21 @@ Return JSON only:
 
         analysis["gemini_valid"] = True
 
-        analysis["reason"] = (
-            str(
-                data.get("reason")
-                or "Technical conditions aligned."
-            )[:300]
-        )
+        analysis["reason"] = str(
+            data.get(
+                "reason"
+            )
+            or
+            "EMA + RSI + ADX/DI aligned."
+        )[:300]
 
-        analysis["cancellation_reason"] = (
-            str(
-                data.get("cancellation_reason")
-                or "Price crossed the invalidation level."
-            )[:250]
-        )
+        analysis["cancellation_reason"] = str(
+            data.get(
+                "cancellation_reason"
+            )
+            or
+            "Price crossed invalidation level."
+        )[:250]
 
         return analysis
 
@@ -1254,55 +1659,132 @@ Return JSON only:
 
 
 # ============================================================
-# SIGNAL VALIDATION
+# VALIDATION
 # ============================================================
 
-def validate_signal(symbol, candles):
+def validate_signal(
+    symbol,
+    candles
+):
 
-    analysis = calculate_analysis(candles)
+    analysis = calculate_analysis(
+        candles
+    )
 
     if not analysis:
+
         return None
 
     if not analysis["direction"]:
+
+        return None
+
+    # --------------------------------------------------------
+    # PRIMARY REQUIREMENT
+    # --------------------------------------------------------
+
+    if not analysis["core_aligned"]:
+
+        logger.info(
+            "REJECT | %s | core indicators not aligned | "
+            "EMA9=%.6f EMA21=%.6f RSI=%.2f ADX=%.2f "
+            "DI+=%.2f DI-=%.2f",
+            symbol,
+            analysis["ema9"],
+            analysis["ema21"],
+            analysis["rsi"],
+            analysis["adx"],
+            analysis["plus_di"],
+            analysis["minus_di"]
+        )
+
         return None
 
     if analysis["conflict"]:
+
+        logger.info(
+            "REJECT | %s | conflict=%s structure=%s "
+            "liquidity=%s abnormal=%s",
+            symbol,
+            analysis["conflict"],
+            analysis["structure"],
+            analysis["liquidity"],
+            analysis["abnormal"]
+        )
+
         return None
 
     if analysis["score"] < MIN_SCORE:
+
+        logger.info(
+            "REJECT | %s | score=%d/20 < %d",
+            symbol,
+            analysis["score"],
+            MIN_SCORE
+        )
+
         return None
 
-    # Strong disagreement is rejected
     score_gap = abs(
         analysis["up_score"]
         - analysis["down_score"]
     )
 
-    if score_gap < 3:
+    if score_gap < MIN_SCORE_GAP:
+
+        logger.info(
+            "REJECT | %s | score gap=%d < %d",
+            symbol,
+            score_gap,
+            MIN_SCORE_GAP
+        )
+
         return None
 
-    # If ADX is weak, don't force signal
-    if analysis["adx"] < 20:
+    if analysis["adx"] < MIN_ADX:
+
+        logger.info(
+            "REJECT | %s | ADX %.2f < %.2f",
+            symbol,
+            analysis["adx"],
+            MIN_ADX
+        )
+
         return None
 
-    # Direction must agree with RSI
+    # --------------------------------------------------------
+    # FINAL DIRECTION CHECK
+    # --------------------------------------------------------
+
     if analysis["direction"] == "UP":
+
         if analysis["rsi"] < 50:
+
             return None
 
-    if analysis["direction"] == "DOWN":
+        if (
+            analysis["plus_di"]
+            <= analysis["minus_di"]
+        ):
+
+            return None
+
+    elif analysis["direction"] == "DOWN":
+
         if analysis["rsi"] > 50:
+
             return None
 
-    # Direction must agree with DI
-    if analysis["direction"] == "UP":
-        if analysis["plus_di"] <= analysis["minus_di"]:
+        if (
+            analysis["minus_di"]
+            <= analysis["plus_di"]
+        ):
+
             return None
 
-    if analysis["direction"] == "DOWN":
-        if analysis["minus_di"] <= analysis["plus_di"]:
-            return None
+    # --------------------------------------------------------
+    # GEMINI
+    # --------------------------------------------------------
 
     analysis = gemini_refine(
         symbol,
@@ -1310,13 +1792,26 @@ def validate_signal(symbol, candles):
         candles
     )
 
-    # Gemini can reject
-    if analysis.get("gemini_valid") is False:
+    if analysis.get(
+        "gemini_valid"
+    ) is False:
+
+        logger.info(
+            "REJECT | %s | Gemini: %s",
+            symbol,
+            analysis.get(
+                "gemini_reason",
+                "rejected"
+            )
+        )
+
         return None
 
-    analysis["cancellation"] = cancellation_price(
-        candles,
-        analysis["direction"]
+    analysis["cancellation"] = (
+        cancellation_price(
+            candles,
+            analysis["direction"]
+        )
     )
 
     return analysis
@@ -1334,11 +1829,16 @@ def choose_best_pair():
 
     with data_lock:
 
-        items = list(data_store.items())
+        items = list(
+            data_store.items()
+        )
 
     for symbol, info in items:
 
-        candles = info.get("candles", [])
+        candles = info.get(
+            "candles",
+            []
+        )
 
         received = info.get(
             "received_at",
@@ -1348,18 +1848,41 @@ def choose_best_pair():
         if not candles:
             continue
 
-        if current_time - received > MAX_DATA_AGE_SECONDS:
+        if (
+            current_time
+            - received
+            > MAX_DATA_AGE_SECONDS
+        ):
             continue
 
         if len(candles) < MIN_CANDLES:
             continue
 
-        analysis = calculate_analysis(candles)
+        analysis = calculate_analysis(
+            candles
+        )
 
         if not analysis:
             continue
 
         if not analysis["direction"]:
+            continue
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Only primary indicator alignment is mandatory here.
+        # ----------------------------------------------------
+
+        if not analysis["core_aligned"]:
+
+            logger.info(
+                "CANDIDATE SKIP | %s | core not aligned | "
+                "UP=%d DOWN=%d",
+                symbol,
+                analysis["up_score"],
+                analysis["down_score"]
+            )
+
             continue
 
         if analysis["conflict"]:
@@ -1368,27 +1891,70 @@ def choose_best_pair():
         if analysis["score"] < MIN_SCORE:
             continue
 
-        if analysis["adx"] < 20:
+        if analysis["adx"] < MIN_ADX:
             continue
 
-        # Small bonus for clean alignment
+        score_gap = abs(
+            analysis["up_score"]
+            - analysis["down_score"]
+        )
+
+        if score_gap < MIN_SCORE_GAP:
+            continue
+
+        # ----------------------------------------------------
+        # Quality ranking
+        # ----------------------------------------------------
+
         quality = float(
             analysis["score"]
         )
 
-        quality += abs(
-            analysis["up_score"]
-            - analysis["down_score"]
-        ) * 0.5
+        quality += (
+            score_gap * 0.7
+        )
 
+        # Strong ADX bonus
         if analysis["adx"] >= 30:
+
+            quality += 2.0
+
+        elif analysis["adx"] >= 25:
+
+            quality += 1.0
+
+        # Structure confirmation
+        if (
+            analysis["structure"]
+            == analysis["direction"]
+        ):
+
             quality += 1.5
 
-        if analysis["structure"] == analysis["direction"]:
-            quality += 1
+        # Breakout confirmation
+        if (
+            analysis["breakout"]
+            == analysis["direction"]
+        ):
 
-        if analysis["breakout"] == analysis["direction"]:
-            quality += 1
+            quality += 1.0
+
+        # Candle confirmation
+        if (
+            analysis["candle_direction"]
+            == analysis["direction"]
+            and analysis["body_ratio"] >= 0.45
+        ):
+
+            quality += 1.0
+
+        # Liquidity confirmation
+        if (
+            analysis["liquidity"]
+            == analysis["direction"]
+        ):
+
+            quality += 1.0
 
         candidates.append({
             "symbol": symbol,
@@ -1398,12 +1964,31 @@ def choose_best_pair():
         })
 
     if not candidates:
+
         return None
 
-    # Highest quality first
     candidates.sort(
         key=lambda x: x["quality"],
         reverse=True
+    )
+
+    # --------------------------------------------------------
+    # Diagnostic log
+    # --------------------------------------------------------
+
+    top = candidates[:5]
+
+    logger.info(
+        "TOP CANDIDATES: %s",
+        " | ".join(
+            (
+                f"{x['symbol']} "
+                f"{x['analysis']['direction']} "
+                f"{x['analysis']['score']}/20 "
+                f"Q={x['quality']:.1f}"
+            )
+            for x in top
+        )
     )
 
     return candidates[0]
@@ -1418,9 +2003,11 @@ async def send_message(text):
     global application
 
     if application is None:
+
         logger.error(
             "Telegram application is not ready."
         )
+
         return False
 
     try:
@@ -1440,7 +2027,6 @@ async def send_message(text):
             e
         )
 
-        # Retry plain text
         try:
 
             await application.bot.send_message(
@@ -1465,19 +2051,25 @@ def send_message_threadsafe(text):
     global telegram_loop
 
     if telegram_loop is None:
+
         logger.error(
             "Telegram loop unavailable."
         )
+
         return False
 
     try:
 
-        future = asyncio.run_coroutine_threadsafe(
-            send_message(text),
-            telegram_loop
+        future = (
+            asyncio.run_coroutine_threadsafe(
+                send_message(text),
+                telegram_loop
+            )
         )
 
-        future.result(timeout=20)
+        future.result(
+            timeout=20
+        )
 
         return True
 
@@ -1501,34 +2093,59 @@ def build_signal_text(
     trade_type
 ):
 
-    direction = analysis["direction"]
+    direction = analysis[
+        "direction"
+    ]
 
-    emoji = "🟢 UP" if direction == "UP" else "🔴 DOWN"
+    emoji = (
+        "🟢 UP"
+        if direction == "UP"
+        else
+        "🔴 DOWN"
+    )
 
-    confidence = analysis["confidence"]
+    confidence = analysis[
+        "confidence"
+    ]
 
-    score = analysis["score"]
+    score = analysis[
+        "score"
+    ]
 
-    up_score = analysis["up_score"]
+    up_score = analysis[
+        "up_score"
+    ]
 
-    down_score = analysis["down_score"]
+    down_score = analysis[
+        "down_score"
+    ]
 
-    price = analysis["price"]
+    price = analysis[
+        "price"
+    ]
 
-    cancellation = analysis["cancellation"]
+    cancellation = analysis[
+        "cancellation"
+    ]
 
-    entry_time = now_algiers() + timedelta(
-        seconds=ENTRY_DELAY_SECONDS
+    entry_time = (
+        now_algiers()
+        + timedelta(
+            seconds=ENTRY_DELAY_SECONDS
+        )
     )
 
     reason = analysis.get(
         "reason",
-        "EMA + RSI + ADX/DI + Price Action aligned."
+        "EMA 9/21 + RSI 14 + ADX/DI aligned."
     )
 
     if trade_type == "BASE":
+
         title = "🎯 BASE TRADE"
+
     else:
+
         title = "♻️ RECOVERY 1/1"
 
     text = (
@@ -1568,64 +2185,69 @@ def send_one_signal(
 
     with cycle_lock:
 
-        # ----------------------------------------------------
-        # HARD ONE-TRADE LOCK
-        # ----------------------------------------------------
-
         if cycle["pending"]:
-            logger.info(
-                "Signal blocked: another trade is pending."
-            )
-            return False
 
-        # ----------------------------------------------------
-        # BASE
-        # ----------------------------------------------------
+            logger.info(
+                "Signal blocked: another trade pending."
+            )
+
+            return False
 
         if trade_type == "BASE":
 
             if cycle["active"]:
+
                 logger.info(
                     "BASE blocked: cycle already active."
                 )
-                return False
 
-        # ----------------------------------------------------
-        # RECOVERY
-        # ----------------------------------------------------
+                return False
 
         if trade_type == "RECOVERY":
 
             if not cycle["active"]:
+
                 logger.info(
                     "Recovery blocked: no active cycle."
                 )
+
                 return False
 
             if cycle["recovery_used"]:
+
                 logger.info(
                     "Recovery blocked: already used."
                 )
+
                 return False
 
-            if cycle["trade_type"] != "RECOVERY":
+            if (
+                cycle["trade_type"]
+                != "RECOVERY"
+            ):
+
                 logger.info(
-                    "Recovery blocked: wrong cycle state."
+                    "Recovery blocked: wrong state."
                 )
-                return False
 
-        # ----------------------------------------------------
-        # SETUP KEY
-        # ----------------------------------------------------
+                return False
 
         setup_key = make_setup_key(
             symbol,
             analysis
         )
 
-        # ----------------------------------------------------
-        # RESERVE THE TRADE BEFORE TELEGRAM
-        # ----------------------------------------------------
+        # Same exact setup protection
+        if (
+            cycle["setup_key"]
+            == setup_key
+        ):
+
+            logger.info(
+                "Signal blocked: same setup."
+            )
+
+            return False
 
         cycle["active"] = True
 
@@ -1633,7 +2255,9 @@ def send_one_signal(
 
         cycle["symbol"] = symbol
 
-        cycle["direction"] = analysis["direction"]
+        cycle["direction"] = (
+            analysis["direction"]
+        )
 
         cycle["pending"] = True
 
@@ -1641,7 +2265,9 @@ def send_one_signal(
 
         cycle["setup_key"] = setup_key
 
-        cycle["last_signal_time"] = now_timestamp()
+        cycle["last_signal_time"] = (
+            now_timestamp()
+        )
 
         cycle["last_signal"] = {
             "symbol": symbol,
@@ -1658,15 +2284,13 @@ def send_one_signal(
 
             cycle["base_symbol"] = symbol
 
-            cycle["base_direction"] = analysis["direction"]
+            cycle["base_direction"] = (
+                analysis["direction"]
+            )
 
         elif trade_type == "RECOVERY":
 
             cycle["recovery_used"] = True
-
-    # --------------------------------------------------------
-    # Build and send outside lock
-    # --------------------------------------------------------
 
     text = build_signal_text(
         symbol,
@@ -1674,30 +2298,33 @@ def send_one_signal(
         trade_type
     )
 
-    success = send_message_threadsafe(text)
+    success = send_message_threadsafe(
+        text
+    )
 
     if not success:
 
-        # Telegram failed, release pending state
         with cycle_lock:
 
             cycle["pending"] = False
 
             if trade_type == "BASE":
+
                 cycle["active"] = False
+
                 cycle["trade_type"] = None
+
                 cycle["symbol"] = None
+
                 cycle["direction"] = None
+
                 cycle["setup_key"] = None
 
             elif trade_type == "RECOVERY":
+
                 cycle["recovery_used"] = False
 
         return False
-
-    # --------------------------------------------------------
-    # History
-    # --------------------------------------------------------
 
     with data_lock:
 
@@ -1713,14 +2340,16 @@ def send_one_signal(
         })
 
         if len(history) > 100:
+
             del history[:-100]
 
     logger.info(
-        "SIGNAL SENT | %s | %s | %s | %s/20",
+        "SIGNAL SENT | %s | %s | %s | %s/20 | confidence=%s%%",
         symbol,
         trade_type,
         analysis["direction"],
-        analysis["score"]
+        analysis["score"],
+        analysis["confidence"]
     )
 
     return True
@@ -1731,10 +2360,6 @@ def send_one_signal(
 # ============================================================
 
 def analyze_and_send_base():
-
-    # --------------------------------------------------------
-    # HARD CYCLE CHECK
-    # --------------------------------------------------------
 
     with cycle_lock:
 
@@ -1747,7 +2372,6 @@ def analyze_and_send_base():
         if cycle["generating"]:
             return False
 
-        # Reserve generation
         cycle["generating"] = True
 
     try:
@@ -1755,30 +2379,40 @@ def analyze_and_send_base():
         candidate = choose_best_pair()
 
         if not candidate:
+
             logger.info(
-                "No high-quality setup found."
+                "No valid candidate found."
             )
+
             return False
 
-        symbol = candidate["symbol"]
+        symbol = candidate[
+            "symbol"
+        ]
 
-        candles = candidate["candles"]
+        candles = candidate[
+            "candles"
+        ]
 
-        # Full validation
+        logger.info(
+            "BEST CANDIDATE | %s | %s | %d/20",
+            symbol,
+            candidate["analysis"]["direction"],
+            candidate["analysis"]["score"]
+        )
+
         analysis = validate_signal(
             symbol,
             candles
         )
 
         if not analysis:
+
             logger.info(
                 "Best candidate failed final validation."
             )
-            return False
 
-        # ----------------------------------------------------
-        # Send exactly ONE
-        # ----------------------------------------------------
+            return False
 
         return send_one_signal(
             symbol,
@@ -1790,6 +2424,7 @@ def analyze_and_send_base():
     finally:
 
         with cycle_lock:
+
             cycle["generating"] = False
 
 
@@ -1810,27 +2445,34 @@ def analyze_and_send_recovery():
         if cycle["recovery_used"]:
             return False
 
-        if cycle["trade_type"] != "RECOVERY":
+        if (
+            cycle["trade_type"]
+            != "RECOVERY"
+        ):
             return False
 
-        symbol = cycle["symbol"]
-
-    # --------------------------------------------------------
-    # Recovery uses freshest data of current pair
-    # --------------------------------------------------------
+        symbol = cycle[
+            "symbol"
+        ]
 
     with data_lock:
 
-        info = data_store.get(symbol)
+        info = data_store.get(
+            symbol
+        )
 
         if not info:
             return False
 
         candles = list(
-            info.get("candles", [])
+            info.get(
+                "candles",
+                []
+            )
         )
 
     if len(candles) < MIN_CANDLES:
+
         return False
 
     analysis = validate_signal(
@@ -1839,9 +2481,11 @@ def analyze_and_send_recovery():
     )
 
     if not analysis:
+
         logger.info(
             "Recovery setup not strong enough."
         )
+
         return False
 
     return send_one_signal(
@@ -1853,46 +2497,58 @@ def analyze_and_send_recovery():
 
 
 # ============================================================
-# MT4 DATA PROCESSING
+# MT4 DATA
 # ============================================================
 
 def process_mt4_payload(payload):
 
     if not isinstance(payload, dict):
+
         return {
             "ok": False,
             "error": "Invalid JSON object"
         }
 
     symbol = str(
-        payload.get("symbol")
+        payload.get(
+            "symbol"
+        )
         or ""
     ).strip().upper()
 
     timeframe = str(
-        payload.get("timeframe")
-        or payload.get("tf")
+        payload.get(
+            "timeframe"
+        )
+        or payload.get(
+            "tf"
+        )
         or "M1"
     ).upper()
 
     candles = normalize_candles(
-        payload.get("candles")
+        payload.get(
+            "candles"
+        )
         or []
     )
 
     if not symbol:
+
         return {
             "ok": False,
             "error": "Missing symbol"
         }
 
     if timeframe != "M1":
+
         return {
             "ok": False,
             "error": "Only M1 is accepted"
         }
 
     if len(candles) < 10:
+
         return {
             "ok": False,
             "error": "Not enough candles"
@@ -1913,13 +2569,6 @@ def process_mt4_payload(payload):
         len(candles)
     )
 
-    # --------------------------------------------------------
-    # AUTOMATIC SIGNAL ENGINE
-    # --------------------------------------------------------
-
-    # Do NOT create multiple analysis threads.
-    # Only one can enter the analysis lock.
-
     def background_signal_check():
 
         if not analysis_lock.acquire(
@@ -1931,11 +2580,9 @@ def process_mt4_payload(payload):
 
             with cycle_lock:
 
-                # ABSOLUTE ONE-TRADE RULE
                 if cycle["pending"]:
                     return
 
-                # Active BASE/RECOVERY cycle
                 if cycle["active"]:
                     return
 
@@ -1962,19 +2609,33 @@ def process_mt4_payload(payload):
 # HTTP SERVER
 # ============================================================
 
-class MT4Handler(BaseHTTPRequestHandler):
+class MT4Handler(
+    BaseHTTPRequestHandler
+):
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args
+    ):
         return
 
-    def _send_json(self, code, data):
+    def _send_json(
+        self,
+        code,
+        data
+    ):
 
         body = json.dumps(
             data,
             ensure_ascii=False
-        ).encode("utf-8")
+        ).encode(
+            "utf-8"
+        )
 
-        self.send_response(code)
+        self.send_response(
+            code
+        )
 
         self.send_header(
             "Content-Type",
@@ -1988,7 +2649,9 @@ class MT4Handler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-        self.wfile.write(body)
+        self.wfile.write(
+            body
+        )
 
     def do_GET(self):
 
@@ -1996,7 +2659,11 @@ class MT4Handler(BaseHTTPRequestHandler):
             self.path
         ).path
 
-        if path in ("/", "/health", "/healthz"):
+        if path in (
+            "/",
+            "/health",
+            "/healthz"
+        ):
 
             self._send_json(
                 200,
@@ -2010,17 +2677,26 @@ class MT4Handler(BaseHTTPRequestHandler):
 
             return
 
-        if path in ("/mt4status", "/status"):
+        if path in (
+            "/mt4status",
+            "/status"
+        ):
 
             with data_lock:
 
                 symbols = {}
 
-                for symbol, info in data_store.items():
+                for (
+                    symbol,
+                    info
+                ) in data_store.items():
 
                     symbols[symbol] = {
                         "candles": len(
-                            info.get("candles", [])
+                            info.get(
+                                "candles",
+                                []
+                            )
                         ),
                         "age_seconds": round(
                             now_timestamp()
@@ -2072,6 +2748,7 @@ class MT4Handler(BaseHTTPRequestHandler):
             "/mt4",
             "/api/mt4"
         ):
+
             self._send_json(
                 404,
                 {
@@ -2079,16 +2756,19 @@ class MT4Handler(BaseHTTPRequestHandler):
                     "error": "Not found"
                 }
             )
+
             return
 
-        # ----------------------------------------------------
-        # API KEY
-        # ----------------------------------------------------
-
         header_key = (
-            self.headers.get("X-MT4-API-Key")
-            or self.headers.get("X-API-Key")
-            or ""
+            self.headers.get(
+                "X-MT4-API-Key"
+            )
+            or
+            self.headers.get(
+                "X-API-Key"
+            )
+            or
+            ""
         ).strip()
 
         try:
@@ -2105,6 +2785,7 @@ class MT4Handler(BaseHTTPRequestHandler):
             content_length = 0
 
         if content_length <= 0:
+
             self._send_json(
                 400,
                 {
@@ -2112,6 +2793,7 @@ class MT4Handler(BaseHTTPRequestHandler):
                     "error": "Empty body"
                 }
             )
+
             return
 
         raw = self.rfile.read(
@@ -2121,7 +2803,9 @@ class MT4Handler(BaseHTTPRequestHandler):
         try:
 
             payload = json.loads(
-                raw.decode("utf-8")
+                raw.decode(
+                    "utf-8"
+                )
             )
 
         except Exception:
@@ -2133,14 +2817,13 @@ class MT4Handler(BaseHTTPRequestHandler):
                     "error": "Invalid JSON"
                 }
             )
+
             return
 
-        # ----------------------------------------------------
-        # Backward compatible API key
-        # ----------------------------------------------------
-
         json_key = str(
-            payload.get("api_key")
+            payload.get(
+                "api_key"
+            )
             or ""
         ).strip()
 
@@ -2151,7 +2834,10 @@ class MT4Handler(BaseHTTPRequestHandler):
 
         if MT4_API_KEY:
 
-            if received_key != MT4_API_KEY:
+            if (
+                received_key
+                != MT4_API_KEY
+            ):
 
                 self._send_json(
                     401,
@@ -2160,11 +2846,8 @@ class MT4Handler(BaseHTTPRequestHandler):
                         "error": "Unauthorized"
                     }
                 )
-                return
 
-        # ----------------------------------------------------
-        # PROCESS
-        # ----------------------------------------------------
+                return
 
         result = process_mt4_payload(
             payload
@@ -2197,7 +2880,10 @@ class MT4Handler(BaseHTTPRequestHandler):
 def start_http_server():
 
     server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
+        (
+            "0.0.0.0",
+            PORT
+        ),
         MT4Handler
     )
 
@@ -2226,6 +2912,8 @@ async def start_command(
         "✅ MT4 M1 engine ready.\n"
         "🎯 One strongest trade only.\n"
         "♻️ One recovery maximum.\n\n"
+        "Strategy:\n"
+        "EMA 9/21 + RSI 14 + ADX/DI 14\n\n"
         "Commands:\n"
         "/stats\n"
         "/history\n"
@@ -2250,16 +2938,21 @@ async def stats_command(
         current = (
             "NONE"
             if not cycle["active"]
-            else (
+            else
+            (
                 f"{cycle['trade_type']} "
                 f"{cycle['symbol']} "
                 f"{cycle['direction']}"
             )
         )
 
-        pending = cycle["pending"]
+        pending = cycle[
+            "pending"
+        ]
 
-        recovery_used = cycle["recovery_used"]
+        recovery_used = cycle[
+            "recovery_used"
+        ]
 
     total_wins = (
         stats["base_win"]
@@ -2271,15 +2964,21 @@ async def stats_command(
         + stats["recovery_loss"]
     )
 
-    total = total_wins + total_losses
+    total = (
+        total_wins
+        + total_losses
+    )
 
     if total > 0:
+
         winrate = (
             total_wins
             / total
             * 100
         )
+
     else:
+
         winrate = 0
 
     text = (
@@ -2293,7 +2992,8 @@ async def stats_command(
         f"❌ TOTAL LOSS: {total_losses}\n"
         f"📈 WIN RATE: {winrate:.1f}%\n\n"
         f"🔄 CURRENT CYCLE: {current}\n"
-        f"⏳ PENDING: {'YES' if pending else 'NO'}\n"
+        f"⏳ PENDING: "
+        f"{'YES' if pending else 'NO'}\n"
         f"♻️ RECOVERY USED: "
         f"{'YES' if recovery_used else 'NO'}"
     )
@@ -2331,12 +3031,15 @@ async def history_command(
 
     for item in reversed(items):
 
-        direction = item["direction"]
+        direction = item[
+            "direction"
+        ]
 
         icon = (
             "🟢"
             if direction == "UP"
-            else "🔴"
+            else
+            "🔴"
         )
 
         lines.append(
@@ -2366,8 +3069,6 @@ async def win_command(
     if not await owner_only(update):
         return
 
-    global cycle
-
     with cycle_lock:
 
         if not cycle["pending"]:
@@ -2378,15 +3079,17 @@ async def win_command(
 
             return
 
-        trade_type = cycle["trade_type"]
+        trade_type = cycle[
+            "trade_type"
+        ]
 
-        symbol = cycle["symbol"]
+        symbol = cycle[
+            "symbol"
+        ]
 
-        direction = cycle["direction"]
-
-        # ----------------------------------------------------
-        # Record stats
-        # ----------------------------------------------------
+        direction = cycle[
+            "direction"
+        ]
 
         if trade_type == "BASE":
 
@@ -2396,27 +3099,26 @@ async def win_command(
 
             stats["recovery_win"] += 1
 
-        # ----------------------------------------------------
-        # Update history
-        # ----------------------------------------------------
-
         with data_lock:
 
-            for item in reversed(history):
+            for item in reversed(
+                history
+            ):
 
                 if (
-                    item["result"] == "PENDING"
-                    and item["symbol"] == symbol
-                    and item["trade_type"] == trade_type
+                    item["result"]
+                    == "PENDING"
+                    and
+                    item["symbol"]
+                    == symbol
+                    and
+                    item["trade_type"]
+                    == trade_type
                 ):
 
                     item["result"] = "WIN"
 
                     break
-
-        # ----------------------------------------------------
-        # CLOSE CYCLE
-        # ----------------------------------------------------
 
         cycle["active"] = False
 
@@ -2455,8 +3157,6 @@ async def loss_command(
     if not await owner_only(update):
         return
 
-    global cycle
-
     with cycle_lock:
 
         if not cycle["pending"]:
@@ -2467,15 +3167,17 @@ async def loss_command(
 
             return
 
-        trade_type = cycle["trade_type"]
+        trade_type = cycle[
+            "trade_type"
+        ]
 
-        symbol = cycle["symbol"]
+        symbol = cycle[
+            "symbol"
+        ]
 
-        direction = cycle["direction"]
-
-        # ----------------------------------------------------
-        # BASE LOSS
-        # ----------------------------------------------------
+        direction = cycle[
+            "direction"
+        ]
 
         if trade_type == "BASE":
 
@@ -2483,23 +3185,28 @@ async def loss_command(
 
             with data_lock:
 
-                for item in reversed(history):
+                for item in reversed(
+                    history
+                ):
 
                     if (
-                        item["result"] == "PENDING"
-                        and item["symbol"] == symbol
-                        and item["trade_type"] == "BASE"
+                        item["result"]
+                        == "PENDING"
+                        and
+                        item["symbol"]
+                        == symbol
+                        and
+                        item["trade_type"]
+                        == "BASE"
                     ):
 
                         item["result"] = "LOSS"
 
                         break
 
-            # ------------------------------------------------
-            # Convert cycle to recovery
-            # ------------------------------------------------
-
-            cycle["trade_type"] = "RECOVERY"
+            cycle["trade_type"] = (
+                "RECOVERY"
+            )
 
             cycle["pending"] = False
 
@@ -2507,33 +3214,30 @@ async def loss_command(
 
             cycle["last_signal"] = None
 
-            # Same pair, fresh M1 data.
-            # Recovery must be independently validated.
-            recovery_symbol = symbol
-
-        # ----------------------------------------------------
-        # RECOVERY LOSS
-        # ----------------------------------------------------
-
         else:
 
             stats["recovery_loss"] += 1
 
             with data_lock:
 
-                for item in reversed(history):
+                for item in reversed(
+                    history
+                ):
 
                     if (
-                        item["result"] == "PENDING"
-                        and item["symbol"] == symbol
-                        and item["trade_type"] == "RECOVERY"
+                        item["result"]
+                        == "PENDING"
+                        and
+                        item["symbol"]
+                        == symbol
+                        and
+                        item["trade_type"]
+                        == "RECOVERY"
                     ):
 
                         item["result"] = "LOSS"
 
                         break
-
-            # END ENTIRE CYCLE
 
             cycle["active"] = False
 
@@ -2551,12 +3255,6 @@ async def loss_command(
 
             cycle["last_signal"] = None
 
-            recovery_symbol = None
-
-    # --------------------------------------------------------
-    # BASE LOSS -> ONE RECOVERY
-    # --------------------------------------------------------
-
     if trade_type == "BASE":
 
         await update.message.reply_text(
@@ -2569,24 +3267,26 @@ async def loss_command(
             parse_mode="Markdown"
         )
 
-        # Give MT4 data a moment to refresh.
         await asyncio.sleep(2)
 
-        # Run recovery outside Telegram handler state lock.
         def recovery_worker():
 
             if not analysis_lock.acquire(
                 blocking=False
             ):
+
                 logger.info(
                     "Recovery analysis already running."
                 )
+
                 return
 
             try:
+
                 analyze_and_send_recovery()
 
             finally:
+
                 analysis_lock.release()
 
         threading.Thread(
@@ -2602,7 +3302,7 @@ async def loss_command(
             f"📊 {symbol} | {direction}\n\n"
             "⛔ Recovery 1/1 انتهت.\n"
             "❌ لا توجد Recovery ثانية.\n"
-            "🔎 الدورة انتهت، والبحث القادم سيكون عن صفقة BASE جديدة.",
+            "🔎 الدورة انتهت، والبحث القادم سيكون عن BASE جديدة.",
             parse_mode="Markdown"
         )
 
@@ -2618,8 +3318,6 @@ async def reset_command(
 
     if not await owner_only(update):
         return
-
-    global cycle
 
     with cycle_lock:
 
@@ -2646,8 +3344,11 @@ async def reset_command(
         history.clear()
 
         stats["base_win"] = 0
+
         stats["base_loss"] = 0
+
         stats["recovery_win"] = 0
+
         stats["recovery_loss"] = 0
 
     await update.message.reply_text(
@@ -2683,10 +3384,16 @@ async def mt4status_command(
             "━━━━━━━━━━━━━━━━━━"
         ]
 
-        for symbol, info in data_store.items():
+        for (
+            symbol,
+            info
+        ) in data_store.items():
 
             candles = len(
-                info.get("candles", [])
+                info.get(
+                    "candles",
+                    []
+                )
             )
 
             age = (
@@ -2700,7 +3407,8 @@ async def mt4status_command(
             status = (
                 "🟢"
                 if age <= MAX_DATA_AGE_SECONDS
-                else "🔴"
+                else
+                "🔴"
             )
 
             lines.append(
@@ -2741,10 +3449,6 @@ async def analyze_command(
     if not await owner_only(update):
         return
 
-    # --------------------------------------------------------
-    # HARD LOCK
-    # --------------------------------------------------------
-
     with cycle_lock:
 
         if cycle["pending"]:
@@ -2776,7 +3480,9 @@ async def analyze_command(
 
         return
 
-    symbol = args[0].upper()
+    symbol = args[
+        0
+    ].upper()
 
     timeframe = (
         args[1].upper()
@@ -2794,7 +3500,9 @@ async def analyze_command(
 
     with data_lock:
 
-        info = data_store.get(symbol)
+        info = data_store.get(
+            symbol
+        )
 
     if not info:
 
@@ -2804,7 +3512,10 @@ async def analyze_command(
 
         return
 
-    candles = info.get("candles", [])
+    candles = info.get(
+        "candles",
+        []
+    )
 
     if len(candles) < MIN_CANDLES:
 
@@ -2825,8 +3536,9 @@ async def analyze_command(
 
         await update.message.reply_text(
             f"❌ {symbol} لا يملك حالياً "
-            f"إشارة بجودة {MIN_SCORE}/20 أو أكثر.\n\n"
-            "البوت لن يجبر السوق على إعطاء صفقة."
+            f"setup مطابق للشروط.\n\n"
+            f"الحد الأدنى: {MIN_SCORE}/20\n"
+            "والـEMA + RSI + ADX/DI لازم يكونوا متفقين."
         )
 
         return
@@ -2858,9 +3570,12 @@ async def analyze_command(
 async def telegram_main():
 
     global application
+
     global telegram_loop
 
-    telegram_loop = asyncio.get_running_loop()
+    telegram_loop = (
+        asyncio.get_running_loop()
+    )
 
     application = (
         Application.builder()
@@ -2936,9 +3651,11 @@ async def telegram_main():
         "Telegram polling started."
     )
 
-    # Keep loop alive
     while True:
-        await asyncio.sleep(3600)
+
+        await asyncio.sleep(
+            3600
+        )
 
 
 # ============================================================
@@ -2985,10 +3702,6 @@ def main():
 
     validate_config()
 
-    # --------------------------------------------------------
-    # HTTP
-    # --------------------------------------------------------
-
     http_thread = threading.Thread(
         target=start_http_server,
         daemon=True
@@ -3000,10 +3713,6 @@ def main():
         "ZinoProSignalAI starting..."
     )
 
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
     asyncio.run(
         telegram_main()
     )
@@ -3011,3 +3720,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
