@@ -1,3 +1,5 @@
 python-telegram-bot>=22,<23
 python-telegram-bot==22.5
 google-genai>=1.30.0
+python-telegram-bot==22.5
+google-genai>=1.30.0
