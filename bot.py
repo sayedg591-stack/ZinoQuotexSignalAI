@@ -51,11 +51,21 @@ GEMINI_MODEL = os.getenv(
 MT4_API_KEY = os.getenv("MT4_API_KEY", "").strip()
 
 if not MT4_API_KEY:
-    MT4_API_KEY = os.getenv("ZINO_API_KEY", "").strip()
+    MT4_API_KEY = os.getenv(
+        "ZINO_API_KEY",
+        ""
+    ).strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000"
+    )
+)
 
-TIMEZONE = ZoneInfo("Africa/Algiers")
+TIMEZONE = ZoneInfo(
+    "Africa/Algiers"
+)
 
 
 # ============================================================
@@ -64,11 +74,15 @@ TIMEZONE = ZoneInfo("Africa/Algiers")
 
 TIMEFRAME = "M1"
 
+# Number of CLOSED candles used for analysis.
 MIN_CANDLES = 50
+
+# MT4 normally sends the current forming candle as the last candle.
+# We exclude it and analyze candles[:-1].
+REQUIRED_TOTAL_CANDLES = MIN_CANDLES + 1
 
 ENTRY_DELAY_SECONDS = 60
 
-# Minimum technical score.
 MIN_SCORE = 13
 
 MAX_SCORE = 20
@@ -81,25 +95,18 @@ MAX_CONFIDENCE = 89
 
 MIN_CONFIDENCE = 76
 
-# Minimum difference between UP and DOWN scores.
 MIN_SCORE_GAP = 2
 
-# Minimum ADX when ADX is being used as a directional signal.
 MIN_ADX = 20.0
 
-# Strong ADX threshold.
 STRONG_ADX = 25.0
 
-# Avoid very weak/flat candles.
 MIN_CANDLE_RANGE_RATIO = 0.25
 
-# Avoid chasing giant candles.
 MAX_CANDLE_RANGE_RATIO = 2.8
 
-# Avoid a repeated exact setup.
 SETUP_REPEAT_BLOCK_SECONDS = 240
 
-# Recovery waits for fresh market data before trying again.
 RECOVERY_WAIT_SECONDS = 60
 
 
@@ -112,7 +119,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("ZinoProSignalAI")
+logger = logging.getLogger(
+    "ZinoProSignalAI"
+)
 
 
 # ============================================================
@@ -173,7 +182,9 @@ application = None
 # ============================================================
 
 def now_algiers():
-    return datetime.now(TIMEZONE)
+    return datetime.now(
+        TIMEZONE
+    )
 
 
 def now_timestamp():
@@ -181,23 +192,32 @@ def now_timestamp():
 
 
 def fmt_time(dt=None):
+
     if dt is None:
         dt = now_algiers()
 
-    return dt.strftime("%H:%M:%S")
+    return dt.strftime(
+        "%H:%M:%S"
+    )
 
 
 def is_owner(update: Update):
+
     if not update.effective_user:
         return False
 
-    return update.effective_user.id == OWNER_ID
+    return (
+        update.effective_user.id
+        == OWNER_ID
+    )
 
 
 async def owner_only(update: Update):
+
     if not is_owner(update):
 
         if update.message:
+
             await update.message.reply_text(
                 "⛔ هذا الأمر متاح للمالك فقط."
             )
@@ -207,30 +227,88 @@ async def owner_only(update: Update):
     return True
 
 
-def safe_float(value, default=0.0):
+def safe_float(
+    value,
+    default=0.0
+):
+
     try:
         return float(value)
+
     except Exception:
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def clamp(
+    value,
+    low,
+    high
+):
+
+    return max(
+        low,
+        min(high, value)
+    )
 
 
-def normalize_direction(direction):
+def normalize_direction(
+    direction
+):
 
     direction = str(
         direction or ""
     ).upper().strip()
 
-    if direction in ("UP", "CALL", "BUY"):
+    if direction in (
+        "UP",
+        "CALL",
+        "BUY"
+    ):
         return "UP"
 
-    if direction in ("DOWN", "PUT", "SELL"):
+    if direction in (
+        "DOWN",
+        "PUT",
+        "SELL"
+    ):
         return "DOWN"
 
     return None
+
+
+# ============================================================
+# CLOSED CANDLE ENGINE
+# ============================================================
+
+def get_closed_candles(candles):
+
+    """
+    MT4 CopyRates normally includes the currently forming candle
+    as the last item.
+
+    Therefore:
+
+        candles[:-1] = closed candles
+        candles[-1]  = current forming candle
+
+    The technical engine NEVER uses the forming candle.
+    """
+
+    if not isinstance(
+        candles,
+        list
+    ):
+        return None
+
+    if len(candles) < REQUIRED_TOTAL_CANDLES:
+        return None
+
+    closed = candles[:-1]
+
+    if len(closed) < MIN_CANDLES:
+        return None
+
+    return closed
 
 
 # ============================================================
@@ -239,7 +317,10 @@ def normalize_direction(direction):
 
 def normalize_candle(c):
 
-    if not isinstance(c, dict):
+    if not isinstance(
+        c,
+        dict
+    ):
         return None
 
     try:
@@ -278,13 +359,24 @@ def normalize_candle(c):
         if t <= 0:
             return None
 
-        if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
+        if (
+            o <= 0
+            or h <= 0
+            or l <= 0
+            or cl <= 0
+        ):
             return None
 
-        if h < max(o, cl):
+        if h < max(
+            o,
+            cl
+        ):
             return None
 
-        if l > min(o, cl):
+        if l > min(
+            o,
+            cl
+        ):
             return None
 
         return {
@@ -301,7 +393,10 @@ def normalize_candle(c):
 
 def normalize_candles(raw):
 
-    if not isinstance(raw, list):
+    if not isinstance(
+        raw,
+        list
+    ):
         return []
 
     result = []
@@ -326,7 +421,9 @@ def normalize_candles(raw):
         if c["time"] in seen:
             continue
 
-        seen.add(c["time"])
+        seen.add(
+            c["time"]
+        )
 
         clean.append(c)
 
@@ -337,36 +434,56 @@ def normalize_candles(raw):
 # INDICATORS
 # ============================================================
 
-def ema(values, period):
+def ema(
+    values,
+    period
+):
 
     if len(values) < period:
         return None
 
-    multiplier = 2.0 / (period + 1.0)
+    multiplier = (
+        2.0
+        / (
+            period
+            + 1.0
+        )
+    )
 
-    result = sum(
-        values[:period]
-    ) / period
+    result = (
+        sum(values[:period])
+        / period
+    )
 
     for value in values[period:]:
 
         result = (
-            (value - result) * multiplier
+            (
+                value - result
+            )
+            * multiplier
             + result
         )
 
     return result
 
 
-def rsi(values, period=14):
+def rsi(
+    values,
+    period=14
+):
 
     if len(values) < period + 1:
         return None
 
     gains = []
+
     losses = []
 
-    for i in range(1, len(values)):
+    for i in range(
+        1,
+        len(values)
+    ):
 
         diff = (
             values[i]
@@ -375,21 +492,35 @@ def rsi(values, period=14):
 
         if diff > 0:
 
-            gains.append(diff)
-            losses.append(0.0)
+            gains.append(
+                diff
+            )
+
+            losses.append(
+                0.0
+            )
 
         else:
 
-            gains.append(0.0)
-            losses.append(abs(diff))
+            gains.append(
+                0.0
+            )
+
+            losses.append(
+                abs(diff)
+            )
 
     avg_gain = (
-        sum(gains[:period])
+        sum(
+            gains[:period]
+        )
         / period
     )
 
     avg_loss = (
-        sum(losses[:period])
+        sum(
+            losses[:period]
+        )
         / period
     )
 
@@ -400,7 +531,8 @@ def rsi(values, period=14):
 
         avg_gain = (
             (
-                avg_gain * (period - 1)
+                avg_gain
+                * (period - 1)
                 + gains[i]
             )
             / period
@@ -408,7 +540,8 @@ def rsi(values, period=14):
 
         avg_loss = (
             (
-                avg_loss * (period - 1)
+                avg_loss
+                * (period - 1)
                 + losses[i]
             )
             / period
@@ -417,13 +550,18 @@ def rsi(values, period=14):
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
     return (
         100.0
         - (
             100.0
-            / (1.0 + rs)
+            / (
+                1.0 + rs
+            )
         )
     )
 
@@ -432,7 +570,9 @@ def true_ranges(candles):
 
     result = []
 
-    for i, c in enumerate(candles):
+    for i, c in enumerate(
+        candles
+    ):
 
         if i == 0:
 
@@ -448,11 +588,14 @@ def true_ranges(candles):
             )
 
             tr = max(
-                c["high"] - c["low"],
+                c["high"]
+                - c["low"],
+
                 abs(
                     c["high"]
                     - prev_close
                 ),
+
                 abs(
                     c["low"]
                     - prev_close
@@ -464,15 +607,22 @@ def true_ranges(candles):
     return result
 
 
-def atr(candles, period=14):
+def atr(
+    candles,
+    period=14
+):
 
     if len(candles) < period + 1:
         return None
 
-    trs = true_ranges(candles)
+    trs = true_ranges(
+        candles
+    )
 
     value = (
-        sum(trs[:period])
+        sum(
+            trs[:period]
+        )
         / period
     )
 
@@ -480,7 +630,8 @@ def atr(candles, period=14):
 
         value = (
             (
-                value * (period - 1)
+                value
+                * (period - 1)
                 + tr
             )
             / period
@@ -489,9 +640,14 @@ def atr(candles, period=14):
     return value
 
 
-def adx_di(candles, period=14):
+def adx_di(
+    candles,
+    period=14
+):
 
-    if len(candles) < period * 2 + 5:
+    if len(candles) < (
+        period * 2 + 5
+    ):
         return None
 
     tr_values = []
@@ -558,25 +714,37 @@ def adx_di(candles, period=14):
 
         tr_values.append(tr)
 
-        plus_dm.append(plus)
+        plus_dm.append(
+            plus
+        )
 
-        minus_dm.append(minus)
+        minus_dm.append(
+            minus
+        )
 
-    if len(tr_values) < period:
+    if len(
+        tr_values
+    ) < period:
         return None
 
     atr_val = (
-        sum(tr_values[:period])
+        sum(
+            tr_values[:period]
+        )
         / period
     )
 
     plus_val = (
-        sum(plus_dm[:period])
+        sum(
+            plus_dm[:period]
+        )
         / period
     )
 
     minus_val = (
-        sum(minus_dm[:period])
+        sum(
+            minus_dm[:period]
+        )
         / period
     )
 
@@ -589,7 +757,8 @@ def adx_di(candles, period=14):
 
         atr_val = (
             (
-                atr_val * (period - 1)
+                atr_val
+                * (period - 1)
                 + tr_values[i]
             )
             / period
@@ -597,7 +766,8 @@ def adx_di(candles, period=14):
 
         plus_val = (
             (
-                plus_val * (period - 1)
+                plus_val
+                * (period - 1)
                 + plus_dm[i]
             )
             / period
@@ -605,7 +775,8 @@ def adx_di(candles, period=14):
 
         minus_val = (
             (
-                minus_val * (period - 1)
+                minus_val
+                * (period - 1)
                 + minus_dm[i]
             )
             / period
@@ -645,11 +816,15 @@ def adx_di(candles, period=14):
 
         dx_values.append(dx)
 
-    if len(dx_values) < period:
+    if len(
+        dx_values
+    ) < period:
         return None
 
     adx_val = (
-        sum(dx_values[:period])
+        sum(
+            dx_values[:period]
+        )
         / period
     )
 
@@ -657,7 +832,8 @@ def adx_di(candles, period=14):
 
         adx_val = (
             (
-                adx_val * (period - 1)
+                adx_val
+                * (period - 1)
                 + value
             )
             / period
@@ -730,7 +906,9 @@ def candle_features(c):
     return {
         "body": body,
         "range": total,
-        "body_ratio": body / total,
+        "body_ratio": (
+            body / total
+        ),
         "upper_wick": upper,
         "lower_wick": lower,
     }
@@ -849,7 +1027,9 @@ def liquidity_status(candles):
         for c in previous
     )
 
-    features = candle_features(last)
+    features = candle_features(
+        last
+    )
 
     if (
         last["high"] > high
@@ -890,7 +1070,8 @@ def abnormal_candle(candles):
 
     if (
         last_range
-        > avg_range * MAX_CANDLE_RANGE_RATIO
+        > avg_range
+        * MAX_CANDLE_RANGE_RATIO
     ):
         return True
 
@@ -920,25 +1101,6 @@ def primary_indicator_states(
     plus_di,
     minus_di
 ):
-    """
-    Returns the directional state of the 3 primary systems.
-
-    EMA:
-        UP / DOWN / NEUTRAL
-
-    RSI:
-        UP / DOWN / NEUTRAL
-
-    ADX/DI:
-        UP / DOWN / NEUTRAL
-
-    Important:
-    ADX/DI is treated as ONE primary indicator system.
-    """
-
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
 
     if ema9 > ema21:
         ema_state = "UP"
@@ -949,12 +1111,6 @@ def primary_indicator_states(
     else:
         ema_state = "NEUTRAL"
 
-    # --------------------------------------------------------
-    # RSI
-    #
-    # 48-52 is considered neutral to avoid forcing direction.
-    # --------------------------------------------------------
-
     if rsi14 > 52:
         rsi_state = "UP"
 
@@ -963,12 +1119,6 @@ def primary_indicator_states(
 
     else:
         rsi_state = "NEUTRAL"
-
-    # --------------------------------------------------------
-    # ADX + DI
-    #
-    # ADX below MIN_ADX = neutral.
-    # --------------------------------------------------------
 
     if adx_value >= MIN_ADX:
 
@@ -1028,12 +1178,19 @@ def primary_opposition_count(
 
 def calculate_analysis(candles):
 
-    if len(candles) < MIN_CANDLES:
+    closed_candles = (
+        get_closed_candles(
+            candles
+        )
+    )
+
+    if closed_candles is None:
+
         return None
 
     closes = [
         c["close"]
-        for c in candles
+        for c in closed_candles
     ]
 
     ema9 = ema(
@@ -1052,12 +1209,12 @@ def calculate_analysis(candles):
     )
 
     adx_data = adx_di(
-        candles,
+        closed_candles,
         14
     )
 
     atr14 = atr(
-        candles,
+        closed_candles,
         14
     )
 
@@ -1070,18 +1227,20 @@ def calculate_analysis(candles):
     ):
         return None
 
-    last = candles[-1]
+    # IMPORTANT:
+    # This is the LAST CLOSED M1 candle.
+    last = closed_candles[-1]
 
     structure = market_structure(
-        candles
+        closed_candles
     )
 
     breakout = breakout_status(
-        candles
+        closed_candles
     )
 
     liquidity = liquidity_status(
-        candles
+        closed_candles
     )
 
     candle_dir = candle_direction(
@@ -1093,7 +1252,7 @@ def calculate_analysis(candles):
     )
 
     avg_range = recent_average_range(
-        candles,
+        closed_candles,
         14
     )
 
@@ -1105,7 +1264,7 @@ def calculate_analysis(candles):
     down_score = 0
 
     # ========================================================
-    # 1. EMA 9/21 = 4 points
+    # 1. EMA 9/21 = 4
     # ========================================================
 
     if ema9 > ema21:
@@ -1131,7 +1290,7 @@ def calculate_analysis(candles):
         down_score += 1
 
     # ========================================================
-    # 2. RSI14 = 3 points
+    # 2. RSI14 = 3
     # ========================================================
 
     if 53 <= rsi14 <= 68:
@@ -1151,14 +1310,20 @@ def calculate_analysis(candles):
         down_score += 1
 
     # ========================================================
-    # 3. ADX + DI = 4 points
+    # 3. ADX + DI = 4
     # ========================================================
 
-    adx_value = adx_data["adx"]
+    adx_value = adx_data[
+        "adx"
+    ]
 
-    plus_di = adx_data["plus_di"]
+    plus_di = adx_data[
+        "plus_di"
+    ]
 
-    minus_di = adx_data["minus_di"]
+    minus_di = adx_data[
+        "minus_di"
+    ]
 
     if adx_value >= 25:
 
@@ -1181,7 +1346,7 @@ def calculate_analysis(candles):
             down_score += 2
 
     # ========================================================
-    # 4. MARKET STRUCTURE = 3 points
+    # 4. MARKET STRUCTURE = 3
     # ========================================================
 
     if structure == "UP":
@@ -1193,7 +1358,7 @@ def calculate_analysis(candles):
         down_score += 3
 
     # ========================================================
-    # 5. BREAKOUT = 2 points
+    # 5. BREAKOUT = 2
     # ========================================================
 
     if breakout == "UP":
@@ -1205,7 +1370,7 @@ def calculate_analysis(candles):
         down_score += 2
 
     # ========================================================
-    # 6. CANDLE = 2 points
+    # 6. CANDLE = 2
     # ========================================================
 
     if candle["body_ratio"] >= 0.55:
@@ -1229,7 +1394,7 @@ def calculate_analysis(candles):
             down_score += 1
 
     # ========================================================
-    # 7. LIQUIDITY = 2 points
+    # 7. LIQUIDITY = 2
     # ========================================================
 
     if liquidity == "UP":
@@ -1245,12 +1410,13 @@ def calculate_analysis(candles):
     # ========================================================
 
     abnormal = abnormal_candle(
-        candles
+        closed_candles
     )
 
     volatility_ok = True
 
     if atr14 <= 0:
+
         volatility_ok = False
 
     if (
@@ -1258,6 +1424,7 @@ def calculate_analysis(candles):
         < avg_range
         * MIN_CANDLE_RANGE_RATIO
     ):
+
         volatility_ok = False
 
     if (
@@ -1265,33 +1432,47 @@ def calculate_analysis(candles):
         > avg_range
         * MAX_CANDLE_RANGE_RATIO
     ):
+
         volatility_ok = False
 
-    # ========================================================
-    # PRIMARY INDICATORS
-    # ========================================================
-
-    primary_states = primary_indicator_states(
-        ema9,
-        ema21,
-        rsi14,
-        adx_value,
-        plus_di,
-        minus_di
-    )
-
-    up_primary = primary_support_count(
-        "UP",
-        primary_states
-    )
-
-    down_primary = primary_support_count(
-        "DOWN",
-        primary_states
+    volatility_ratio = (
+        candle["range"]
+        / avg_range
+        if avg_range > 0
+        else 0
     )
 
     # ========================================================
-    # DETERMINE DIRECTION
+    # PRIMARY
+    # ========================================================
+
+    primary_states = (
+        primary_indicator_states(
+            ema9,
+            ema21,
+            rsi14,
+            adx_value,
+            plus_di,
+            minus_di
+        )
+    )
+
+    up_primary = (
+        primary_support_count(
+            "UP",
+            primary_states
+        )
+    )
+
+    down_primary = (
+        primary_support_count(
+            "DOWN",
+            primary_states
+        )
+    )
+
+    # ========================================================
+    # DIRECTION
     # ========================================================
 
     if up_score > down_score:
@@ -1311,27 +1492,6 @@ def calculate_analysis(candles):
         direction = None
 
         raw_score = 0
-
-    # ========================================================
-    # CORE ALIGNMENT
-    #
-    # NEW LOGIC:
-    #
-    # 2 of 3 primary indicators are enough.
-    #
-    # Example:
-    # EMA UP + RSI UP + ADX/DI neutral = VALID CORE
-    #
-    # EMA UP + ADX/DI UP + RSI neutral = VALID CORE
-    #
-    # RSI UP + ADX/DI UP + EMA neutral = VALID CORE
-    #
-    # But:
-    # EMA UP + RSI DOWN + ADX/DI UP
-    # = only 2 support? Actually EMA+DI support, RSI opposite.
-    # This can still pass because the third is a single conflict,
-    # but a strong opposite RSI is treated below.
-    # ========================================================
 
     if direction == "UP":
 
@@ -1357,21 +1517,15 @@ def calculate_analysis(candles):
     )
 
     # ========================================================
-    # STRONG PRIMARY CONTRADICTION
-    #
-    # A single neutral indicator is allowed.
-    # A strong contradiction from the primary system can reject.
+    # STRONG PRIMARY CONFLICT
     # ========================================================
 
     strong_primary_conflict = False
 
     if direction == "UP":
 
-        # Strong bearish EMA = direct contradiction.
         if ema9 < ema21:
 
-            # If EMA is clearly bearish while the other two
-            # are bullish, do not force the trade.
             if (
                 rsi14 < 48
                 or (
@@ -1379,9 +1533,9 @@ def calculate_analysis(candles):
                     and minus_di > plus_di
                 )
             ):
+
                 strong_primary_conflict = True
 
-        # Strong bearish RSI.
         if rsi14 < 45:
 
             if (
@@ -1391,19 +1545,22 @@ def calculate_analysis(candles):
                     and minus_di > plus_di
                 )
             ):
+
                 strong_primary_conflict = True
 
-        # Strong bearish DI.
         if (
             adx_value >= STRONG_ADX
             and minus_di > plus_di
-            and (ema9 < ema21 or rsi14 < 48)
+            and (
+                ema9 < ema21
+                or rsi14 < 48
+            )
         ):
+
             strong_primary_conflict = True
 
     elif direction == "DOWN":
 
-        # Strong bullish EMA.
         if ema9 > ema21:
 
             if (
@@ -1413,9 +1570,9 @@ def calculate_analysis(candles):
                     and plus_di > minus_di
                 )
             ):
+
                 strong_primary_conflict = True
 
-        # Strong bullish RSI.
         if rsi14 > 55:
 
             if (
@@ -1425,33 +1582,33 @@ def calculate_analysis(candles):
                     and plus_di > minus_di
                 )
             ):
+
                 strong_primary_conflict = True
 
-        # Strong bullish DI.
         if (
             adx_value >= STRONG_ADX
             and plus_di > minus_di
-            and (ema9 > ema21 or rsi14 > 52)
+            and (
+                ema9 > ema21
+                or rsi14 > 52
+            )
         ):
+
             strong_primary_conflict = True
 
     # ========================================================
     # SECONDARY CONFLICT
-    #
-    # Structure and liquidity are NOT automatically hard rejects.
-    # They are confirmations / warnings.
     # ========================================================
 
     secondary_conflict = False
 
-    # Only treat a secondary contradiction as serious when
-    # both structure and liquidity strongly disagree.
     if direction == "UP":
 
         if (
             structure == "DOWN"
             and liquidity == "DOWN"
         ):
+
             secondary_conflict = True
 
     elif direction == "DOWN":
@@ -1460,25 +1617,38 @@ def calculate_analysis(candles):
             structure == "UP"
             and liquidity == "UP"
         ):
+
             secondary_conflict = True
 
     # ========================================================
-    # FINAL CONFLICT
+    # EXACT CONFLICT REASONS
     # ========================================================
 
-    conflict = False
+    conflict_reasons = []
 
     if strong_primary_conflict:
-        conflict = True
+        conflict_reasons.append(
+            "PRIMARY"
+        )
 
     if secondary_conflict:
-        conflict = True
+        conflict_reasons.append(
+            "SECONDARY"
+        )
 
     if abnormal:
-        conflict = True
+        conflict_reasons.append(
+            "ABNORMAL"
+        )
 
     if not volatility_ok:
-        conflict = True
+        conflict_reasons.append(
+            "VOLATILITY"
+        )
+
+    conflict = bool(
+        conflict_reasons
+    )
 
     # ========================================================
     # CONFIDENCE
@@ -1499,7 +1669,6 @@ def calculate_analysis(candles):
             + gap * 0.90
         )
 
-        # Primary agreement bonus.
         if core_support == 3:
 
             confidence += 4
@@ -1508,7 +1677,6 @@ def calculate_analysis(candles):
 
             confidence += 1
 
-        # Strong ADX bonus.
         if adx_value >= 30:
 
             confidence += 3
@@ -1517,22 +1685,18 @@ def calculate_analysis(candles):
 
             confidence += 2
 
-        # Candle quality.
         if candle["body_ratio"] >= 0.65:
 
             confidence += 2
 
-        # Structure confirmation.
         if structure == direction:
 
             confidence += 1
 
-        # Breakout confirmation.
         if breakout == direction:
 
             confidence += 1
 
-        # Liquidity confirmation.
         if liquidity == direction:
 
             confidence += 1
@@ -1584,6 +1748,8 @@ def calculate_analysis(candles):
 
         "average_range": avg_range,
 
+        "volatility_ratio": volatility_ratio,
+
         "abnormal": abnormal,
 
         "volatility_ok": volatility_ok,
@@ -1596,9 +1762,14 @@ def calculate_analysis(candles):
 
         "core_aligned": core_aligned,
 
-        "strong_primary_conflict": strong_primary_conflict,
+        "strong_primary_conflict":
+            strong_primary_conflict,
 
-        "secondary_conflict": secondary_conflict,
+        "secondary_conflict":
+            secondary_conflict,
+
+        "conflict_reasons":
+            conflict_reasons,
 
         "conflict": conflict,
 
@@ -1617,7 +1788,14 @@ def cancellation_price(
     direction
 ):
 
-    recent = candles[-8:]
+    closed = get_closed_candles(
+        candles
+    )
+
+    if closed is None:
+        closed = candles
+
+    recent = closed[-8:]
 
     if direction == "UP":
 
@@ -1670,7 +1848,14 @@ def gemini_refine(
             api_key=GEMINI_API_KEY
         )
 
-        recent = candles[-20:]
+        closed = get_closed_candles(
+            candles
+        )
+
+        if closed is None:
+            closed = candles
+
+        recent = closed[-20:]
 
         compact = []
 
@@ -1731,16 +1916,16 @@ DI+:
 DI-:
 {analysis['minus_di']}
 
-Primary EMA state:
+Primary EMA:
 {analysis['primary_states']['ema']}
 
-Primary RSI state:
+Primary RSI:
 {analysis['primary_states']['rsi']}
 
-Primary ADX/DI state:
+Primary ADX/DI:
 {analysis['primary_states']['adx_di']}
 
-Primary indicators supporting direction:
+Primary support:
 {analysis['primary_support']}/3
 
 Structure:
@@ -1772,13 +1957,13 @@ Rules:
    the other two are clearly stronger and there is no major contradiction.
 7. Strong contradiction between the primary indicators must be rejected.
 8. Neutral structure is allowed.
-9. A breakout is NOT mandatory.
-10. Liquidity confirmation is NOT mandatory.
+9. Breakout is not mandatory.
+10. Liquidity confirmation is not mandatory.
 11. Reject abnormal candles.
 12. Reject extreme chasing.
-13. The strongest available M1 setup is preferred.
+13. Prefer the strongest available M1 setup.
 14. Do not invent a direction.
-15. If valid=false, the setup is rejected.
+15. If valid=false, reject the setup.
 
 Return JSON only:
 
@@ -1818,9 +2003,13 @@ Return JSON only:
 
         if not valid:
 
-            analysis["gemini_valid"] = False
+            analysis[
+                "gemini_valid"
+            ] = False
 
-            analysis["gemini_reason"] = (
+            analysis[
+                "gemini_reason"
+            ] = (
                 data.get(
                     "reason"
                 )
@@ -1836,11 +2025,17 @@ Return JSON only:
             )
         )
 
-        if direction != analysis["direction"]:
+        if direction != analysis[
+            "direction"
+        ]:
 
-            analysis["gemini_valid"] = False
+            analysis[
+                "gemini_valid"
+            ] = False
 
-            analysis["gemini_reason"] = (
+            analysis[
+                "gemini_reason"
+            ] = (
                 "Gemini direction disagreed."
             )
 
@@ -1851,32 +2046,42 @@ Return JSON only:
                 data.get(
                     "confidence"
                 ),
-                analysis["confidence"]
+                analysis[
+                    "confidence"
+                ]
             )
         )
 
-        analysis["confidence"] = int(
+        analysis[
+            "confidence"
+        ] = int(
             clamp(
                 min(
                     gemini_conf,
-                    analysis["confidence"] + 4
+                    analysis[
+                        "confidence"
+                    ] + 4
                 ),
                 MIN_CONFIDENCE,
                 MAX_CONFIDENCE
             )
         )
 
-        analysis["gemini_valid"] = True
+        analysis[
+            "gemini_valid"
+        ] = True
 
         analysis["reason"] = str(
             data.get(
                 "reason"
             )
             or
-            "Primary indicators aligned."
+            "Primary indicators support the direction."
         )[:300]
 
-        analysis["cancellation_reason"] = str(
+        analysis[
+            "cancellation_reason"
+        ] = str(
             data.get(
                 "cancellation_reason"
             )
@@ -1893,7 +2098,6 @@ Return JSON only:
             e
         )
 
-        # Technical engine remains authoritative.
         return analysis
 
 
@@ -1911,56 +2115,85 @@ def validate_signal(
     )
 
     if not analysis:
-
         return None
 
     if not analysis["direction"]:
-
         return None
 
-    # --------------------------------------------------------
-    # PRIMARY INDICATORS
-    # --------------------------------------------------------
-
-    if not analysis["core_aligned"]:
+    if not analysis[
+        "core_aligned"
+    ]:
 
         logger.info(
-            "REJECT | %s | primary support=%d/3 | "
-            "opposition=%d/3 | EMA=%s RSI=%s ADXDI=%s | "
+            "REJECT | %s | PRIMARY ALIGNMENT | "
+            "support=%d/3 opposition=%d/3 | "
+            "EMA=%s RSI=%s ADXDI=%s | "
             "UP=%d DOWN=%d",
             symbol,
-            analysis["primary_support"],
-            analysis["primary_opposition"],
-            analysis["primary_states"]["ema"],
-            analysis["primary_states"]["rsi"],
-            analysis["primary_states"]["adx_di"],
-            analysis["up_score"],
-            analysis["down_score"]
+            analysis[
+                "primary_support"
+            ],
+            analysis[
+                "primary_opposition"
+            ],
+            analysis[
+                "primary_states"
+            ]["ema"],
+            analysis[
+                "primary_states"
+            ]["rsi"],
+            analysis[
+                "primary_states"
+            ]["adx_di"],
+            analysis[
+                "up_score"
+            ],
+            analysis[
+                "down_score"
+            ]
         )
 
         return None
 
     if analysis["conflict"]:
 
+        reasons = ",".join(
+            analysis[
+                "conflict_reasons"
+            ]
+        )
+
         logger.info(
-            "REJECT | %s | conflict=%s | "
-            "strong_primary=%s | secondary=%s | "
-            "structure=%s liquidity=%s abnormal=%s",
+            "REJECT | %s | CONFLICT=%s | "
+            "range=%.8f avg=%.8f ratio=%.2f | "
+            "abnormal=%s volatility_ok=%s",
             symbol,
-            analysis["conflict"],
-            analysis["strong_primary_conflict"],
-            analysis["secondary_conflict"],
-            analysis["structure"],
-            analysis["liquidity"],
-            analysis["abnormal"]
+            reasons,
+            analysis[
+                "candle_range"
+            ],
+            analysis[
+                "average_range"
+            ],
+            analysis[
+                "volatility_ratio"
+            ],
+            analysis[
+                "abnormal"
+            ],
+            analysis[
+                "volatility_ok"
+            ]
         )
 
         return None
 
-    if analysis["score"] < MIN_SCORE:
+    if analysis[
+        "score"
+    ] < MIN_SCORE:
 
         logger.info(
-            "REJECT | %s | score=%d/20 < %d",
+            "REJECT | %s | SCORE=%d/20 < %d",
             symbol,
             analysis["score"],
             MIN_SCORE
@@ -1976,7 +2209,7 @@ def validate_signal(
     if score_gap < MIN_SCORE_GAP:
 
         logger.info(
-            "REJECT | %s | score gap=%d < %d",
+            "REJECT | %s | SCORE GAP=%d < %d",
             symbol,
             score_gap,
             MIN_SCORE_GAP
@@ -1984,18 +2217,10 @@ def validate_signal(
 
         return None
 
-    # --------------------------------------------------------
-    # ADX
-    #
-    # If ADX/DI is one of the two supporting indicators,
-    # ADX must be >= MIN_ADX.
-    #
-    # If EMA + RSI are the two supporters and ADX/DI is neutral,
-    # the signal can still pass.
-    # --------------------------------------------------------
-
     if (
-        analysis["primary_states"]["adx_di"]
+        analysis[
+            "primary_states"
+        ]["adx_di"]
         == analysis["direction"]
         and analysis["adx"] < MIN_ADX
     ):
@@ -2009,47 +2234,45 @@ def validate_signal(
 
         return None
 
-    # --------------------------------------------------------
-    # FINAL PRIMARY DIRECTION CHECK
-    # --------------------------------------------------------
-
     if analysis["direction"] == "UP":
 
         if (
-            analysis["ema9"] < analysis["ema21"]
-            and analysis["rsi"] < 45
+            analysis["ema9"]
+            < analysis["ema21"]
+            and analysis["rsi"]
+            < 45
         ):
-
             return None
 
         if (
             analysis["adx"] >= STRONG_ADX
-            and analysis["minus_di"] > analysis["plus_di"]
-            and analysis["ema9"] < analysis["ema21"]
+            and analysis["minus_di"]
+            > analysis["plus_di"]
+            and analysis["ema9"]
+            < analysis["ema21"]
         ):
-
             return None
 
-    elif analysis["direction"] == "DOWN":
+    elif analysis[
+        "direction"
+    ] == "DOWN":
 
         if (
-            analysis["ema9"] > analysis["ema21"]
-            and analysis["rsi"] > 55
+            analysis["ema9"]
+            > analysis["ema21"]
+            and analysis["rsi"]
+            > 55
         ):
-
             return None
 
         if (
             analysis["adx"] >= STRONG_ADX
-            and analysis["plus_di"] > analysis["minus_di"]
-            and analysis["ema9"] > analysis["ema21"]
+            and analysis["plus_di"]
+            > analysis["minus_di"]
+            and analysis["ema9"]
+            > analysis["ema21"]
         ):
-
             return None
-
-    # --------------------------------------------------------
-    # GEMINI
-    # --------------------------------------------------------
 
     analysis = gemini_refine(
         symbol,
@@ -2075,7 +2298,9 @@ def validate_signal(
     analysis["cancellation"] = (
         cancellation_price(
             candles,
-            analysis["direction"]
+            analysis[
+                "direction"
+            ]
         )
     )
 
@@ -2090,7 +2315,9 @@ def choose_best_pair():
 
     candidates = []
 
-    current_time = now_timestamp()
+    current_time = (
+        now_timestamp()
+    )
 
     with data_lock:
 
@@ -2120,7 +2347,16 @@ def choose_best_pair():
         ):
             continue
 
-        if len(candles) < MIN_CANDLES:
+        if len(candles) < (
+            REQUIRED_TOTAL_CANDLES
+        ):
+            logger.info(
+                "CANDIDATE SKIP | %s | "
+                "candles=%d need=%d",
+                symbol,
+                len(candles),
+                REQUIRED_TOTAL_CANDLES
+            )
             continue
 
         analysis = calculate_analysis(
@@ -2130,62 +2366,104 @@ def choose_best_pair():
         if not analysis:
             continue
 
-        if not analysis["direction"]:
-
-            logger.info(
-                "CANDIDATE SKIP | %s | no direction | "
-                "UP=%d DOWN=%d",
-                symbol,
-                analysis["up_score"],
-                analysis["down_score"]
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Primary indicators
-        # ----------------------------------------------------
-
-        if not analysis["core_aligned"]:
+        if not analysis[
+            "direction"
+        ]:
 
             logger.info(
                 "CANDIDATE SKIP | %s | "
-                "primary=%d/3 | opposition=%d/3 | "
+                "NO DIRECTION | UP=%d DOWN=%d",
+                symbol,
+                analysis[
+                    "up_score"
+                ],
+                analysis[
+                    "down_score"
+                ]
+            )
+
+            continue
+
+        if not analysis[
+            "core_aligned"
+        ]:
+
+            logger.info(
+                "CANDIDATE SKIP | %s | "
+                "PRIMARY=%d/3 OPP=%d/3 | "
                 "EMA=%s RSI=%s ADXDI=%s | "
                 "UP=%d DOWN=%d",
                 symbol,
-                analysis["primary_support"],
-                analysis["primary_opposition"],
-                analysis["primary_states"]["ema"],
-                analysis["primary_states"]["rsi"],
-                analysis["primary_states"]["adx_di"],
-                analysis["up_score"],
-                analysis["down_score"]
+                analysis[
+                    "primary_support"
+                ],
+                analysis[
+                    "primary_opposition"
+                ],
+                analysis[
+                    "primary_states"
+                ]["ema"],
+                analysis[
+                    "primary_states"
+                ]["rsi"],
+                analysis[
+                    "primary_states"
+                ]["adx_di"],
+                analysis[
+                    "up_score"
+                ],
+                analysis[
+                    "down_score"
+                ]
             )
 
             continue
 
-        if analysis["conflict"]:
+        if analysis[
+            "conflict"
+        ]:
+
+            reasons = ",".join(
+                analysis[
+                    "conflict_reasons"
+                ]
+            )
 
             logger.info(
-                "CANDIDATE SKIP | %s | conflict | "
-                "strong_primary=%s secondary=%s "
-                "structure=%s liquidity=%s",
+                "CANDIDATE SKIP | %s | "
+                "CONFLICT=%s | "
+                "primary=%d/3 | "
+                "structure=%s liquidity=%s | "
+                "range_ratio=%.2f",
                 symbol,
-                analysis["strong_primary_conflict"],
-                analysis["secondary_conflict"],
-                analysis["structure"],
-                analysis["liquidity"]
+                reasons,
+                analysis[
+                    "primary_support"
+                ],
+                analysis[
+                    "structure"
+                ],
+                analysis[
+                    "liquidity"
+                ],
+                analysis[
+                    "volatility_ratio"
+                ]
             )
 
             continue
 
-        if analysis["score"] < MIN_SCORE:
+        if analysis[
+            "score"
+        ] < MIN_SCORE:
 
             logger.info(
-                "CANDIDATE SKIP | %s | score=%d/20",
+                "CANDIDATE SKIP | %s | "
+                "SCORE=%d/20",
                 symbol,
-                analysis["score"]
+                analysis[
+                    "score"
+                ]
             )
 
             continue
@@ -2198,18 +2476,21 @@ def choose_best_pair():
         if score_gap < MIN_SCORE_GAP:
 
             logger.info(
-                "CANDIDATE SKIP | %s | gap=%d",
+                "CANDIDATE SKIP | %s | "
+                "GAP=%d",
                 symbol,
                 score_gap
             )
 
             continue
 
-        # ADX only mandatory when it is the directional supporter.
         if (
-            analysis["primary_states"]["adx_di"]
+            analysis[
+                "primary_states"
+            ]["adx_di"]
             == analysis["direction"]
-            and analysis["adx"] < MIN_ADX
+            and analysis["adx"]
+            < MIN_ADX
         ):
 
             logger.info(
@@ -2220,10 +2501,6 @@ def choose_best_pair():
 
             continue
 
-        # ----------------------------------------------------
-        # Quality ranking
-        # ----------------------------------------------------
-
         quality = float(
             analysis["score"]
         )
@@ -2232,25 +2509,34 @@ def choose_best_pair():
             score_gap * 0.7
         )
 
-        # Primary agreement.
-        if analysis["primary_support"] == 3:
+        if (
+            analysis[
+                "primary_support"
+            ] == 3
+        ):
 
             quality += 3.0
 
-        elif analysis["primary_support"] == 2:
+        elif (
+            analysis[
+                "primary_support"
+            ] == 2
+        ):
 
             quality += 1.0
 
-        # Strong ADX bonus.
-        if analysis["adx"] >= 30:
+        if analysis[
+            "adx"
+        ] >= 30:
 
             quality += 2.0
 
-        elif analysis["adx"] >= 25:
+        elif analysis[
+            "adx"
+        ] >= 25:
 
             quality += 1.0
 
-        # Structure confirmation.
         if (
             analysis["structure"]
             == analysis["direction"]
@@ -2258,7 +2544,6 @@ def choose_best_pair():
 
             quality += 1.5
 
-        # Breakout confirmation.
         if (
             analysis["breakout"]
             == analysis["direction"]
@@ -2266,16 +2551,18 @@ def choose_best_pair():
 
             quality += 1.0
 
-        # Candle confirmation.
         if (
-            analysis["candle_direction"]
+            analysis[
+                "candle_direction"
+            ]
             == analysis["direction"]
-            and analysis["body_ratio"] >= 0.45
+            and analysis[
+                "body_ratio"
+            ] >= 0.45
         ):
 
             quality += 1.0
 
-        # Liquidity confirmation.
         if (
             analysis["liquidity"]
             == analysis["direction"]
@@ -2283,11 +2570,13 @@ def choose_best_pair():
 
             quality += 1.0
 
-        # Slight penalty for opposite structure only.
-        # It is not an automatic rejection.
         if (
             analysis["structure"]
-            not in ("NONE", "NEUTRAL", analysis["direction"])
+            not in (
+                "NONE",
+                "NEUTRAL",
+                analysis["direction"]
+            )
         ):
 
             quality -= 1.0
@@ -2304,13 +2593,11 @@ def choose_best_pair():
         return None
 
     candidates.sort(
-        key=lambda x: x["quality"],
+        key=lambda x: x[
+            "quality"
+        ],
         reverse=True
     )
-
-    # --------------------------------------------------------
-    # Diagnostic log
-    # --------------------------------------------------------
 
     top = candidates[:8]
 
@@ -2384,7 +2671,9 @@ async def send_message(text):
             return False
 
 
-def send_message_threadsafe(text):
+def send_message_threadsafe(
+    text
+):
 
     global telegram_loop
 
@@ -2472,8 +2761,8 @@ def build_signal_text(
     reason = analysis.get(
         "reason",
         (
-            "Primary indicators support the direction. "
-            "EMA 9/21 + RSI 14 + ADX/DI confirmation."
+            "EMA 9/21 + RSI 14 + "
+            "ADX/DI support the direction."
         )
     )
 
@@ -2495,9 +2784,11 @@ def build_signal_text(
         f"📈 UP Score: *{up_score}/20*\n"
         f"📉 DOWN Score: *{down_score}/20*\n\n"
         f"⏱️ Entry after: *1 minute*\n"
-        f"🕐 *ENTRY TIME: {fmt_time(entry_time)} 🇩🇿*\n\n"
+        f"🕐 *ENTRY TIME: "
+        f"{fmt_time(entry_time)} 🇩🇿*\n\n"
         f"💰 Price: *{price:.6f}*\n"
-        f"❌ Cancellation: *{cancellation:.6f}*\n\n"
+        f"❌ Cancellation: "
+        f"*{cancellation:.6f}*\n\n"
         f"🧠 *Reason:*\n"
         f"{reason}\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -2550,7 +2841,9 @@ def send_one_signal(
 
                 return False
 
-            if cycle["recovery_used"]:
+            if cycle[
+                "recovery_used"
+            ]:
 
                 logger.info(
                     "Recovery blocked: already used."
@@ -2574,7 +2867,6 @@ def send_one_signal(
             analysis
         )
 
-        # Same exact setup protection.
         if (
             cycle["setup_key"]
             == setup_key
@@ -2588,7 +2880,9 @@ def send_one_signal(
 
         cycle["active"] = True
 
-        cycle["trade_type"] = trade_type
+        cycle["trade_type"] = (
+            trade_type
+        )
 
         cycle["symbol"] = symbol
 
@@ -2608,18 +2902,26 @@ def send_one_signal(
 
         cycle["last_signal"] = {
             "symbol": symbol,
-            "direction": analysis["direction"],
+            "direction":
+                analysis["direction"],
             "trade_type": trade_type,
-            "score": analysis["score"],
-            "confidence": analysis["confidence"],
-            "price": analysis["price"],
-            "candle_time": analysis["candle_time"],
-            "sent_at": now_timestamp(),
+            "score":
+                analysis["score"],
+            "confidence":
+                analysis["confidence"],
+            "price":
+                analysis["price"],
+            "candle_time":
+                analysis["candle_time"],
+            "sent_at":
+                now_timestamp(),
         }
 
         if trade_type == "BASE":
 
-            cycle["base_symbol"] = symbol
+            cycle["base_symbol"] = (
+                symbol
+            )
 
             cycle["base_direction"] = (
                 analysis["direction"]
@@ -2629,9 +2931,13 @@ def send_one_signal(
 
             cycle["recovery_used"] = True
 
-            cycle["recovery_requested"] = False
+            cycle[
+                "recovery_requested"
+            ] = False
 
-            cycle["recovery_requested_at"] = 0
+            cycle[
+                "recovery_requested_at"
+            ] = 0
 
     text = build_signal_text(
         symbol,
@@ -2663,27 +2969,39 @@ def send_one_signal(
 
             elif trade_type == "RECOVERY":
 
-                cycle["recovery_used"] = False
+                cycle[
+                    "recovery_used"
+                ] = False
 
-                cycle["recovery_requested"] = True
+                cycle[
+                    "recovery_requested"
+                ] = True
 
-                cycle["recovery_requested_at"] = (
-                    now_timestamp()
-                )
+                cycle[
+                    "recovery_requested_at"
+                ] = now_timestamp()
 
         return False
 
     with data_lock:
 
         history.append({
-            "time": now_algiers().isoformat(),
-            "symbol": symbol,
-            "trade_type": trade_type,
-            "direction": analysis["direction"],
-            "score": analysis["score"],
-            "confidence": analysis["confidence"],
-            "price": analysis["price"],
-            "result": "PENDING",
+            "time":
+                now_algiers().isoformat(),
+            "symbol":
+                symbol,
+            "trade_type":
+                trade_type,
+            "direction":
+                analysis["direction"],
+            "score":
+                analysis["score"],
+            "confidence":
+                analysis["confidence"],
+            "price":
+                analysis["price"],
+            "result":
+                "PENDING",
         })
 
         if len(history) > 100:
@@ -2691,14 +3009,16 @@ def send_one_signal(
             del history[:-100]
 
     logger.info(
-        "SIGNAL SENT | %s | %s | %s | %s/20 | "
-        "primary=%s/3 | confidence=%s%%",
+        "SIGNAL SENT | %s | %s | %s | "
+        "%s/20 | primary=%s/3 | "
+        "confidence=%s%% | candle=%s",
         symbol,
         trade_type,
         analysis["direction"],
         analysis["score"],
         analysis["primary_support"],
-        analysis["confidence"]
+        analysis["confidence"],
+        analysis["candle_time"]
     )
 
     return True
@@ -2744,12 +3064,18 @@ def analyze_and_send_base():
         ]
 
         logger.info(
-            "BEST CANDIDATE | %s | %s | %d/20 | "
-            "primary=%d/3",
+            "BEST CANDIDATE | %s | %s | "
+            "%d/20 | primary=%d/3",
             symbol,
-            candidate["analysis"]["direction"],
-            candidate["analysis"]["score"],
-            candidate["analysis"]["primary_support"]
+            candidate[
+                "analysis"
+            ]["direction"],
+            candidate[
+                "analysis"
+            ]["score"],
+            candidate[
+                "analysis"
+            ]["primary_support"]
         )
 
         analysis = validate_signal(
@@ -2813,21 +3139,18 @@ def analyze_and_send_recovery():
                 - requested_at
             )
 
-            if elapsed < RECOVERY_WAIT_SECONDS:
+            if elapsed < (
+                RECOVERY_WAIT_SECONDS
+            ):
 
                 logger.info(
-                    "Recovery waiting for fresh setup | "
+                    "Recovery waiting | "
                     "%.0fs/%ss",
                     elapsed,
                     RECOVERY_WAIT_SECONDS
                 )
 
                 return False
-
-    # --------------------------------------------------------
-    # Recovery now searches all available pairs.
-    # It does not blindly reuse the BASE pair.
-    # --------------------------------------------------------
 
     candidate = choose_best_pair()
 
@@ -2850,8 +3173,12 @@ def analyze_and_send_recovery():
     logger.info(
         "RECOVERY CANDIDATE | %s | %s | %d/20",
         symbol,
-        candidate["analysis"]["direction"],
-        candidate["analysis"]["score"]
+        candidate[
+            "analysis"
+        ]["direction"],
+        candidate[
+            "analysis"
+        ]["score"]
     )
 
     analysis = validate_signal(
@@ -2879,13 +3206,19 @@ def analyze_and_send_recovery():
 # MT4 DATA
 # ============================================================
 
-def process_mt4_payload(payload):
+def process_mt4_payload(
+    payload
+):
 
-    if not isinstance(payload, dict):
+    if not isinstance(
+        payload,
+        dict
+    ):
 
         return {
             "ok": False,
-            "error": "Invalid JSON object"
+            "error":
+                "Invalid JSON object"
         }
 
     symbol = str(
@@ -2916,34 +3249,44 @@ def process_mt4_payload(payload):
 
         return {
             "ok": False,
-            "error": "Missing symbol"
+            "error":
+                "Missing symbol"
         }
 
     if timeframe != "M1":
 
         return {
             "ok": False,
-            "error": "Only M1 is accepted"
+            "error":
+                "Only M1 is accepted"
         }
 
     if len(candles) < 10:
 
         return {
             "ok": False,
-            "error": "Not enough candles"
+            "error":
+                "Not enough candles"
         }
 
     with data_lock:
 
-        data_store[symbol] = {
-            "symbol": symbol,
-            "timeframe": "M1",
-            "candles": candles[-150:],
-            "received_at": now_timestamp(),
+        data_store[
+            symbol
+        ] = {
+            "symbol":
+                symbol,
+            "timeframe":
+                "M1",
+            "candles":
+                candles[-150:],
+            "received_at":
+                now_timestamp(),
         }
 
     logger.info(
-        "MT4 DATA | %s | candles=%d",
+        "MT4 DATA | %s | candles=%d | "
+        "forming_excluded=yes",
         symbol,
         len(candles)
     )
@@ -2957,42 +3300,41 @@ def process_mt4_payload(payload):
 
         try:
 
-            # ------------------------------------------------
-            # BASE
-            # ------------------------------------------------
-
             with cycle_lock:
 
-                active = cycle["active"]
-
-                pending = cycle["pending"]
-
-                recovery_requested = (
-                    cycle["recovery_requested"]
+                active = (
+                    cycle["active"]
                 )
 
-                trade_type = cycle["trade_type"]
+                pending = (
+                    cycle["pending"]
+                )
+
+                recovery_requested = (
+                    cycle[
+                        "recovery_requested"
+                    ]
+                )
+
+                trade_type = (
+                    cycle[
+                        "trade_type"
+                    ]
+                )
 
             if pending:
                 return
 
-            # ------------------------------------------------
-            # RECOVERY
-            # ------------------------------------------------
-
             if (
                 active
-                and trade_type == "RECOVERY"
+                and trade_type
+                == "RECOVERY"
                 and recovery_requested
             ):
 
                 analyze_and_send_recovery()
 
                 return
-
-            # ------------------------------------------------
-            # BASE
-            # ------------------------------------------------
 
             if active:
                 return
@@ -3013,6 +3355,13 @@ def process_mt4_payload(payload):
         "symbol": symbol,
         "timeframe": timeframe,
         "candles": len(candles),
+        "closed_candles_used":
+            max(
+                0,
+                len(candles) - 1
+            ),
+        "forming_candle_excluded":
+            True,
     }
 
 
@@ -3080,9 +3429,12 @@ class MT4Handler(
                 200,
                 {
                     "ok": True,
-                    "service": "ZinoProSignalAI",
-                    "status": "running",
-                    "mode": "MT4-M1",
+                    "service":
+                        "ZinoProSignalAI",
+                    "status":
+                        "running",
+                    "mode":
+                        "MT4-M1",
                 }
             )
 
@@ -3102,41 +3454,56 @@ class MT4Handler(
                     info
                 ) in data_store.items():
 
-                    symbols[symbol] = {
-                        "candles": len(
-                            info.get(
-                                "candles",
-                                []
-                            )
-                        ),
-                        "age_seconds": round(
-                            now_timestamp()
-                            - info.get(
-                                "received_at",
-                                now_timestamp()
+                    symbols[
+                        symbol
+                    ] = {
+                        "candles":
+                            len(
+                                info.get(
+                                    "candles",
+                                    []
+                                )
                             ),
-                            1
-                        )
+                        "age_seconds":
+                            round(
+                                now_timestamp()
+                                - info.get(
+                                    "received_at",
+                                    now_timestamp()
+                                ),
+                                1
+                            )
                     }
 
             with cycle_lock:
 
                 cycle_copy = {
-                    "active": cycle["active"],
-                    "trade_type": cycle["trade_type"],
-                    "symbol": cycle["symbol"],
-                    "direction": cycle["direction"],
-                    "pending": cycle["pending"],
-                    "recovery_used": cycle["recovery_used"],
-                    "recovery_requested": cycle["recovery_requested"],
+                    "active":
+                        cycle["active"],
+                    "trade_type":
+                        cycle["trade_type"],
+                    "symbol":
+                        cycle["symbol"],
+                    "direction":
+                        cycle["direction"],
+                    "pending":
+                        cycle["pending"],
+                    "recovery_used":
+                        cycle["recovery_used"],
+                    "recovery_requested":
+                        cycle[
+                            "recovery_requested"
+                        ],
                 }
 
             self._send_json(
                 200,
                 {
                     "ok": True,
-                    "cycle": cycle_copy,
-                    "symbols": symbols,
+                    "cycle":
+                        cycle_copy,
+                    "symbols":
+                        symbols,
                 }
             )
 
@@ -3146,7 +3513,8 @@ class MT4Handler(
             404,
             {
                 "ok": False,
-                "error": "Not found"
+                "error":
+                    "Not found"
             }
         )
 
@@ -3165,7 +3533,8 @@ class MT4Handler(
                 404,
                 {
                     "ok": False,
-                    "error": "Not found"
+                    "error":
+                        "Not found"
                 }
             )
 
@@ -3202,7 +3571,8 @@ class MT4Handler(
                 400,
                 {
                     "ok": False,
-                    "error": "Empty body"
+                    "error":
+                        "Empty body"
                 }
             )
 
@@ -3226,7 +3596,8 @@ class MT4Handler(
                 400,
                 {
                     "ok": False,
-                    "error": "Invalid JSON"
+                    "error":
+                        "Invalid JSON"
                 }
             )
 
@@ -3255,7 +3626,8 @@ class MT4Handler(
                     401,
                     {
                         "ok": False,
-                        "error": "Unauthorized"
+                        "error":
+                            "Unauthorized"
                     }
                 )
 
@@ -3265,13 +3637,21 @@ class MT4Handler(
             payload
         )
 
-        if result.get("ok"):
+        if result.get(
+            "ok"
+        ):
 
-            result["accepted"] = True
+            result[
+                "accepted"
+            ] = True
 
-            result["batch_complete"] = True
+            result[
+                "batch_complete"
+            ] = True
 
-            result["batch_id"] = (
+            result[
+                "batch_id"
+            ] = (
                 f"{result['symbol']}_"
                 f"{int(time.time())}"
             )
@@ -3323,7 +3703,8 @@ async def start_command(
         "🎓 ZinoProSignalAI\n\n"
         "✅ MT4 M1 engine ready.\n"
         "🎯 One strongest trade only.\n"
-        "♻️ One recovery maximum.\n\n"
+        "♻️ One recovery maximum.\n"
+        "🕯️ Closed-candle analysis.\n\n"
         "Strategy:\n"
         "EMA 9/21 + RSI 14 + ADX/DI 14\n"
         "Primary confirmation: 2/3 minimum\n\n"
@@ -3401,14 +3782,22 @@ async def stats_command(
     text = (
         "📊 *ZinoProSignalAI STATS*\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 BASE WIN: {stats['base_win']}\n"
-        f"🔴 BASE LOSS: {stats['base_loss']}\n"
-        f"♻️ RECOVERY WIN: {stats['recovery_win']}\n"
-        f"♻️ RECOVERY LOSS: {stats['recovery_loss']}\n\n"
-        f"🏆 TOTAL WIN: {total_wins}\n"
-        f"❌ TOTAL LOSS: {total_losses}\n"
-        f"📈 WIN RATE: {winrate:.1f}%\n\n"
-        f"🔄 CURRENT CYCLE: {current}\n"
+        f"🟢 BASE WIN: "
+        f"{stats['base_win']}\n"
+        f"🔴 BASE LOSS: "
+        f"{stats['base_loss']}\n"
+        f"♻️ RECOVERY WIN: "
+        f"{stats['recovery_win']}\n"
+        f"♻️ RECOVERY LOSS: "
+        f"{stats['recovery_loss']}\n\n"
+        f"🏆 TOTAL WIN: "
+        f"{total_wins}\n"
+        f"❌ TOTAL LOSS: "
+        f"{total_losses}\n"
+        f"📈 WIN RATE: "
+        f"{winrate:.1f}%\n\n"
+        f"🔄 CURRENT CYCLE: "
+        f"{current}\n"
         f"⏳ PENDING: "
         f"{'YES' if pending else 'NO'}\n"
         f"♻️ RECOVERY USED: "
@@ -3448,7 +3837,9 @@ async def history_command(
         "━━━━━━━━━━━━━━━━━━"
     ]
 
-    for item in reversed(items):
+    for item in reversed(
+        items
+    ):
 
         direction = item[
             "direction"
@@ -3512,11 +3903,15 @@ async def win_command(
 
         if trade_type == "BASE":
 
-            stats["base_win"] += 1
+            stats[
+                "base_win"
+            ] += 1
 
         elif trade_type == "RECOVERY":
 
-            stats["recovery_win"] += 1
+            stats[
+                "recovery_win"
+            ] += 1
 
         with data_lock:
 
@@ -3535,7 +3930,9 @@ async def win_command(
                     == trade_type
                 ):
 
-                    item["result"] = "WIN"
+                    item[
+                        "result"
+                    ] = "WIN"
 
                     break
 
@@ -3551,9 +3948,13 @@ async def win_command(
 
         cycle["recovery_used"] = False
 
-        cycle["recovery_requested"] = False
+        cycle[
+            "recovery_requested"
+        ] = False
 
-        cycle["recovery_requested_at"] = 0
+        cycle[
+            "recovery_requested_at"
+        ] = 0
 
         cycle["setup_key"] = None
 
@@ -3604,7 +4005,9 @@ async def loss_command(
 
         if trade_type == "BASE":
 
-            stats["base_loss"] += 1
+            stats[
+                "base_loss"
+            ] += 1
 
             with data_lock:
 
@@ -3623,29 +4026,41 @@ async def loss_command(
                         == "BASE"
                     ):
 
-                        item["result"] = "LOSS"
+                        item[
+                            "result"
+                        ] = "LOSS"
 
                         break
 
-            cycle["trade_type"] = (
-                "RECOVERY"
-            )
+            cycle[
+                "trade_type"
+            ] = "RECOVERY"
 
-            cycle["pending"] = False
+            cycle[
+                "pending"
+            ] = False
 
-            cycle["recovery_used"] = False
+            cycle[
+                "recovery_used"
+            ] = False
 
-            cycle["recovery_requested"] = True
+            cycle[
+                "recovery_requested"
+            ] = True
 
-            cycle["recovery_requested_at"] = (
-                now_timestamp()
-            )
+            cycle[
+                "recovery_requested_at"
+            ] = now_timestamp()
 
-            cycle["last_signal"] = None
+            cycle[
+                "last_signal"
+            ] = None
 
         else:
 
-            stats["recovery_loss"] += 1
+            stats[
+                "recovery_loss"
+            ] += 1
 
             with data_lock:
 
@@ -3664,29 +4079,47 @@ async def loss_command(
                         == "RECOVERY"
                     ):
 
-                        item["result"] = "LOSS"
+                        item[
+                            "result"
+                        ] = "LOSS"
 
                         break
 
             cycle["active"] = False
 
-            cycle["trade_type"] = None
+            cycle[
+                "trade_type"
+            ] = None
 
             cycle["symbol"] = None
 
-            cycle["direction"] = None
+            cycle[
+                "direction"
+            ] = None
 
-            cycle["pending"] = False
+            cycle[
+                "pending"
+            ] = False
 
-            cycle["recovery_used"] = False
+            cycle[
+                "recovery_used"
+            ] = False
 
-            cycle["recovery_requested"] = False
+            cycle[
+                "recovery_requested"
+            ] = False
 
-            cycle["recovery_requested_at"] = 0
+            cycle[
+                "recovery_requested_at"
+            ] = 0
 
-            cycle["setup_key"] = None
+            cycle[
+                "setup_key"
+            ] = None
 
-            cycle["last_signal"] = None
+            cycle[
+                "last_signal"
+            ] = None
 
     if trade_type == "BASE":
 
@@ -3700,12 +4133,6 @@ async def loss_command(
             "⚠️ إذا الشروط ضعيفة، لن يتم إرسال Recovery.",
             parse_mode="Markdown"
         )
-
-        # ----------------------------------------------------
-        # First attempt after waiting.
-        # Later MT4 data can trigger another attempt.
-        # Recovery is still limited to ONE successful signal.
-        # ----------------------------------------------------
 
         await asyncio.sleep(
             RECOVERY_WAIT_SECONDS
@@ -3775,27 +4202,45 @@ async def reset_command(
 
         cycle["recovery_used"] = False
 
-        cycle["recovery_requested"] = False
+        cycle[
+            "recovery_requested"
+        ] = False
 
-        cycle["recovery_requested_at"] = 0
+        cycle[
+            "recovery_requested_at"
+        ] = 0
 
-        cycle["generating"] = False
+        cycle[
+            "generating"
+        ] = False
 
-        cycle["setup_key"] = None
+        cycle[
+            "setup_key"
+        ] = None
 
-        cycle["last_signal"] = None
+        cycle[
+            "last_signal"
+        ] = None
 
     with data_lock:
 
         history.clear()
 
-        stats["base_win"] = 0
+        stats[
+            "base_win"
+        ] = 0
 
-        stats["base_loss"] = 0
+        stats[
+            "base_loss"
+        ] = 0
 
-        stats["recovery_win"] = 0
+        stats[
+            "recovery_win"
+        ] = 0
 
-        stats["recovery_loss"] = 0
+        stats[
+            "recovery_loss"
+        ] = 0
 
     await update.message.reply_text(
         "♻️ تم Reset بالكامل.\n"
@@ -3852,7 +4297,8 @@ async def mt4status_command(
 
             status = (
                 "🟢"
-                if age <= MAX_DATA_AGE_SECONDS
+                if age <=
+                MAX_DATA_AGE_SECONDS
                 else
                 "🔴"
             )
@@ -3968,12 +4414,16 @@ async def analyze_command(
         []
     )
 
-    if len(candles) < MIN_CANDLES:
+    if len(candles) < (
+        REQUIRED_TOTAL_CANDLES
+    ):
 
         await update.message.reply_text(
             f"⚠️ {symbol} عنده فقط "
             f"{len(candles)} شمعة.\n"
-            f"المطلوب {MIN_CANDLES}."
+            f"المطلوب {REQUIRED_TOTAL_CANDLES} "
+            f"لتحليل آخر {MIN_CANDLES} "
+            "شمعة مغلقة."
         )
 
         return
@@ -3990,7 +4440,8 @@ async def analyze_command(
             f"setup مطابق للشروط.\n\n"
             f"الحد الأدنى: {MIN_SCORE}/20\n"
             "المطلوب دعم من 2/3 على الأقل "
-            "من EMA + RSI + ADX/DI."
+            "من EMA + RSI + ADX/DI.\n"
+            "والتحليل يتم على آخر شمعة مغلقة."
         )
 
         return
