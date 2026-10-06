@@ -1,4 +1,3 @@
-  
 import os
 import json
 import time
@@ -69,13 +68,7 @@ MIN_CANDLES = 50
 
 ENTRY_DELAY_SECONDS = 60
 
-# ------------------------------------------------------------
-# IMPORTANT:
-# Previous value 16 was too strict.
-# 13 gives the engine room to find good setups while the
-# mandatory EMA + RSI + ADX/DI alignment still protects it.
-# ------------------------------------------------------------
-
+# Minimum technical score.
 MIN_SCORE = 13
 
 MAX_SCORE = 20
@@ -91,7 +84,7 @@ MIN_CONFIDENCE = 76
 # Minimum difference between UP and DOWN scores.
 MIN_SCORE_GAP = 2
 
-# Minimum ADX.
+# Minimum ADX when ADX is being used as a directional signal.
 MIN_ADX = 20.0
 
 # Strong ADX threshold.
@@ -105,6 +98,9 @@ MAX_CANDLE_RANGE_RATIO = 2.8
 
 # Avoid a repeated exact setup.
 SETUP_REPEAT_BLOCK_SECONDS = 240
+
+# Recovery waits for fresh market data before trying again.
+RECOVERY_WAIT_SECONDS = 60
 
 
 # ============================================================
@@ -152,6 +148,8 @@ cycle = {
     "direction": None,
     "pending": False,
     "recovery_used": False,
+    "recovery_requested": False,
+    "recovery_requested_at": 0,
     "generating": False,
     "setup_key": None,
     "last_signal_time": 0,
@@ -911,6 +909,120 @@ def candle_direction(c):
 
 
 # ============================================================
+# PRIMARY INDICATOR STATES
+# ============================================================
+
+def primary_indicator_states(
+    ema9,
+    ema21,
+    rsi14,
+    adx_value,
+    plus_di,
+    minus_di
+):
+    """
+    Returns the directional state of the 3 primary systems.
+
+    EMA:
+        UP / DOWN / NEUTRAL
+
+    RSI:
+        UP / DOWN / NEUTRAL
+
+    ADX/DI:
+        UP / DOWN / NEUTRAL
+
+    Important:
+    ADX/DI is treated as ONE primary indicator system.
+    """
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    if ema9 > ema21:
+        ema_state = "UP"
+
+    elif ema9 < ema21:
+        ema_state = "DOWN"
+
+    else:
+        ema_state = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # RSI
+    #
+    # 48-52 is considered neutral to avoid forcing direction.
+    # --------------------------------------------------------
+
+    if rsi14 > 52:
+        rsi_state = "UP"
+
+    elif rsi14 < 48:
+        rsi_state = "DOWN"
+
+    else:
+        rsi_state = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # ADX + DI
+    #
+    # ADX below MIN_ADX = neutral.
+    # --------------------------------------------------------
+
+    if adx_value >= MIN_ADX:
+
+        if plus_di > minus_di:
+            di_state = "UP"
+
+        elif minus_di > plus_di:
+            di_state = "DOWN"
+
+        else:
+            di_state = "NEUTRAL"
+
+    else:
+
+        di_state = "NEUTRAL"
+
+    return {
+        "ema": ema_state,
+        "rsi": rsi_state,
+        "adx_di": di_state,
+    }
+
+
+def primary_support_count(
+    direction,
+    states
+):
+
+    return sum(
+        1
+        for state in states.values()
+        if state == direction
+    )
+
+
+def primary_opposition_count(
+    direction,
+    states
+):
+
+    opposite = (
+        "DOWN"
+        if direction == "UP"
+        else "UP"
+    )
+
+    return sum(
+        1
+        for state in states.values()
+        if state == opposite
+    )
+
+
+# ============================================================
 # TECHNICAL ANALYSIS
 # ============================================================
 
@@ -1156,6 +1268,29 @@ def calculate_analysis(candles):
         volatility_ok = False
 
     # ========================================================
+    # PRIMARY INDICATORS
+    # ========================================================
+
+    primary_states = primary_indicator_states(
+        ema9,
+        ema21,
+        rsi14,
+        adx_value,
+        plus_di,
+        minus_di
+    )
+
+    up_primary = primary_support_count(
+        "UP",
+        primary_states
+    )
+
+    down_primary = primary_support_count(
+        "DOWN",
+        primary_states
+    )
+
+    # ========================================================
     # DETERMINE DIRECTION
     # ========================================================
 
@@ -1178,102 +1313,166 @@ def calculate_analysis(candles):
         raw_score = 0
 
     # ========================================================
-    # CORE INDICATOR ALIGNMENT
+    # CORE ALIGNMENT
     #
-    # This is the most important change.
+    # NEW LOGIC:
     #
-    # EMA + RSI + ADX/DI must agree.
-    # Price action is confirmation, not a mandatory condition.
+    # 2 of 3 primary indicators are enough.
+    #
+    # Example:
+    # EMA UP + RSI UP + ADX/DI neutral = VALID CORE
+    #
+    # EMA UP + ADX/DI UP + RSI neutral = VALID CORE
+    #
+    # RSI UP + ADX/DI UP + EMA neutral = VALID CORE
+    #
+    # But:
+    # EMA UP + RSI DOWN + ADX/DI UP
+    # = only 2 support? Actually EMA+DI support, RSI opposite.
+    # This can still pass because the third is a single conflict,
+    # but a strong opposite RSI is treated below.
     # ========================================================
-
-    core_aligned = False
 
     if direction == "UP":
 
-        ema_ok = (
-            ema9 > ema21
-        )
+        core_support = up_primary
 
-        rsi_ok = (
-            rsi14 >= 50
-        )
-
-        di_ok = (
-            plus_di > minus_di
-        )
-
-        core_aligned = (
-            ema_ok
-            and rsi_ok
-            and di_ok
-            and adx_value >= MIN_ADX
-        )
+        core_opposition = down_primary
 
     elif direction == "DOWN":
 
-        ema_ok = (
-            ema9 < ema21
-        )
+        core_support = down_primary
 
-        rsi_ok = (
-            rsi14 <= 50
-        )
+        core_opposition = up_primary
 
-        di_ok = (
-            minus_di > plus_di
-        )
+    else:
 
-        core_aligned = (
-            ema_ok
-            and rsi_ok
-            and di_ok
-            and adx_value >= MIN_ADX
-        )
+        core_support = 0
+
+        core_opposition = 0
+
+    core_aligned = (
+        core_support >= 2
+        and core_opposition <= 1
+    )
 
     # ========================================================
-    # CONFLICT
+    # STRONG PRIMARY CONTRADICTION
     #
-    # We no longer reject simply because structure is neutral.
-    # We reject only real contradictions.
+    # A single neutral indicator is allowed.
+    # A strong contradiction from the primary system can reject.
+    # ========================================================
+
+    strong_primary_conflict = False
+
+    if direction == "UP":
+
+        # Strong bearish EMA = direct contradiction.
+        if ema9 < ema21:
+
+            # If EMA is clearly bearish while the other two
+            # are bullish, do not force the trade.
+            if (
+                rsi14 < 48
+                or (
+                    adx_value >= STRONG_ADX
+                    and minus_di > plus_di
+                )
+            ):
+                strong_primary_conflict = True
+
+        # Strong bearish RSI.
+        if rsi14 < 45:
+
+            if (
+                ema9 < ema21
+                or (
+                    adx_value >= STRONG_ADX
+                    and minus_di > plus_di
+                )
+            ):
+                strong_primary_conflict = True
+
+        # Strong bearish DI.
+        if (
+            adx_value >= STRONG_ADX
+            and minus_di > plus_di
+            and (ema9 < ema21 or rsi14 < 48)
+        ):
+            strong_primary_conflict = True
+
+    elif direction == "DOWN":
+
+        # Strong bullish EMA.
+        if ema9 > ema21:
+
+            if (
+                rsi14 > 52
+                or (
+                    adx_value >= STRONG_ADX
+                    and plus_di > minus_di
+                )
+            ):
+                strong_primary_conflict = True
+
+        # Strong bullish RSI.
+        if rsi14 > 55:
+
+            if (
+                ema9 > ema21
+                or (
+                    adx_value >= STRONG_ADX
+                    and plus_di > minus_di
+                )
+            ):
+                strong_primary_conflict = True
+
+        # Strong bullish DI.
+        if (
+            adx_value >= STRONG_ADX
+            and plus_di > minus_di
+            and (ema9 > ema21 or rsi14 > 52)
+        ):
+            strong_primary_conflict = True
+
+    # ========================================================
+    # SECONDARY CONFLICT
+    #
+    # Structure and liquidity are NOT automatically hard rejects.
+    # They are confirmations / warnings.
+    # ========================================================
+
+    secondary_conflict = False
+
+    # Only treat a secondary contradiction as serious when
+    # both structure and liquidity strongly disagree.
+    if direction == "UP":
+
+        if (
+            structure == "DOWN"
+            and liquidity == "DOWN"
+        ):
+            secondary_conflict = True
+
+    elif direction == "DOWN":
+
+        if (
+            structure == "UP"
+            and liquidity == "UP"
+        ):
+            secondary_conflict = True
+
+    # ========================================================
+    # FINAL CONFLICT
     # ========================================================
 
     conflict = False
 
-    if direction == "UP":
+    if strong_primary_conflict:
+        conflict = True
 
-        if ema9 <= ema21:
-            conflict = True
-
-        if rsi14 < 50:
-            conflict = True
-
-        if plus_di <= minus_di:
-            conflict = True
-
-        # Strong opposite structure is a real warning.
-        if structure == "DOWN":
-            conflict = True
-
-        # Strong opposite liquidity sweep is a warning.
-        if liquidity == "DOWN":
-            conflict = True
-
-    elif direction == "DOWN":
-
-        if ema9 >= ema21:
-            conflict = True
-
-        if rsi14 > 50:
-            conflict = True
-
-        if minus_di <= plus_di:
-            conflict = True
-
-        if structure == "UP":
-            conflict = True
-
-        if liquidity == "UP":
-            conflict = True
+    if secondary_conflict:
+        conflict = True
 
     if abnormal:
         conflict = True
@@ -1300,6 +1499,16 @@ def calculate_analysis(candles):
             + gap * 0.90
         )
 
+        # Primary agreement bonus.
+        if core_support == 3:
+
+            confidence += 4
+
+        elif core_support == 2:
+
+            confidence += 1
+
+        # Strong ADX bonus.
         if adx_value >= 30:
 
             confidence += 3
@@ -1308,15 +1517,23 @@ def calculate_analysis(candles):
 
             confidence += 2
 
+        # Candle quality.
         if candle["body_ratio"] >= 0.65:
 
             confidence += 2
 
+        # Structure confirmation.
         if structure == direction:
 
             confidence += 1
 
+        # Breakout confirmation.
         if breakout == direction:
+
+            confidence += 1
+
+        # Liquidity confirmation.
+        if liquidity == direction:
 
             confidence += 1
 
@@ -1371,7 +1588,17 @@ def calculate_analysis(candles):
 
         "volatility_ok": volatility_ok,
 
+        "primary_states": primary_states,
+
+        "primary_support": core_support,
+
+        "primary_opposition": core_opposition,
+
         "core_aligned": core_aligned,
+
+        "strong_primary_conflict": strong_primary_conflict,
+
+        "secondary_conflict": secondary_conflict,
 
         "conflict": conflict,
 
@@ -1504,6 +1731,18 @@ DI+:
 DI-:
 {analysis['minus_di']}
 
+Primary EMA state:
+{analysis['primary_states']['ema']}
+
+Primary RSI state:
+{analysis['primary_states']['rsi']}
+
+Primary ADX/DI state:
+{analysis['primary_states']['adx_di']}
+
+Primary indicators supporting direction:
+{analysis['primary_support']}/3
+
 Structure:
 {analysis['structure']}
 
@@ -1519,9 +1758,6 @@ Candle:
 Body ratio:
 {analysis['body_ratio']}
 
-Core indicators aligned:
-{analysis['core_aligned']}
-
 Candles:
 {json.dumps(compact)}
 
@@ -1530,16 +1766,19 @@ Rules:
 1. Do not invent information.
 2. Do not force a trade.
 3. EMA9/EMA21, RSI14 and ADX/DI are the primary indicators.
-4. The three primary indicators should support the candidate direction.
-5. Neutral structure is allowed.
-6. A breakout is NOT mandatory.
-7. Reject abnormal candles.
-8. Reject extreme chasing.
-9. Reject clear contradiction between the primary indicators.
-10. We want the strongest available M1 setup.
-11. Do not require every secondary condition to be present.
-12. If valid=false, the setup is rejected.
-13. Never invent a direction.
+4. At least 2 of the 3 primary indicators may support the candidate.
+5. A neutral third primary indicator is allowed.
+6. One non-neutral opposite primary indicator is allowed only when
+   the other two are clearly stronger and there is no major contradiction.
+7. Strong contradiction between the primary indicators must be rejected.
+8. Neutral structure is allowed.
+9. A breakout is NOT mandatory.
+10. Liquidity confirmation is NOT mandatory.
+11. Reject abnormal candles.
+12. Reject extreme chasing.
+13. The strongest available M1 setup is preferred.
+14. Do not invent a direction.
+15. If valid=false, the setup is rejected.
 
 Return JSON only:
 
@@ -1634,7 +1873,7 @@ Return JSON only:
                 "reason"
             )
             or
-            "EMA + RSI + ADX/DI aligned."
+            "Primary indicators aligned."
         )[:300]
 
         analysis["cancellation_reason"] = str(
@@ -1680,22 +1919,23 @@ def validate_signal(
         return None
 
     # --------------------------------------------------------
-    # PRIMARY REQUIREMENT
+    # PRIMARY INDICATORS
     # --------------------------------------------------------
 
     if not analysis["core_aligned"]:
 
         logger.info(
-            "REJECT | %s | core indicators not aligned | "
-            "EMA9=%.6f EMA21=%.6f RSI=%.2f ADX=%.2f "
-            "DI+=%.2f DI-=%.2f",
+            "REJECT | %s | primary support=%d/3 | "
+            "opposition=%d/3 | EMA=%s RSI=%s ADXDI=%s | "
+            "UP=%d DOWN=%d",
             symbol,
-            analysis["ema9"],
-            analysis["ema21"],
-            analysis["rsi"],
-            analysis["adx"],
-            analysis["plus_di"],
-            analysis["minus_di"]
+            analysis["primary_support"],
+            analysis["primary_opposition"],
+            analysis["primary_states"]["ema"],
+            analysis["primary_states"]["rsi"],
+            analysis["primary_states"]["adx_di"],
+            analysis["up_score"],
+            analysis["down_score"]
         )
 
         return None
@@ -1703,10 +1943,13 @@ def validate_signal(
     if analysis["conflict"]:
 
         logger.info(
-            "REJECT | %s | conflict=%s structure=%s "
-            "liquidity=%s abnormal=%s",
+            "REJECT | %s | conflict=%s | "
+            "strong_primary=%s | secondary=%s | "
+            "structure=%s liquidity=%s abnormal=%s",
             symbol,
             analysis["conflict"],
+            analysis["strong_primary_conflict"],
+            analysis["secondary_conflict"],
             analysis["structure"],
             analysis["liquidity"],
             analysis["abnormal"]
@@ -1741,7 +1984,21 @@ def validate_signal(
 
         return None
 
-    if analysis["adx"] < MIN_ADX:
+    # --------------------------------------------------------
+    # ADX
+    #
+    # If ADX/DI is one of the two supporting indicators,
+    # ADX must be >= MIN_ADX.
+    #
+    # If EMA + RSI are the two supporters and ADX/DI is neutral,
+    # the signal can still pass.
+    # --------------------------------------------------------
+
+    if (
+        analysis["primary_states"]["adx_di"]
+        == analysis["direction"]
+        and analysis["adx"] < MIN_ADX
+    ):
 
         logger.info(
             "REJECT | %s | ADX %.2f < %.2f",
@@ -1753,31 +2010,39 @@ def validate_signal(
         return None
 
     # --------------------------------------------------------
-    # FINAL DIRECTION CHECK
+    # FINAL PRIMARY DIRECTION CHECK
     # --------------------------------------------------------
 
     if analysis["direction"] == "UP":
 
-        if analysis["rsi"] < 50:
+        if (
+            analysis["ema9"] < analysis["ema21"]
+            and analysis["rsi"] < 45
+        ):
 
             return None
 
         if (
-            analysis["plus_di"]
-            <= analysis["minus_di"]
+            analysis["adx"] >= STRONG_ADX
+            and analysis["minus_di"] > analysis["plus_di"]
+            and analysis["ema9"] < analysis["ema21"]
         ):
 
             return None
 
     elif analysis["direction"] == "DOWN":
 
-        if analysis["rsi"] > 50:
+        if (
+            analysis["ema9"] > analysis["ema21"]
+            and analysis["rsi"] > 55
+        ):
 
             return None
 
         if (
-            analysis["minus_di"]
-            <= analysis["plus_di"]
+            analysis["adx"] >= STRONG_ADX
+            and analysis["plus_di"] > analysis["minus_di"]
+            and analysis["ema9"] > analysis["ema21"]
         ):
 
             return None
@@ -1866,17 +2131,9 @@ def choose_best_pair():
             continue
 
         if not analysis["direction"]:
-            continue
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Only primary indicator alignment is mandatory here.
-        # ----------------------------------------------------
-
-        if not analysis["core_aligned"]:
 
             logger.info(
-                "CANDIDATE SKIP | %s | core not aligned | "
+                "CANDIDATE SKIP | %s | no direction | "
                 "UP=%d DOWN=%d",
                 symbol,
                 analysis["up_score"],
@@ -1885,13 +2142,52 @@ def choose_best_pair():
 
             continue
 
+        # ----------------------------------------------------
+        # Primary indicators
+        # ----------------------------------------------------
+
+        if not analysis["core_aligned"]:
+
+            logger.info(
+                "CANDIDATE SKIP | %s | "
+                "primary=%d/3 | opposition=%d/3 | "
+                "EMA=%s RSI=%s ADXDI=%s | "
+                "UP=%d DOWN=%d",
+                symbol,
+                analysis["primary_support"],
+                analysis["primary_opposition"],
+                analysis["primary_states"]["ema"],
+                analysis["primary_states"]["rsi"],
+                analysis["primary_states"]["adx_di"],
+                analysis["up_score"],
+                analysis["down_score"]
+            )
+
+            continue
+
         if analysis["conflict"]:
+
+            logger.info(
+                "CANDIDATE SKIP | %s | conflict | "
+                "strong_primary=%s secondary=%s "
+                "structure=%s liquidity=%s",
+                symbol,
+                analysis["strong_primary_conflict"],
+                analysis["secondary_conflict"],
+                analysis["structure"],
+                analysis["liquidity"]
+            )
+
             continue
 
         if analysis["score"] < MIN_SCORE:
-            continue
 
-        if analysis["adx"] < MIN_ADX:
+            logger.info(
+                "CANDIDATE SKIP | %s | score=%d/20",
+                symbol,
+                analysis["score"]
+            )
+
             continue
 
         score_gap = abs(
@@ -1900,6 +2196,28 @@ def choose_best_pair():
         )
 
         if score_gap < MIN_SCORE_GAP:
+
+            logger.info(
+                "CANDIDATE SKIP | %s | gap=%d",
+                symbol,
+                score_gap
+            )
+
+            continue
+
+        # ADX only mandatory when it is the directional supporter.
+        if (
+            analysis["primary_states"]["adx_di"]
+            == analysis["direction"]
+            and analysis["adx"] < MIN_ADX
+        ):
+
+            logger.info(
+                "CANDIDATE SKIP | %s | ADX=%.2f",
+                symbol,
+                analysis["adx"]
+            )
+
             continue
 
         # ----------------------------------------------------
@@ -1914,7 +2232,16 @@ def choose_best_pair():
             score_gap * 0.7
         )
 
-        # Strong ADX bonus
+        # Primary agreement.
+        if analysis["primary_support"] == 3:
+
+            quality += 3.0
+
+        elif analysis["primary_support"] == 2:
+
+            quality += 1.0
+
+        # Strong ADX bonus.
         if analysis["adx"] >= 30:
 
             quality += 2.0
@@ -1923,7 +2250,7 @@ def choose_best_pair():
 
             quality += 1.0
 
-        # Structure confirmation
+        # Structure confirmation.
         if (
             analysis["structure"]
             == analysis["direction"]
@@ -1931,7 +2258,7 @@ def choose_best_pair():
 
             quality += 1.5
 
-        # Breakout confirmation
+        # Breakout confirmation.
         if (
             analysis["breakout"]
             == analysis["direction"]
@@ -1939,7 +2266,7 @@ def choose_best_pair():
 
             quality += 1.0
 
-        # Candle confirmation
+        # Candle confirmation.
         if (
             analysis["candle_direction"]
             == analysis["direction"]
@@ -1948,13 +2275,22 @@ def choose_best_pair():
 
             quality += 1.0
 
-        # Liquidity confirmation
+        # Liquidity confirmation.
         if (
             analysis["liquidity"]
             == analysis["direction"]
         ):
 
             quality += 1.0
+
+        # Slight penalty for opposite structure only.
+        # It is not an automatic rejection.
+        if (
+            analysis["structure"]
+            not in ("NONE", "NEUTRAL", analysis["direction"])
+        ):
+
+            quality -= 1.0
 
         candidates.append({
             "symbol": symbol,
@@ -1976,7 +2312,7 @@ def choose_best_pair():
     # Diagnostic log
     # --------------------------------------------------------
 
-    top = candidates[:5]
+    top = candidates[:8]
 
     logger.info(
         "TOP CANDIDATES: %s",
@@ -1985,6 +2321,8 @@ def choose_best_pair():
                 f"{x['symbol']} "
                 f"{x['analysis']['direction']} "
                 f"{x['analysis']['score']}/20 "
+                f"PRIMARY="
+                f"{x['analysis']['primary_support']}/3 "
                 f"Q={x['quality']:.1f}"
             )
             for x in top
@@ -2108,10 +2446,6 @@ def build_signal_text(
         "confidence"
     ]
 
-    score = analysis[
-        "score"
-    ]
-
     up_score = analysis[
         "up_score"
     ]
@@ -2137,7 +2471,10 @@ def build_signal_text(
 
     reason = analysis.get(
         "reason",
-        "EMA 9/21 + RSI 14 + ADX/DI aligned."
+        (
+            "Primary indicators support the direction. "
+            "EMA 9/21 + RSI 14 + ADX/DI confirmation."
+        )
     )
 
     if trade_type == "BASE":
@@ -2237,7 +2574,7 @@ def send_one_signal(
             analysis
         )
 
-        # Same exact setup protection
+        # Same exact setup protection.
         if (
             cycle["setup_key"]
             == setup_key
@@ -2292,6 +2629,10 @@ def send_one_signal(
 
             cycle["recovery_used"] = True
 
+            cycle["recovery_requested"] = False
+
+            cycle["recovery_requested_at"] = 0
+
     text = build_signal_text(
         symbol,
         analysis,
@@ -2324,6 +2665,12 @@ def send_one_signal(
 
                 cycle["recovery_used"] = False
 
+                cycle["recovery_requested"] = True
+
+                cycle["recovery_requested_at"] = (
+                    now_timestamp()
+                )
+
         return False
 
     with data_lock:
@@ -2344,11 +2691,13 @@ def send_one_signal(
             del history[:-100]
 
     logger.info(
-        "SIGNAL SENT | %s | %s | %s | %s/20 | confidence=%s%%",
+        "SIGNAL SENT | %s | %s | %s | %s/20 | "
+        "primary=%s/3 | confidence=%s%%",
         symbol,
         trade_type,
         analysis["direction"],
         analysis["score"],
+        analysis["primary_support"],
         analysis["confidence"]
     )
 
@@ -2395,10 +2744,12 @@ def analyze_and_send_base():
         ]
 
         logger.info(
-            "BEST CANDIDATE | %s | %s | %d/20",
+            "BEST CANDIDATE | %s | %s | %d/20 | "
+            "primary=%d/3",
             symbol,
             candidate["analysis"]["direction"],
-            candidate["analysis"]["score"]
+            candidate["analysis"]["score"],
+            candidate["analysis"]["primary_support"]
         )
 
         analysis = validate_signal(
@@ -2451,29 +2802,57 @@ def analyze_and_send_recovery():
         ):
             return False
 
-        symbol = cycle[
-            "symbol"
+        requested_at = cycle[
+            "recovery_requested_at"
         ]
 
-    with data_lock:
+        if requested_at > 0:
 
-        info = data_store.get(
-            symbol
-        )
-
-        if not info:
-            return False
-
-        candles = list(
-            info.get(
-                "candles",
-                []
+            elapsed = (
+                now_timestamp()
+                - requested_at
             )
-        )
 
-    if len(candles) < MIN_CANDLES:
+            if elapsed < RECOVERY_WAIT_SECONDS:
+
+                logger.info(
+                    "Recovery waiting for fresh setup | "
+                    "%.0fs/%ss",
+                    elapsed,
+                    RECOVERY_WAIT_SECONDS
+                )
+
+                return False
+
+    # --------------------------------------------------------
+    # Recovery now searches all available pairs.
+    # It does not blindly reuse the BASE pair.
+    # --------------------------------------------------------
+
+    candidate = choose_best_pair()
+
+    if not candidate:
+
+        logger.info(
+            "Recovery: no strong candidate yet."
+        )
 
         return False
+
+    symbol = candidate[
+        "symbol"
+    ]
+
+    candles = candidate[
+        "candles"
+    ]
+
+    logger.info(
+        "RECOVERY CANDIDATE | %s | %s | %d/20",
+        symbol,
+        candidate["analysis"]["direction"],
+        candidate["analysis"]["score"]
+    )
 
     analysis = validate_signal(
         symbol,
@@ -2483,7 +2862,7 @@ def analyze_and_send_recovery():
     if not analysis:
 
         logger.info(
-            "Recovery setup not strong enough."
+            "Recovery candidate failed final validation."
         )
 
         return False
@@ -2578,13 +2957,45 @@ def process_mt4_payload(payload):
 
         try:
 
+            # ------------------------------------------------
+            # BASE
+            # ------------------------------------------------
+
             with cycle_lock:
 
-                if cycle["pending"]:
-                    return
+                active = cycle["active"]
 
-                if cycle["active"]:
-                    return
+                pending = cycle["pending"]
+
+                recovery_requested = (
+                    cycle["recovery_requested"]
+                )
+
+                trade_type = cycle["trade_type"]
+
+            if pending:
+                return
+
+            # ------------------------------------------------
+            # RECOVERY
+            # ------------------------------------------------
+
+            if (
+                active
+                and trade_type == "RECOVERY"
+                and recovery_requested
+            ):
+
+                analyze_and_send_recovery()
+
+                return
+
+            # ------------------------------------------------
+            # BASE
+            # ------------------------------------------------
+
+            if active:
+                return
 
             analyze_and_send_base()
 
@@ -2717,6 +3128,7 @@ class MT4Handler(
                     "direction": cycle["direction"],
                     "pending": cycle["pending"],
                     "recovery_used": cycle["recovery_used"],
+                    "recovery_requested": cycle["recovery_requested"],
                 }
 
             self._send_json(
@@ -2913,7 +3325,8 @@ async def start_command(
         "🎯 One strongest trade only.\n"
         "♻️ One recovery maximum.\n\n"
         "Strategy:\n"
-        "EMA 9/21 + RSI 14 + ADX/DI 14\n\n"
+        "EMA 9/21 + RSI 14 + ADX/DI 14\n"
+        "Primary confirmation: 2/3 minimum\n\n"
         "Commands:\n"
         "/stats\n"
         "/history\n"
@@ -2952,6 +3365,10 @@ async def stats_command(
 
         recovery_used = cycle[
             "recovery_used"
+        ]
+
+        recovery_requested = cycle[
+            "recovery_requested"
         ]
 
     total_wins = (
@@ -2995,7 +3412,9 @@ async def stats_command(
         f"⏳ PENDING: "
         f"{'YES' if pending else 'NO'}\n"
         f"♻️ RECOVERY USED: "
-        f"{'YES' if recovery_used else 'NO'}"
+        f"{'YES' if recovery_used else 'NO'}\n"
+        f"🔎 RECOVERY WAITING: "
+        f"{'YES' if recovery_requested else 'NO'}"
     )
 
     await update.message.reply_text(
@@ -3132,6 +3551,10 @@ async def win_command(
 
         cycle["recovery_used"] = False
 
+        cycle["recovery_requested"] = False
+
+        cycle["recovery_requested_at"] = 0
+
         cycle["setup_key"] = None
 
         cycle["last_signal"] = None
@@ -3212,6 +3635,12 @@ async def loss_command(
 
             cycle["recovery_used"] = False
 
+            cycle["recovery_requested"] = True
+
+            cycle["recovery_requested_at"] = (
+                now_timestamp()
+            )
+
             cycle["last_signal"] = None
 
         else:
@@ -3251,6 +3680,10 @@ async def loss_command(
 
             cycle["recovery_used"] = False
 
+            cycle["recovery_requested"] = False
+
+            cycle["recovery_requested_at"] = 0
+
             cycle["setup_key"] = None
 
             cycle["last_signal"] = None
@@ -3262,12 +3695,21 @@ async def loss_command(
             "━━━━━━━━━━━━━━━━━━\n"
             f"📊 {symbol} | {direction}\n\n"
             "♻️ Recovery 1/1 مسموحة.\n"
-            "🔍 سيتم فحص الحركة الجديدة بدقة.\n"
-            "⚠️ لن يتم إرسال Recovery إذا كانت الشروط ضعيفة.",
+            "⏳ سيتم انتظار حركة جديدة لمدة دقيقة.\n"
+            "🔍 بعدها سيتم فحص جميع الأزواج واختيار أقوى Recovery.\n"
+            "⚠️ إذا الشروط ضعيفة، لن يتم إرسال Recovery.",
             parse_mode="Markdown"
         )
 
-        await asyncio.sleep(2)
+        # ----------------------------------------------------
+        # First attempt after waiting.
+        # Later MT4 data can trigger another attempt.
+        # Recovery is still limited to ONE successful signal.
+        # ----------------------------------------------------
+
+        await asyncio.sleep(
+            RECOVERY_WAIT_SECONDS
+        )
 
         def recovery_worker():
 
@@ -3332,6 +3774,10 @@ async def reset_command(
         cycle["pending"] = False
 
         cycle["recovery_used"] = False
+
+        cycle["recovery_requested"] = False
+
+        cycle["recovery_requested_at"] = 0
 
         cycle["generating"] = False
 
@@ -3429,6 +3875,11 @@ async def mt4status_command(
         lines.append(
             f"⏳ Pending: "
             f"{'YES' if cycle['pending'] else 'NO'}"
+        )
+
+        lines.append(
+            f"♻️ Recovery waiting: "
+            f"{'YES' if cycle['recovery_requested'] else 'NO'}"
         )
 
     await update.message.reply_text(
@@ -3538,7 +3989,8 @@ async def analyze_command(
             f"❌ {symbol} لا يملك حالياً "
             f"setup مطابق للشروط.\n\n"
             f"الحد الأدنى: {MIN_SCORE}/20\n"
-            "والـEMA + RSI + ADX/DI لازم يكونوا متفقين."
+            "المطلوب دعم من 2/3 على الأقل "
+            "من EMA + RSI + ADX/DI."
         )
 
         return
@@ -3720,4 +4172,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
