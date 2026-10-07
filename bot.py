@@ -1,3 +1,4 @@
+ ```python
 import os
 import json
 import logging
@@ -23,8 +24,9 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
 try:
-    OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+    OWNER_ID = int(OWNER_ID_RAW)
 except Exception:
     OWNER_ID = 0
 
@@ -33,81 +35,38 @@ MT4_API_KEY = (
     or os.getenv("ZINO_API_KEY", "").strip()
 )
 
-try:
-    PORT = int(os.getenv("PORT", "10000"))
-except Exception:
-    PORT = 10000
+PORT = int(os.getenv("PORT", "10000"))
 
-TIMEZONE = ZoneInfo("Africa/Algiers")
+ALGIERS_TZ = ZoneInfo("Africa/Algiers")
 
-# Default timeframe.
-# MT4 can also send "timeframe" in the JSON payload.
-DEFAULT_TIMEFRAME = "M1"
+BOT_NAME = "ZinoProSignalAI"
 
-MIN_CANDLES = 60
-REQUIRED_TOTAL_CANDLES = 61
+# ------------------------------------------------------------
+# SIGNAL FILTERS
+# ------------------------------------------------------------
 
-# Signal entry is deliberately after 2 candles for M1.
-ENTRY_DELAY_SECONDS = 120
-
-# Recovery waiting period.
-RECOVERY_WAIT_SECONDS = 120
-
-# ============================================================
-# SCORE SYSTEM
-#
-# EXACT MAX = 20
-#
-# Structure       3
-# Breakout        3
-# Liquidity       2
-# Momentum        2
-# Candle          2
-# RSI             1
-# Oscillators     2
-# Moving Average  3
-# ADX / DI        2
-# ----------------
-# TOTAL           20
-# ============================================================
-
-MAX_SCORE = 20
-
-MIN_SCORE = 14
-MIN_SCORE_GAP = 3
-
-MIN_CONFIDENCE = 76
-MAX_CONFIDENCE = 89
+MIN_SCORE = 15
+MIN_SCORE_GAP = 4
 
 MIN_ADX = 20.0
 STRONG_ADX = 25.0
 
-MAX_DATA_AGE_SECONDS = 90
+MAX_BASE_CONFIDENCE = 89
+MAX_RECOVERY_CONFIDENCE = 89
 
-RECOVERY_LIMIT = 1
+DATA_FRESH_SECONDS = 90
 
-RECOVERY_MIN_SCORE = 16
-RECOVERY_MIN_GAP = 4
-RECOVERY_MIN_ADX = 25.0
+# Exactly one recovery.
+MAX_RECOVERY = 1
 
-SETUP_REPEAT_BLOCK_SECONDS = 300
+# Prevent repeated BASE signals for the same direction.
+BASE_COOLDOWN_SECONDS = 300
 
-FRESH_SETUP_ATR_RATIO = 0.35
+# Minimum price movement before allowing a new same-direction signal.
+MIN_PRICE_MOVE_ATR = 0.35
 
-# Avoid chasing extreme RSI.
-EXTREME_RSI_UP = 78
-EXTREME_RSI_DOWN = 22
-
-# Avoid candles that are abnormally large compared with recent candles.
-MAX_CANDLE_RANGE_RATIO = 2.6
-
-# Very small candles are unreliable.
-MIN_CANDLE_BODY_RATIO = 0.25
-
-# Breakout settings.
-BREAKOUT_LOOKBACK = 20
-BREAKOUT_ATR_MULTIPLIER = 0.25
-BREAKOUT_RETEST_TOLERANCE = 0.20
+# Minimum RSI change before allowing another same-direction setup.
+MIN_RSI_CHANGE = 5.0
 
 
 # ============================================================
@@ -119,85 +78,51 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger("ZinoProSignalAI")
+logger = logging.getLogger(BOT_NAME)
 
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
-data_store = {}
+state_lock = threading.RLock()
 
-data_lock = threading.RLock()
-cycle_lock = threading.RLock()
+latest_market = {}
 
-telegram_app = None
-telegram_loop = None
+last_signal = None
 
-shutdown_event = threading.Event()
+signal_history = []
 
-cycle = {
-    "active": False,
-    "stage": "IDLE",
+wins = 0
+losses = 0
 
-    "base_symbol": None,
-    "base_direction": None,
-    "base_price": None,
-    "base_entry_time": None,
+recovery_used = 0
+recovery_skips = 0
 
-    "recovery_count": 0,
+last_base_by_symbol = {}
 
-    "pending_signal": None,
-
-    "last_result": None,
-    "recovery_ready_at": None,
-}
-
-stats = {
-    "signals": 0,
-    "wins": 0,
-    "losses": 0,
-
-    "base_signals": 0,
-    "base_wins": 0,
-    "base_losses": 0,
-
-    "recovery_signals": 0,
-    "recovery_wins": 0,
-    "recovery_losses": 0,
-
-    "recovery_skips": 0,
-}
-
-history = []
-
-recent_base_setups = {}
+pending_recovery = {}
 
 
 # ============================================================
 # BASIC HELPERS
 # ============================================================
 
-def now_algeria():
-    return datetime.now(TIMEZONE)
+def now_algiers():
+    return datetime.now(ALGIERS_TZ)
 
 
-def now_string():
-    return now_algeria().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def time_string(dt):
-    if not dt:
-        return "--:--:--"
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TIMEZONE)
-
-    return dt.astimezone(TIMEZONE).strftime("%H:%M:%S")
+def format_price(price, digits=5):
+    try:
+        return f"{float(price):.{digits}f}"
+    except Exception:
+        return str(price)
 
 
 def safe_float(value, default=None):
     try:
+        if value is None:
+            return default
         return float(value)
     except Exception:
         return default
@@ -210,91 +135,45 @@ def safe_int(value, default=0):
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def normalize_symbol(symbol):
+    if not symbol:
+        return "UNKNOWN"
+
+    return str(symbol).upper().replace("/", "").replace(" ", "")
 
 
-def fmt_price(price):
-    if price is None:
-        return "--"
+def normalize_timeframe(tf):
+    if tf is None:
+        return "M1"
 
-    try:
-        p = float(price)
-
-        if abs(p) >= 100:
-            return f"{p:.3f}"
-
-        if abs(p) >= 10:
-            return f"{p:.4f}"
-
-        return f"{p:.5f}"
-
-    except Exception:
-        return str(price)
-
-
-def direction_emoji(direction):
-    return "🟢" if direction == "UP" else "🔴"
-
-
-def opposite_direction(direction):
-    if direction == "UP":
-        return "DOWN"
-
-    if direction == "DOWN":
-        return "UP"
-
-    return None
-
-
-def is_owner(update):
-    if not update or not update.effective_user:
-        return False
-
-    return update.effective_user.id == OWNER_ID
-
-
-def normalize_timeframe(value):
-    if value is None:
-        return DEFAULT_TIMEFRAME
-
-    text = str(value).strip().upper()
+    text = str(tf).upper().strip()
 
     aliases = {
         "1": "M1",
-        "1M": "M1",
-        "M1": "M1",
-
         "2": "M2",
-        "2M": "M2",
-        "M2": "M2",
-
         "3": "M3",
-        "3M": "M3",
-        "M3": "M3",
-
         "5": "M5",
-        "5M": "M5",
-        "M5": "M5",
-
         "15": "M15",
-        "15M": "M15",
-        "M15": "M15",
-
         "30": "M30",
-        "30M": "M30",
-        "M30": "M30",
-
         "60": "H1",
-        "H1": "H1",
+        "240": "H4",
+        "1440": "D1",
+        "1M": "M1",
+        "2M": "M2",
+        "3M": "M3",
+        "5M": "M5",
+        "15M": "M15",
+        "30M": "M30",
         "1H": "H1",
+        "4H": "H4",
+        "1D": "D1",
     }
 
-    return aliases.get(text, DEFAULT_TIMEFRAME)
+    return aliases.get(text, text)
 
 
-def timeframe_minutes(timeframe):
-    tf = normalize_timeframe(timeframe)
+def timeframe_minutes(tf):
+    tf = normalize_timeframe(tf)
 
     mapping = {
         "M1": 1,
@@ -304,38 +183,68 @@ def timeframe_minutes(timeframe):
         "M15": 15,
         "M30": 30,
         "H1": 60,
+        "H4": 240,
+        "D1": 1440,
     }
 
     return mapping.get(tf, 1)
 
 
-def entry_delay_for_timeframe(timeframe):
+def entry_delay_minutes(tf):
     """
-    For M1:
-        2 minutes.
+    Binary-option style entry delay.
 
-    For M2:
-        2 minutes.
-
-    For M3:
-        3 minutes.
-
-    For higher timeframes:
-        one candle.
+    M1 -> 2 minutes
+    M2 -> 2 minutes
+    M3 -> 3 minutes
+    Higher TF -> one candle
     """
 
-    minutes = timeframe_minutes(timeframe)
+    tf = normalize_timeframe(tf)
 
-    if minutes <= 1:
-        return 120
+    if tf == "M1":
+        return 2
 
-    if minutes <= 2:
-        return 120
+    if tf == "M2":
+        return 2
 
-    if minutes <= 3:
-        return 180
+    if tf == "M3":
+        return 3
 
-    return minutes * 60
+    return timeframe_minutes(tf)
+
+
+def parse_timestamp(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(
+                float(value),
+                tz=ALGIERS_TZ,
+            )
+        except Exception:
+            return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    try:
+        text = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ALGIERS_TZ)
+
+        return dt.astimezone(ALGIERS_TZ)
+
+    except Exception:
+        pass
+
+    return None
 
 
 # ============================================================
@@ -346,111 +255,137 @@ def normalize_candle(c):
     if not isinstance(c, dict):
         return None
 
-    t = (
+    timestamp = (
         c.get("time")
         if c.get("time") is not None
         else c.get("timestamp")
     )
 
-    o = safe_float(c.get("open"))
-    h = safe_float(c.get("high"))
-    l = safe_float(c.get("low"))
-    cl = safe_float(c.get("close"))
+    if timestamp is None:
+        timestamp = c.get("date")
 
-    if o is None or h is None or l is None or cl is None:
-        return None
-
-    volume = safe_float(
-        c.get("volume"),
-        safe_float(c.get("tick_volume"), 0.0),
+    o = (
+        c.get("open")
+        if c.get("open") is not None
+        else c.get("o")
     )
 
+    h = (
+        c.get("high")
+        if c.get("high") is not None
+        else c.get("h")
+    )
+
+    l = (
+        c.get("low")
+        if c.get("low") is not None
+        else c.get("l")
+    )
+
+    close = (
+        c.get("close")
+        if c.get("close") is not None
+        else c.get("c")
+    )
+
+    volume = (
+        c.get("volume")
+        if c.get("volume") is not None
+        else c.get("tick_volume", 0)
+    )
+
+    o = safe_float(o)
+    h = safe_float(h)
+    l = safe_float(l)
+    close = safe_float(close)
+    volume = safe_float(volume, 0)
+
+    if None in (o, h, l, close):
+        return None
+
     return {
-        "time": t,
+        "time": timestamp,
         "open": o,
         "high": h,
         "low": l,
-        "close": cl,
-        "volume": volume or 0.0,
+        "close": close,
+        "volume": volume,
     }
 
 
-def normalize_candles(raw):
+def extract_candles(payload):
+    raw = None
+
+    for key in ("candles", "data", "bars", "ohlc"):
+        if key in payload:
+            raw = payload.get(key)
+            break
+
+    if isinstance(raw, dict):
+        for key in ("candles", "data", "bars"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+
     if not isinstance(raw, list):
         return []
 
     result = []
 
-    for c in raw:
-        n = normalize_candle(c)
+    for item in raw:
+        candle = normalize_candle(item)
 
-        if n:
-            result.append(n)
-
-    def candle_sort_key(item):
-        value = item.get("time")
-
-        if isinstance(value, (int, float)):
-            return float(value)
-
-        return str(value or "")
-
-    result.sort(key=candle_sort_key)
+        if candle is not None:
+            result.append(candle)
 
     return result
-
-
-def get_closed_candles(candles):
-    """
-    MT4 normally sends:
-        candle 0 ... candle N-2 = closed
-        candle N-1             = current/forming
-
-    Therefore remove the last candle.
-    """
-
-    if len(candles) < 3:
-        return []
-
-    return candles[:-1]
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    result = []
+
+    seed = sum(values[:period]) / period
+    result.append(seed)
+
+    multiplier = 2.0 / (period + 1.0)
+
+    for value in values[period:]:
+        previous = result[-1]
+        current = (
+            (value - previous) * multiplier
+            + previous
+        )
+        result.append(current)
+
+    return result[-1]
+
+
 def ema_series(values, period):
     if len(values) < period:
         return []
 
+    seed = sum(values[:period]) / period
+
+    result = [seed]
+
     multiplier = 2.0 / (period + 1.0)
 
-    first = sum(values[:period]) / period
-
-    result = [first]
-
-    previous = first
-
     for value in values[period:]:
-        current = (
-            (value - previous)
-            * multiplier
+        previous = result[-1]
+
+        result.append(
+            (value - previous) * multiplier
             + previous
         )
 
-        result.append(current)
-        previous = current
-
     return result
-
-
-def ema(values, period):
-    series = ema_series(values, period)
-
-    if not series:
-        return None
-
-    return series[-1]
 
 
 def sma(values, period):
@@ -461,28 +396,26 @@ def sma(values, period):
 
 
 def true_ranges(candles):
-    if not candles:
-        return []
-
     result = []
 
     previous_close = None
 
-    for c in candles:
+    for candle in candles:
+        high = candle["high"]
+        low = candle["low"]
 
         if previous_close is None:
-            tr = c["high"] - c["low"]
-
+            tr = high - low
         else:
             tr = max(
-                c["high"] - c["low"],
-                abs(c["high"] - previous_close),
-                abs(c["low"] - previous_close),
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
             )
 
-        result.append(max(tr, 0.0))
+        result.append(tr)
 
-        previous_close = c["close"]
+        previous_close = candle["close"]
 
     return result
 
@@ -500,30 +433,34 @@ def rsi(candles, period=14):
     if len(candles) < period + 1:
         return None
 
-    closes = [c["close"] for c in candles]
+    closes = [x["close"] for x in candles]
 
     gains = []
-    losses = []
+    losses_ = []
 
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
+        change = closes[i] - closes[i - 1]
 
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
+        if change > 0:
+            gains.append(change)
+            losses_.append(0.0)
+
+        else:
+            gains.append(0.0)
+            losses_.append(abs(change))
 
     avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_loss = sum(losses_[:period]) / period
 
     for i in range(period, len(gains)):
-
         avg_gain = (
-            avg_gain * (period - 1)
+            (avg_gain * (period - 1))
             + gains[i]
         ) / period
 
         avg_loss = (
-            avg_loss * (period - 1)
-            + losses[i]
+            (avg_loss * (period - 1))
+            + losses_[i]
         ) / period
 
     if avg_loss == 0:
@@ -531,9 +468,7 @@ def rsi(candles, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100.0 - (
-        100.0 / (1.0 + rs)
-    )
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def williams_r(candles, period=14):
@@ -542,82 +477,34 @@ def williams_r(candles, period=14):
 
     window = candles[-period:]
 
-    highest = max(
-        c["high"]
-        for c in window
-    )
-
-    lowest = min(
-        c["low"]
-        for c in window
-    )
+    highest = max(x["high"] for x in window)
+    lowest = min(x["low"] for x in window)
 
     if highest == lowest:
         return -50.0
 
     return (
-        (
-            highest
-            - candles[-1]["close"]
-        )
+        (highest - candles[-1]["close"])
         / (highest - lowest)
     ) * -100.0
 
 
 def stochastic(candles, period=14):
     if len(candles) < period:
-        return None, None
+        return None
 
-    def calculate_k(index):
-        start = max(
-            0,
-            index - period + 1,
-        )
+    window = candles[-period:]
 
-        window = candles[start:index + 1]
+    highest = max(x["high"] for x in window)
+    lowest = min(x["low"] for x in window)
 
-        highest = max(
-            c["high"]
-            for c in window
-        )
+    if highest == lowest:
+        return 50.0
 
-        lowest = min(
-            c["low"]
-            for c in window
-        )
-
-        if highest == lowest:
-            return 50.0
-
-        return (
-            (
-                candles[index]["close"]
-                - lowest
-            )
-            / (highest - lowest)
-        ) * 100.0
-
-    k = calculate_k(
-        len(candles) - 1
-    )
-
-    values = []
-
-    for i in range(
-        max(0, len(candles) - 3),
-        len(candles),
-    ):
-        values.append(
-            calculate_k(i)
-        )
-
-    d = (
-        sum(values) / len(values)
-        if values
-        else 50.0
-    )
-
-    return k, d
+    return (
+        (candles[-1]["close"] - lowest)
+        / (highest - lowest)
+    ) * 100.0
 
 
 def momentum(candles, period=5):
@@ -630,917 +517,655 @@ def momentum(candles, period=5):
     )
 
 
-def macd(candles):
-    closes = [
-        c["close"]
-        for c in candles
-    ]
-
-    fast_series = ema_series(
-        closes,
-        12,
-    )
-
-    slow_series = ema_series(
-        closes,
-        26,
-    )
-
-    if not fast_series or not slow_series:
-        return None, None
-
-    length = min(
-        len(fast_series),
-        len(slow_series),
-    )
-
-    macd_series = []
-
-    for i in range(length):
-        macd_series.append(
-            fast_series[-length + i]
-            - slow_series[-length + i]
-        )
-
-    if not macd_series:
-        return None, None
-
-    macd_line = macd_series[-1]
-
-    signal = ema(
-        macd_series,
-        9,
-    )
-
-    return macd_line, signal
-
-
 def cci(candles, period=20):
     if len(candles) < period:
         return None
 
     typical = [
-        (
-            c["high"]
-            + c["low"]
-            + c["close"]
-        ) / 3.0
-        for c in candles
+        (x["high"] + x["low"] + x["close"]) / 3.0
+        for x in candles
     ]
 
     window = typical[-period:]
 
-    mean = sum(window) / period
+    average = sum(window) / period
 
-    deviation = (
-        sum(
-            abs(x - mean)
-            for x in window
-        )
-        / period
-    )
+    deviation = sum(
+        abs(x - average)
+        for x in window
+    ) / period
 
     if deviation == 0:
         return 0.0
 
     return (
-        (typical[-1] - mean)
+        (typical[-1] - average)
         / (0.015 * deviation)
     )
 
 
+def macd(candles):
+    closes = [x["close"] for x in candles]
+
+    ema12 = ema_series(closes, 12)
+    ema26 = ema_series(closes, 26)
+
+    if not ema12 or not ema26:
+        return None
+
+    # Align from the end.
+    length = min(len(ema12), len(ema26))
+
+    macd_values = []
+
+    for i in range(length):
+        macd_values.append(
+            ema12[-length + i]
+            - ema26[-length + i]
+        )
+
+    if len(macd_values) < 9:
+        return None
+
+    signal = ema(macd_values, 9)
+
+    if signal is None:
+        return None
+
+    return {
+        "macd": macd_values[-1],
+        "signal": signal,
+        "hist": macd_values[-1] - signal,
+    }
+
+
 def adx_di(candles, period=14):
-    if len(candles) < period * 2 + 2:
-        return None, None, None
+    if len(candles) < period + 2:
+        return None
 
     trs = []
     plus_dm = []
     minus_dm = []
 
     for i in range(1, len(candles)):
-
         current = candles[i]
         previous = candles[i - 1]
 
-        up_move = (
-            current["high"]
-            - previous["high"]
-        )
+        up_move = current["high"] - previous["high"]
+        down_move = previous["low"] - current["low"]
 
-        down_move = (
-            previous["low"]
-            - current["low"]
-        )
+        if up_move > down_move and up_move > 0:
+            pdm = up_move
+        else:
+            pdm = 0.0
 
-        plus = (
-            up_move
-            if (
-                up_move > down_move
-                and up_move > 0
-            )
-            else 0.0
-        )
-
-        minus = (
-            down_move
-            if (
-                down_move > up_move
-                and down_move > 0
-            )
-            else 0.0
-        )
+        if down_move > up_move and down_move > 0:
+            mdm = down_move
+        else:
+            mdm = 0.0
 
         tr = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
         )
 
         trs.append(tr)
-        plus_dm.append(plus)
-        minus_dm.append(minus)
+        plus_dm.append(pdm)
+        minus_dm.append(mdm)
 
-    dx_values = []
-    plus_values = []
-    minus_values = []
+    if len(trs) < period:
+        return None
 
-    for i in range(
-        period,
-        len(trs) + 1,
-    ):
+    atr_value = sum(trs[-period:]) / period
 
-        tr_sum = sum(
-            trs[i - period:i]
-        )
+    if atr_value <= 0:
+        return None
 
-        plus_sum = sum(
-            plus_dm[i - period:i]
-        )
+    plus_di = (
+        sum(plus_dm[-period:])
+        / atr_value
+    ) * 100.0 / period
 
-        minus_sum = sum(
-            minus_dm[i - period:i]
-        )
+    minus_di = (
+        sum(minus_dm[-period:])
+        / atr_value
+    ) * 100.0 / period
 
-        if tr_sum <= 0:
-            plus = 0.0
-            minus = 0.0
+    denominator = plus_di + minus_di
 
-        else:
-            plus = (
-                100.0
-                * plus_sum
-                / tr_sum
-            )
-
-            minus = (
-                100.0
-                * minus_sum
-                / tr_sum
-            )
-
-        denominator = plus + minus
-
-        if denominator <= 0:
-            dx = 0.0
-
-        else:
-            dx = (
-                abs(plus - minus)
-                / denominator
-            ) * 100.0
-
-        dx_values.append(dx)
-        plus_values.append(plus)
-        minus_values.append(minus)
-
-    if len(dx_values) < period:
-        return None, None, None
-
-    adx = (
-        sum(dx_values[-period:])
-        / period
-    )
-
-    return (
-        adx,
-        plus_values[-1],
-        minus_values[-1],
-    )
-
-
-# ============================================================
-# PRICE ACTION
-# ============================================================
-
-def candle_metrics(candles):
-    if not candles:
-        return {}
-
-    c = candles[-1]
-
-    body = abs(
-        c["close"]
-        - c["open"]
-    )
-
-    total_range = (
-        c["high"]
-        - c["low"]
-    )
-
-    upper_wick = (
-        c["high"]
-        - max(
-            c["open"],
-            c["close"],
-        )
-    )
-
-    lower_wick = (
-        min(
-            c["open"],
-            c["close"],
-        )
-        - c["low"]
-    )
-
-    body_ratio = (
-        body / total_range
-        if total_range > 0
-        else 0.0
-    )
+    if denominator <= 0:
+        adx = 0.0
+    else:
+        adx = (
+            abs(plus_di - minus_di)
+            / denominator
+        ) * 100.0
 
     return {
-        "body": body,
-        "range": total_range,
-        "body_ratio": body_ratio,
-        "upper_wick": max(
-            upper_wick,
-            0.0,
-        ),
-        "lower_wick": max(
-            lower_wick,
-            0.0,
-        ),
-        "bullish": (
-            c["close"]
-            > c["open"]
-        ),
-        "bearish": (
-            c["close"]
-            < c["open"]
-        ),
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
     }
 
 
-def structure_analysis(candles):
-    """
-    Uses recent swing behavior instead of only comparing
-    the last two candles.
-    """
+# ============================================================
+# CANDLE ANALYSIS
+# ============================================================
 
-    result = {
-        "direction": None,
-        "strength": "NONE",
+def candle_direction(candle):
+    if candle["close"] > candle["open"]:
+        return "UP"
+
+    if candle["close"] < candle["open"]:
+        return "DOWN"
+
+    return "NONE"
+
+
+def candle_strength(candle):
+    body = abs(candle["close"] - candle["open"])
+    full_range = candle["high"] - candle["low"]
+
+    if full_range <= 0:
+        return 0.0
+
+    return body / full_range
+
+
+def candle_quality(candles):
+    if len(candles) < 3:
+        return {
+            "direction": "NONE",
+            "points": 0,
+            "quality": "NONE",
+        }
+
+    c1 = candles[-1]
+    c2 = candles[-2]
+
+    direction = candle_direction(c1)
+
+    body_ratio = candle_strength(c1)
+
+    if direction == "NONE":
+        return {
+            "direction": "NONE",
+            "points": 0,
+            "quality": "NONE",
+        }
+
+    points = 1
+
+    if body_ratio >= 0.55:
+        points += 1
+
+    # Avoid rewarding an abnormally large candle.
+    avg_range = sum(
+        x["high"] - x["low"]
+        for x in candles[-10:]
+    ) / min(10, len(candles))
+
+    current_range = c1["high"] - c1["low"]
+
+    if avg_range > 0 and current_range > avg_range * 2.5:
+        points = 0
+
+    quality = "NORMAL"
+
+    if body_ratio >= 0.65:
+        quality = "STRONG"
+
+    return {
+        "direction": direction,
+        "points": min(points, 2),
+        "quality": quality,
     }
 
+
+# ============================================================
+# STRUCTURE
+# ============================================================
+
+def analyze_structure(candles):
     if len(candles) < 12:
-        return result
+        return {
+            "direction": "NONE",
+            "points": 0,
+        }
 
     recent = candles[-8:]
 
-    highs = [
-        c["high"]
-        for c in recent
-    ]
-
-    lows = [
-        c["low"]
-        for c in recent
-    ]
-
-    # Compare two 4-candle blocks.
     first = recent[:4]
     second = recent[4:]
 
-    first_high = max(
-        c["high"]
-        for c in first
-    )
+    first_high = max(x["high"] for x in first)
+    first_low = min(x["low"] for x in first)
 
-    second_high = max(
-        c["high"]
-        for c in second
-    )
+    second_high = max(x["high"] for x in second)
+    second_low = min(x["low"] for x in second)
 
-    first_low = min(
-        c["low"]
-        for c in first
-    )
+    first_close = first[-1]["close"]
+    second_close = second[-1]["close"]
 
-    second_low = min(
-        c["low"]
-        for c in second
-    )
-
-    if (
+    up = (
         second_high > first_high
         and second_low > first_low
-    ):
-        result["direction"] = "UP"
-        result["strength"] = "STRONG"
+        and second_close > first_close
+    )
 
-        return result
-
-    if (
+    down = (
         second_high < first_high
         and second_low < first_low
-    ):
-        result["direction"] = "DOWN"
-        result["strength"] = "STRONG"
+        and second_close < first_close
+    )
 
-        return result
+    if up:
+        return {
+            "direction": "UP",
+            "points": 3,
+        }
 
-    # Weaker continuation structure.
+    if down:
+        return {
+            "direction": "DOWN",
+            "points": 3,
+        }
+
+    # Softer continuation structure.
     if (
-        highs[-1] > highs[-2]
-        and lows[-1] >= lows[-2]
+        second_high > first_high
+        and second_close > first_close
     ):
-        result["direction"] = "UP"
-        result["strength"] = "WEAK"
-
-        return result
+        return {
+            "direction": "UP",
+            "points": 2,
+        }
 
     if (
-        highs[-1] < highs[-2]
-        and lows[-1] <= lows[-2]
+        second_low < first_low
+        and second_close < first_close
     ):
-        result["direction"] = "DOWN"
-        result["strength"] = "WEAK"
+        return {
+            "direction": "DOWN",
+            "points": 2,
+        }
 
-        return result
-
-    return result
-
-
-def liquidity_analysis(candles):
-    """
-    Detects a liquidity sweep.
-
-    Sweep below + close back above = bullish.
-    Sweep above + close back below = bearish.
-    """
-
-    result = {
-        "direction": None,
-        "strength": "NONE",
+    return {
+        "direction": "NONE",
+        "points": 0,
     }
 
+
+# ============================================================
+# LIQUIDITY
+# ============================================================
+
+def analyze_liquidity(candles):
     if len(candles) < 15:
-        return result
+        return {
+            "direction": "NONE",
+            "points": 0,
+            "type": "NONE",
+        }
 
     current = candles[-1]
 
     previous = candles[-11:-1]
 
-    highest = max(
-        c["high"]
-        for c in previous
-    )
+    previous_high = max(x["high"] for x in previous)
+    previous_low = min(x["low"] for x in previous)
 
-    lowest = min(
-        c["low"]
-        for c in previous
-    )
-
-    current_range = (
-        current["high"]
-        - current["low"]
-    )
-
-    if current_range <= 0:
-        return result
-
-    # Bullish liquidity sweep.
+    # Sell-side liquidity sweep:
+    # price goes below previous low and closes back above it.
     if (
-        current["low"] < lowest
-        and current["close"] > lowest
+        current["low"] < previous_low
+        and current["close"] > previous_low
     ):
+        return {
+            "direction": "UP",
+            "points": 2,
+            "type": "LOW SWEEP",
+        }
 
-        recovery_ratio = (
-            current["close"]
-            - current["low"]
-        ) / current_range
-
-        if recovery_ratio >= 0.55:
-            result["direction"] = "UP"
-            result["strength"] = "STRONG"
-        else:
-            result["direction"] = "UP"
-            result["strength"] = "WEAK"
-
-        return result
-
-    # Bearish liquidity sweep.
+    # Buy-side liquidity sweep:
+    # price goes above previous high and closes back below it.
     if (
-        current["high"] > highest
-        and current["close"] < highest
+        current["high"] > previous_high
+        and current["close"] < previous_high
     ):
+        return {
+            "direction": "DOWN",
+            "points": 2,
+            "type": "HIGH SWEEP",
+        }
 
-        rejection_ratio = (
-            current["high"]
-            - current["close"]
-        ) / current_range
-
-        if rejection_ratio >= 0.55:
-            result["direction"] = "DOWN"
-            result["strength"] = "STRONG"
-        else:
-            result["direction"] = "DOWN"
-            result["strength"] = "WEAK"
-
-        return result
-
-    return result
-
-
-# ============================================================
-# BREAKOUT ENGINE
-# ============================================================
-
-def breakout_analysis(candles):
-    result = {
-        "direction": None,
-        "strength": "NONE",
-        "retest": False,
-        "fake": False,
-        "level": None,
-        "score": 0,
+    return {
+        "direction": "NONE",
+        "points": 0,
+        "type": "NONE",
     }
 
-    if len(candles) < BREAKOUT_LOOKBACK + 5:
-        return result
 
-    atr_value = atr(
-        candles,
-        14,
-    )
+# ============================================================
+# BREAKOUT + RETEST
+# ============================================================
 
-    if atr_value is None or atr_value <= 0:
-        return result
+def analyze_breakout(candles, atr_value):
+    if len(candles) < 25 or atr_value is None or atr_value <= 0:
+        return {
+            "direction": "NONE",
+            "points": 0,
+            "quality": "NONE",
+            "retest": False,
+            "fake": False,
+        }
 
-    last = candles[-1]
+    current = candles[-1]
 
-    previous = candles[
-        -BREAKOUT_LOOKBACK - 1:-1
-    ]
+    lookback = candles[-21:-1]
 
-    highest = max(
-        c["high"]
-        for c in previous
-    )
+    resistance = max(x["high"] for x in lookback)
+    support = min(x["low"] for x in lookback)
 
-    lowest = min(
-        c["low"]
-        for c in previous
-    )
-
-    candle_range = (
-        last["high"]
-        - last["low"]
-    )
-
-    if candle_range <= 0:
-        return result
+    tolerance = atr_value * 0.20
 
     # --------------------------------------------------------
-    # TRUE UP BREAKOUT
+    # UP BREAKOUT
     # --------------------------------------------------------
 
-    if last["close"] > highest:
+    if current["close"] > resistance:
+        distance = current["close"] - resistance
 
-        distance = (
-            last["close"]
-            - highest
-        )
+        strong = distance >= atr_value * 0.15
 
-        result["direction"] = "UP"
-        result["level"] = highest
+        quality = "STRONG" if strong else "WEAK"
 
-        if distance >= (
-            atr_value
-            * BREAKOUT_ATR_MULTIPLIER
-        ):
-            result["strength"] = "STRONG"
-            result["score"] = 3
-        else:
-            result["strength"] = "WEAK"
-            result["score"] = 1
+        retest = False
 
-    # --------------------------------------------------------
-    # TRUE DOWN BREAKOUT
-    # --------------------------------------------------------
+        # Search last 4 candles for a touch/retest
+        # around the broken resistance.
+        for candle in candles[-5:-1]:
+            if (
+                candle["low"] <= resistance + tolerance
+                and candle["high"] >= resistance - tolerance
+                and candle["close"] >= resistance
+            ):
+                retest = True
+                break
 
-    elif last["close"] < lowest:
-
-        distance = (
-            lowest
-            - last["close"]
-        )
-
-        result["direction"] = "DOWN"
-        result["level"] = lowest
-
-        if distance >= (
-            atr_value
-            * BREAKOUT_ATR_MULTIPLIER
-        ):
-            result["strength"] = "STRONG"
-            result["score"] = 3
-        else:
-            result["strength"] = "WEAK"
-            result["score"] = 1
+        return {
+            "direction": "UP",
+            "points": 3 if strong else 2,
+            "quality": quality,
+            "retest": retest,
+            "fake": False,
+        }
 
     # --------------------------------------------------------
-    # FAKE UP BREAKOUT
+    # DOWN BREAKOUT
     # --------------------------------------------------------
 
-    elif (
-        last["high"] > highest
-        and last["close"] <= highest
-    ):
+    if current["close"] < support:
+        distance = support - current["close"]
 
-        result["direction"] = "UP"
-        result["strength"] = "FAKE"
-        result["fake"] = True
-        result["level"] = highest
-        result["score"] = -3
+        strong = distance >= atr_value * 0.15
+
+        quality = "STRONG" if strong else "WEAK"
+
+        retest = False
+
+        for candle in candles[-5:-1]:
+            if (
+                candle["high"] >= support - tolerance
+                and candle["low"] <= support + tolerance
+                and candle["close"] <= support
+            ):
+                retest = True
+                break
+
+        return {
+            "direction": "DOWN",
+            "points": 3 if strong else 2,
+            "quality": quality,
+            "retest": retest,
+            "fake": False,
+        }
 
     # --------------------------------------------------------
-    # FAKE DOWN BREAKOUT
+    # FAKE BREAKOUT DETECTION
     # --------------------------------------------------------
 
-    elif (
-        last["low"] < lowest
-        and last["close"] >= lowest
-    ):
-
-        result["direction"] = "DOWN"
-        result["strength"] = "FAKE"
-        result["fake"] = True
-        result["level"] = lowest
-        result["score"] = -3
-
-    # --------------------------------------------------------
-    # RETEST
-    # --------------------------------------------------------
-
-    direction = result["direction"]
-    level = result["level"]
+    previous = candles[-2]
 
     if (
-        direction in ("UP", "DOWN")
-        and not result["fake"]
-        and level is not None
+        previous["high"] > resistance
+        and current["close"] < resistance
     ):
+        return {
+            "direction": "DOWN",
+            "points": 0,
+            "quality": "FAKE",
+            "retest": False,
+            "fake": True,
+        }
 
-        tolerance = (
-            atr_value
-            * BREAKOUT_RETEST_TOLERANCE
-        )
+    if (
+        previous["low"] < support
+        and current["close"] > support
+    ):
+        return {
+            "direction": "UP",
+            "points": 0,
+            "quality": "FAKE",
+            "retest": False,
+            "fake": True,
+        }
 
-        scan_start = max(
-            1,
-            len(candles) - 6,
-        )
-
-        for i in range(
-            scan_start,
-            len(candles) - 1,
-        ):
-
-            c = candles[i]
-
-            if direction == "UP":
-
-                touched = (
-                    c["low"]
-                    <= level + tolerance
-                    and c["low"]
-                    >= level - tolerance
-                )
-
-                rejected = (
-                    c["close"]
-                    > level
-                )
-
-                if touched and rejected:
-                    result["retest"] = True
-                    break
-
-            else:
-
-                touched = (
-                    c["high"]
-                    <= level + tolerance
-                    and c["high"]
-                    >= level - tolerance
-                )
-
-                rejected = (
-                    c["close"]
-                    < level
-                )
-
-                if touched and rejected:
-                    result["retest"] = True
-                    break
-
-    return result
+    return {
+        "direction": "NONE",
+        "points": 0,
+        "quality": "NONE",
+        "retest": False,
+        "fake": False,
+    }
 
 
 # ============================================================
-# ANALYSIS
+# SWING LEVELS
 # ============================================================
 
-def calculate_analysis(candles):
-    if len(candles) < MIN_CANDLES:
+def recent_swing_low(candles, lookback=8):
+    if len(candles) < lookback:
         return None
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    window = candles[-lookback:]
 
-    last = candles[-1]
+    return min(x["low"] for x in window)
 
-    # --------------------------------------------------------
-    # Indicators
-    # --------------------------------------------------------
+
+def recent_swing_high(candles, lookback=8):
+    if len(candles) < lookback:
+        return None
+
+    window = candles[-lookback:]
+
+    return max(x["high"] for x in window)
+
+
+def cancellation_level(candles, direction, atr_value):
+    """
+    Structural cancellation.
+
+    UP:
+        cancel below a real recent swing low.
+
+    DOWN:
+        cancel above a real recent swing high.
+
+    A small ATR buffer is added so that the level is not
+    immediately triggered by tiny market noise.
+    """
+
+    if atr_value is None or atr_value <= 0:
+        return None
+
+    current = candles[-1]["close"]
+
+    buffer = atr_value * 0.15
+
+    if direction == "UP":
+        swing = recent_swing_low(candles, 8)
+
+        if swing is None:
+            return None
+
+        level = swing - buffer
+
+        # Ensure the cancellation is meaningfully below price.
+        minimum_distance = atr_value * 0.20
+
+        if current - level < minimum_distance:
+            level = current - minimum_distance
+
+        return level
+
+    if direction == "DOWN":
+        swing = recent_swing_high(candles, 8)
+
+        if swing is None:
+            return None
+
+        level = swing + buffer
+
+        minimum_distance = atr_value * 0.20
+
+        if level - current < minimum_distance:
+            level = current + minimum_distance
+
+        return level
+
+    return None
+
+
+# ============================================================
+# TECHNICAL ANALYSIS
+# ============================================================
+
+def analyze_market(candles):
+    if len(candles) < 61:
+        return None
+
+    # MT4 normally sends the current forming candle last.
+    # We analyze closed candles only.
+    closed = candles[:-1]
+
+    if len(closed) < 60:
+        return None
+
+    closes = [x["close"] for x in closed]
+
+    current = closed[-1]
+
+    price = current["close"]
+
+    atr_value = atr(closed, 14)
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     ema50 = ema(closes, 50)
 
-    rsi14 = rsi(
-        candles,
-        14,
-    )
+    rsi_value = rsi(closed, 14)
+    williams = williams_r(closed, 14)
+    stoch = stochastic(closed, 14)
+    mom = momentum(closed, 5)
+    cci_value = cci(closed, 20)
+    macd_value = macd(closed)
+    adx_value = adx_di(closed, 14)
 
-    williams = williams_r(
-        candles,
-        14,
-    )
+    if (
+        atr_value is None
+        or ema9 is None
+        or ema21 is None
+        or ema50 is None
+        or rsi_value is None
+        or adx_value is None
+    ):
+        return None
 
-    stoch_k, stoch_d = stochastic(
-        candles,
-        14,
-    )
-
-    macd_line, macd_signal = macd(
-        candles
-    )
-
-    mom5 = momentum(
-        candles,
-        5,
-    )
-
-    adx, plus_di, minus_di = adx_di(
-        candles,
-        14,
-    )
-
-    atr14 = atr(
-        candles,
-        14,
-    )
-
-    cci20 = cci(
-        candles,
-        20,
-    )
-
-    structure_info = structure_analysis(
-        candles
-    )
-
-    liquidity_info = liquidity_analysis(
-        candles
-    )
-
-    breakout_info = breakout_analysis(
-        candles
-    )
-
-    metrics = candle_metrics(
-        candles
-    )
-
-    # --------------------------------------------------------
-    # Directions
-    # --------------------------------------------------------
+    structure = analyze_structure(closed)
+    liquidity = analyze_liquidity(closed)
+    breakout = analyze_breakout(closed, atr_value)
+    candle = candle_quality(closed)
 
     up_score = 0
     down_score = 0
 
-    reasons_up = []
-    reasons_down = []
+    # --------------------------------------------------------
+    # STRUCTURE / 3
+    # --------------------------------------------------------
 
-    # ========================================================
-    # 1. STRUCTURE = 3
-    # ========================================================
+    if structure["direction"] == "UP":
+        up_score += structure["points"]
 
-    structure = structure_info["direction"]
+    elif structure["direction"] == "DOWN":
+        down_score += structure["points"]
 
-    if structure == "UP":
-        up_score += 3
-        reasons_up.append("Structure UP")
+    # --------------------------------------------------------
+    # BREAKOUT / 3
+    # --------------------------------------------------------
 
-    elif structure == "DOWN":
-        down_score += 3
-        reasons_down.append("Structure DOWN")
+    if breakout["direction"] == "UP":
+        up_score += breakout["points"]
 
-    # ========================================================
-    # 2. BREAKOUT = 3
-    # ========================================================
+    elif breakout["direction"] == "DOWN":
+        down_score += breakout["points"]
 
-    breakout = breakout_info["direction"]
-    breakout_strength = breakout_info["strength"]
-    breakout_retest = breakout_info["retest"]
-    breakout_fake = breakout_info["fake"]
+    # --------------------------------------------------------
+    # LIQUIDITY / 2
+    # --------------------------------------------------------
 
-    if (
-        breakout in ("UP", "DOWN")
-        and not breakout_fake
-    ):
+    if liquidity["direction"] == "UP":
+        up_score += liquidity["points"]
 
-        breakout_points = 0
+    elif liquidity["direction"] == "DOWN":
+        down_score += liquidity["points"]
 
-        if breakout_strength == "STRONG":
-            breakout_points += 2
+    # --------------------------------------------------------
+    # MOMENTUM / 2
+    # --------------------------------------------------------
 
-        elif breakout_strength == "WEAK":
-            breakout_points += 1
+    if mom is not None:
 
-        if breakout_retest:
-            breakout_points += 1
+        if mom > 0:
+            up_score += 2
 
-        breakout_points = clamp(
-            breakout_points,
-            0,
-            3,
-        )
+        elif mom < 0:
+            down_score += 2
 
-        if breakout == "UP":
-            up_score += breakout_points
+    # --------------------------------------------------------
+    # CANDLE / 2
+    # --------------------------------------------------------
 
-            if breakout_points:
-                reasons_up.append(
-                    "Breakout UP"
-                )
+    if candle["direction"] == "UP":
+        up_score += candle["points"]
 
-        else:
-            down_score += breakout_points
+    elif candle["direction"] == "DOWN":
+        down_score += candle["points"]
 
-            if breakout_points:
-                reasons_down.append(
-                    "Breakout DOWN"
-                )
+    # --------------------------------------------------------
+    # RSI / 1
+    # --------------------------------------------------------
 
-    # Fake breakout is not a positive score.
-    # It is treated as a warning against the breakout direction.
-
-    # ========================================================
-    # 3. LIQUIDITY = 2
-    # ========================================================
-
-    liquidity = liquidity_info["direction"]
-    liquidity_strength = liquidity_info["strength"]
-
-    if liquidity == "UP":
-
-        points = (
-            2
-            if liquidity_strength == "STRONG"
-            else 1
-        )
-
-        up_score += points
-        reasons_up.append("Liquidity sweep UP")
-
-    elif liquidity == "DOWN":
-
-        points = (
-            2
-            if liquidity_strength == "STRONG"
-            else 1
-        )
-
-        down_score += points
-        reasons_down.append("Liquidity sweep DOWN")
-
-    # ========================================================
-    # 4. MOMENTUM = 2
-    # ========================================================
-
-    momentum_votes_up = 0
-    momentum_votes_down = 0
-
-    if mom5 is not None:
-
-        if mom5 > 0:
-            momentum_votes_up += 1
-
-        elif mom5 < 0:
-            momentum_votes_down += 1
-
-    if macd_line is not None and macd_signal is not None:
-
-        if macd_line > macd_signal:
-            momentum_votes_up += 1
-
-        elif macd_line < macd_signal:
-            momentum_votes_down += 1
-
-    if cci20 is not None:
-
-        if cci20 > 0:
-            momentum_votes_up += 1
-
-        elif cci20 < 0:
-            momentum_votes_down += 1
-
-    if momentum_votes_up >= 2:
-        up_score += 2
-        reasons_up.append("Momentum UP")
-
-    elif momentum_votes_down >= 2:
-        down_score += 2
-        reasons_down.append("Momentum DOWN")
-
-    elif momentum_votes_up == 1:
+    if 52 <= rsi_value < 68:
         up_score += 1
 
-    elif momentum_votes_down == 1:
+    elif 32 < rsi_value <= 48:
         down_score += 1
 
-    # ========================================================
-    # 5. CANDLE = 2
-    # ========================================================
-
-    body_ratio = metrics.get(
-        "body_ratio",
-        0.0,
-    )
-
-    if body_ratio >= MIN_CANDLE_BODY_RATIO:
-
-        if metrics.get("bullish"):
-
-            up_score += 2
-            reasons_up.append("Bullish candle")
-
-        elif metrics.get("bearish"):
-
-            down_score += 2
-            reasons_down.append("Bearish candle")
-
-    # ========================================================
-    # 6. RSI = 1
-    # ========================================================
-
-    if rsi14 is not None:
-
-        if 52 <= rsi14 < EXTREME_RSI_UP:
-
-            up_score += 1
-            reasons_up.append(
-                f"RSI {rsi14:.1f}"
-            )
-
-        elif EXTREME_RSI_DOWN < rsi14 <= 48:
-
-            down_score += 1
-            reasons_down.append(
-                f"RSI {rsi14:.1f}"
-            )
-
-    # ========================================================
-    # 7. OSCILLATORS = 2
-    #
-    # Williams + Stochastic
-    # ========================================================
+    # --------------------------------------------------------
+    # OSCILLATORS / 2
+    # --------------------------------------------------------
 
     oscillator_up = 0
     oscillator_down = 0
@@ -1553,189 +1178,68 @@ def calculate_analysis(candles):
         elif williams < -50:
             oscillator_down += 1
 
-    if (
-        stoch_k is not None
-        and stoch_d is not None
-    ):
+    if stoch is not None:
 
-        if (
-            stoch_k > stoch_d
-            and stoch_k > 50
-        ):
+        if stoch > 50:
             oscillator_up += 1
 
-        elif (
-            stoch_k < stoch_d
-            and stoch_k < 50
-        ):
+        elif stoch < 50:
             oscillator_down += 1
 
-    if oscillator_up >= 2:
+    if cci_value is not None:
+
+        if cci_value > 0:
+            oscillator_up += 1
+
+        elif cci_value < 0:
+            oscillator_down += 1
+
+    if macd_value is not None:
+
+        if macd_value["hist"] > 0:
+            oscillator_up += 1
+
+        elif macd_value["hist"] < 0:
+            oscillator_down += 1
+
+    if oscillator_up > oscillator_down:
+        up_score += min(2, oscillator_up)
+
+    elif oscillator_down > oscillator_up:
+        down_score += min(2, oscillator_down)
+
+    # --------------------------------------------------------
+    # MOVING AVERAGES / 3
+    # --------------------------------------------------------
+
+    if ema9 > ema21 > ema50:
+        up_score += 3
+
+    elif ema9 < ema21 < ema50:
+        down_score += 3
+
+    elif ema9 > ema21:
         up_score += 2
-        reasons_up.append("Oscillators UP")
 
-    elif oscillator_down >= 2:
+    elif ema9 < ema21:
         down_score += 2
-        reasons_down.append("Oscillators DOWN")
 
-    elif oscillator_up == 1:
-        up_score += 1
+    # --------------------------------------------------------
+    # ADX / DI / 2
+    # --------------------------------------------------------
 
-    elif oscillator_down == 1:
-        down_score += 1
+    plus_di = adx_value["plus_di"]
+    minus_di = adx_value["minus_di"]
 
-    # ========================================================
-    # 8. MOVING AVERAGES = 3
-    #
-    # EMA 9/21 + price position EMA21/50
-    # ========================================================
+    if plus_di > minus_di:
+        up_score += 2
 
-    ma_up = 0
-    ma_down = 0
+    elif minus_di > plus_di:
+        down_score += 2
 
-    if (
-        ema9 is not None
-        and ema21 is not None
-    ):
-
-        if ema9 > ema21:
-            ma_up += 2
-
-        elif ema9 < ema21:
-            ma_down += 2
-
-    if ema21 is not None:
-
-        if last["close"] > ema21:
-            ma_up += 1
-
-        elif last["close"] < ema21:
-            ma_down += 1
-
-    if (
-        ema50 is not None
-        and ema21 is not None
-    ):
-
-        if (
-            ema21 > ema50
-            and last["close"] > ema50
-        ):
-            ma_up = min(
-                3,
-                ma_up + 1,
-            )
-
-        elif (
-            ema21 < ema50
-            and last["close"] < ema50
-        ):
-            ma_down = min(
-                3,
-                ma_down + 1,
-            )
-
-    ma_up = min(3, ma_up)
-    ma_down = min(3, ma_down)
-
-    if ma_up > ma_down:
-        up_score += ma_up
-        reasons_up.append("MA alignment")
-
-    elif ma_down > ma_up:
-        down_score += ma_down
-        reasons_down.append("MA alignment")
-
-    # ========================================================
-    # 9. ADX / DI = 2
-    # ========================================================
-
-    if (
-        adx is not None
-        and plus_di is not None
-        and minus_di is not None
-    ):
-
-        if adx >= MIN_ADX:
-
-            if plus_di > minus_di:
-                up_score += 2
-                reasons_up.append(
-                    f"DI+ {plus_di:.1f}"
-                )
-
-            elif minus_di > plus_di:
-                down_score += 2
-                reasons_down.append(
-                    f"DI- {minus_di:.1f}"
-                )
-
-    # ========================================================
-    # HARD CAP
-    # ========================================================
-
-    up_score = int(
-        clamp(
-            up_score,
-            0,
-            MAX_SCORE,
-        )
-    )
-
-    down_score = int(
-        clamp(
-            down_score,
-            0,
-            MAX_SCORE,
-        )
-    )
-
-    # ========================================================
-    # PRIMARY DIRECTION
-    # ========================================================
-
-    primary_votes = 0
-
-    if (
-        ema9 is not None
-        and ema21 is not None
-    ):
-
-        if ema9 > ema21:
-            primary_votes += 1
-
-        elif ema9 < ema21:
-            primary_votes -= 1
-
-    if (
-        plus_di is not None
-        and minus_di is not None
-    ):
-
-        if plus_di > minus_di:
-            primary_votes += 1
-
-        elif minus_di > plus_di:
-            primary_votes -= 1
-
-    if structure == "UP":
-        primary_votes += 1
-
-    elif structure == "DOWN":
-        primary_votes -= 1
-
-    if primary_votes > 0:
-        primary_direction = "UP"
-
-    elif primary_votes < 0:
-        primary_direction = "DOWN"
-
-    else:
-        primary_direction = None
-
-    # ========================================================
+    # --------------------------------------------------------
     # FINAL DIRECTION
-    # ========================================================
+    # --------------------------------------------------------
 
     if up_score > down_score:
         direction = "UP"
@@ -1744,1829 +1248,1226 @@ def calculate_analysis(candles):
         direction = "DOWN"
 
     else:
-        direction = None
+        direction = "NONE"
 
-    max_score = max(
-        up_score,
-        down_score,
-    )
+    winning_score = max(up_score, down_score)
+    losing_score = min(up_score, down_score)
 
-    score_gap = abs(
-        up_score - down_score
-    )
+    score_gap = winning_score - losing_score
 
-    # ========================================================
-    # CONFLICT DETECTION
-    # ========================================================
+    # --------------------------------------------------------
+    # PRIMARY DIRECTION CONFLICT CHECK
+    # --------------------------------------------------------
 
-    conflicts = []
+    primary_conflict = False
 
-    if (
-        direction is not None
-        and primary_direction is not None
-        and direction != primary_direction
-    ):
-        conflicts.append(
-            "Primary direction conflict"
-        )
-
-    # Strong structure against signal is a serious conflict.
-    if (
-        direction == "UP"
-        and structure == "DOWN"
-        and structure_info["strength"] == "STRONG"
-    ):
-        conflicts.append(
-            "Strong bearish structure"
-        )
-
-    if (
-        direction == "DOWN"
-        and structure == "UP"
-        and structure_info["strength"] == "STRONG"
-    ):
-        conflicts.append(
-            "Strong bullish structure"
-        )
-
-    # Fake breakout against current direction.
-    if breakout_fake:
+    if direction == "UP":
 
         if (
-            direction is not None
-            and breakout is not None
-            and breakout == direction
+            structure["direction"] == "DOWN"
+            and breakout["direction"] == "DOWN"
+            and liquidity["direction"] == "DOWN"
         ):
-            conflicts.append(
-                "Fake breakout"
-            )
+            primary_conflict = True
 
-    # ========================================================
+    elif direction == "DOWN":
+
+        if (
+            structure["direction"] == "UP"
+            and breakout["direction"] == "UP"
+            and liquidity["direction"] == "UP"
+        ):
+            primary_conflict = True
+
+    # --------------------------------------------------------
+    # VOLATILITY
+    # --------------------------------------------------------
+
+    ranges = [
+        x["high"] - x["low"]
+        for x in closed[-20:]
+    ]
+
+    average_range = (
+        sum(ranges) / len(ranges)
+        if ranges
+        else 0
+    )
+
+    volatility_ok = (
+        atr_value > 0
+        and average_range > 0
+        and atr_value >= average_range * 0.60
+    )
+
+    # --------------------------------------------------------
     # ABNORMAL CANDLE
-    # ========================================================
+    # --------------------------------------------------------
 
     abnormal_candle = False
 
-    if len(candles) >= 22:
+    current_range = current["high"] - current["low"]
 
-        ranges = [
-            c["high"] - c["low"]
-            for c in candles[-21:-1]
-        ]
-
-        average_range = (
-            sum(ranges)
-            / len(ranges)
-            if ranges
-            else 0
-        )
-
-        current_range = (
-            last["high"]
-            - last["low"]
-        )
-
-        if (
-            average_range > 0
-            and current_range
-            > average_range
-            * MAX_CANDLE_RANGE_RATIO
-        ):
+    if average_range > 0:
+        if current_range > average_range * 2.8:
             abnormal_candle = True
 
-            conflicts.append(
-                "Abnormal candle"
+    # --------------------------------------------------------
+    # EXTREME RSI
+    # --------------------------------------------------------
+
+    extreme_rsi = (
+        rsi_value >= 78
+        or rsi_value <= 22
+    )
+
+    # --------------------------------------------------------
+    # PRICE ACTION QUALITY
+    # --------------------------------------------------------
+
+    price_action_points = (
+        structure["points"]
+        + breakout["points"]
+        + liquidity["points"]
+        + candle["points"]
+    )
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    valid = True
+    reject_reason = ""
+
+    if direction == "NONE":
+        valid = False
+        reject_reason = "NO CLEAR DIRECTION"
+
+    elif winning_score < MIN_SCORE:
+        valid = False
+        reject_reason = "LOW SCORE"
+
+    elif score_gap < MIN_SCORE_GAP:
+        valid = False
+        reject_reason = "SMALL SCORE GAP"
+
+    elif adx_value["adx"] < MIN_ADX:
+        valid = False
+        reject_reason = "WEAK ADX"
+
+    elif primary_conflict:
+        valid = False
+        reject_reason = "PRIMARY CONFLICT"
+
+    elif not volatility_ok:
+        valid = False
+        reject_reason = "LOW VOLATILITY"
+
+    elif abnormal_candle:
+        valid = False
+        reject_reason = "ABNORMAL CANDLE"
+
+    elif extreme_rsi:
+        valid = False
+        reject_reason = "EXTREME RSI"
+
+    elif breakout["fake"]:
+        valid = False
+        reject_reason = "FAKE BREAKOUT"
+
+    # --------------------------------------------------------
+    # IMPORTANT PRICE-ACTION FILTER
+    #
+    # We do NOT want:
+    #
+    # Structure + EMA + ADX + RSI
+    #
+    # to create an 85-89% signal without actual price action.
+    # --------------------------------------------------------
+
+    if valid:
+
+        strong_breakout = (
+            breakout["direction"] == direction
+            and breakout["quality"] == "STRONG"
+        )
+
+        retested_breakout = (
+            strong_breakout
+            and breakout["retest"]
+        )
+
+        strong_liquidity = (
+            liquidity["direction"] == direction
+            and liquidity["points"] >= 2
+        )
+
+        strong_structure = (
+            structure["direction"] == direction
+            and structure["points"] >= 3
+        )
+
+        # Require meaningful price action.
+        #
+        # Accepted BASE patterns:
+        #
+        # 1) Strong breakout + structure
+        # 2) Strong breakout + retest
+        # 3) Structure + liquidity sweep
+        # 4) Structure + breakout
+        #
+        # A plain trend/EMA/ADX setup is rejected.
+        price_action_ok = (
+            (
+                strong_breakout
+                and strong_structure
             )
+            or (
+                retested_breakout
+            )
+            or (
+                strong_structure
+                and strong_liquidity
+            )
+            or (
+                strong_structure
+                and breakout["direction"] == direction
+                and breakout["points"] >= 2
+            )
+        )
 
-    # ========================================================
-    # EXTREME CHASE
-    # ========================================================
+        if not price_action_ok:
+            valid = False
+            reject_reason = "WEAK PRICE ACTION"
 
-    extreme_chase = False
+    # --------------------------------------------------------
+    # STRUCTURE / BREAKOUT MISMATCH
+    # --------------------------------------------------------
 
-    if rsi14 is not None:
+    if valid:
 
         if (
-            direction == "UP"
-            and rsi14 >= EXTREME_RSI_UP
+            structure["direction"] != "NONE"
+            and breakout["direction"] != "NONE"
+            and structure["direction"] != breakout["direction"]
         ):
-            extreme_chase = True
+            valid = False
+            reject_reason = "STRUCTURE/BREAKOUT MISMATCH"
 
-        if (
-            direction == "DOWN"
-            and rsi14 <= EXTREME_RSI_DOWN
-        ):
-            extreme_chase = True
-
-    # ========================================================
-    # VOLATILITY
-    # ========================================================
-
-    volatility_ok = (
-        atr14 is not None
-        and atr14 > 0
-    )
-
-    # ========================================================
+    # --------------------------------------------------------
     # CONFIDENCE
-    # ========================================================
+    # --------------------------------------------------------
 
-    confidence = 74
+    confidence = 70
 
-    # Gap is important but cannot dominate.
-    confidence += min(
-        8,
-        score_gap * 2,
-    )
+    if winning_score >= 15:
+        confidence += 5
 
-    # Primary alignment.
-    if (
-        direction is not None
-        and primary_direction == direction
-    ):
-        confidence += 3
-
-    # ADX.
-    if adx is not None:
-
-        if adx >= 30:
-            confidence += 5
-
-        elif adx >= STRONG_ADX:
-            confidence += 3
-
-        elif adx >= MIN_ADX:
-            confidence += 1
-
-    # Structure.
-    if structure == direction:
-        confidence += 3
-
-    # Strong breakout.
-    if (
-        breakout == direction
-        and not breakout_fake
-    ):
-
-        if breakout_strength == "STRONG":
-            confidence += 4
-
-        elif breakout_strength == "WEAK":
-            confidence += 1
-
-        if breakout_retest:
-            confidence += 2
-
-    # Liquidity confirmation.
-    if liquidity == direction:
+    if winning_score >= 16:
         confidence += 2
 
-    # Candle.
-    if body_ratio >= 0.55:
+    if winning_score >= 17:
         confidence += 1
 
-    # Penalties.
-    if conflicts:
-        confidence -= 8
+    if score_gap >= 5:
+        confidence += 2
 
-    if extreme_chase:
-        confidence -= 5
+    if score_gap >= 7:
+        confidence += 1
 
-    if abnormal_candle:
-        confidence -= 5
+    if adx_value["adx"] >= STRONG_ADX:
+        confidence += 2
 
-    confidence = int(
-        clamp(
-            confidence,
-            MIN_CONFIDENCE,
-            MAX_CONFIDENCE,
+    # Structure confirmation.
+    if structure["direction"] == direction:
+        confidence += 2
+
+    # Breakout confirmation.
+    if breakout["direction"] == direction:
+
+        if breakout["quality"] == "STRONG":
+            confidence += 3
+
+        elif breakout["quality"] == "WEAK":
+            confidence += 1
+
+    # Retest is a major confirmation.
+    if (
+        breakout["direction"] == direction
+        and breakout["retest"]
+    ):
+        confidence += 3
+
+    # Liquidity confirmation.
+    if liquidity["direction"] == direction:
+        confidence += 2
+
+    # Candle confirmation.
+    if candle["direction"] == direction:
+        confidence += 1
+
+    # --------------------------------------------------------
+    # CRITICAL CONFIDENCE CAPS
+    #
+    # These caps are the main correction for the AUDNZD loss.
+    # --------------------------------------------------------
+
+    if breakout["direction"] != direction:
+        confidence = min(confidence, 82)
+
+    if breakout["direction"] == "NONE":
+        confidence = min(confidence, 81)
+
+    elif (
+        breakout["direction"] == direction
+        and breakout["quality"] == "WEAK"
+        and not breakout["retest"]
+    ):
+        confidence = min(confidence, 84)
+
+    elif (
+        breakout["direction"] == direction
+        and breakout["quality"] == "STRONG"
+        and not breakout["retest"]
+    ):
+        confidence = min(confidence, 86)
+
+    elif (
+        breakout["direction"] == direction
+        and breakout["quality"] == "STRONG"
+        and breakout["retest"]
+    ):
+        confidence = min(confidence, 89)
+
+    # No 89% without actual price-action confirmation.
+    if not (
+        breakout["direction"] == direction
+        and breakout["quality"] == "STRONG"
+        and breakout["retest"]
+    ):
+        confidence = min(confidence, 86)
+
+    # Liquidity can strengthen, but cannot manufacture confidence.
+    if liquidity["direction"] == direction:
+        confidence += 1
+
+    confidence = max(76, min(confidence, MAX_BASE_CONFIDENCE))
+
+    # --------------------------------------------------------
+    # ADDITIONAL BASE QUALITY
+    # --------------------------------------------------------
+
+    strong_pa = (
+        structure["direction"] == direction
+        and structure["points"] >= 3
+        and (
+            (
+                breakout["direction"] == direction
+                and breakout["quality"] == "STRONG"
+            )
+            or
+            liquidity["direction"] == direction
         )
     )
 
-    # ========================================================
-    # CANCELLATION LEVEL
-    # ========================================================
+    # --------------------------------------------------------
+    # CANCELLATION
+    # --------------------------------------------------------
 
-    cancellation_level = None
+    cancel = cancellation_level(
+        closed,
+        direction,
+        atr_value,
+    )
 
-    if atr14 is not None and atr14 > 0:
-
-        if direction == "UP":
-            cancellation_level = (
-                last["close"]
-                - atr14 * 0.35
-            )
-
-        elif direction == "DOWN":
-            cancellation_level = (
-                last["close"]
-                + atr14 * 0.35
-            )
+    if cancel is None:
+        valid = False
+        reject_reason = "NO STRUCTURAL CANCELLATION"
 
     return {
+        "valid": valid,
+        "reject_reason": reject_reason,
+
         "direction": direction,
 
         "up_score": up_score,
         "down_score": down_score,
 
-        "max_score": max_score,
+        "winning_score": winning_score,
+        "losing_score": losing_score,
         "score_gap": score_gap,
 
         "confidence": confidence,
 
-        "primary_direction": primary_direction,
+        "price": price,
+        "atr": atr_value,
 
         "ema9": ema9,
         "ema21": ema21,
         "ema50": ema50,
 
-        "rsi": rsi14,
+        "rsi": rsi_value,
         "williams": williams,
+        "stoch": stoch,
+        "momentum": mom,
+        "cci": cci_value,
+        "macd": macd_value,
 
-        "stoch_k": stoch_k,
-        "stoch_d": stoch_d,
-
-        "macd": macd_line,
-        "macd_signal": macd_signal,
-
-        "momentum": mom5,
-        "cci": cci20,
-
-        "adx": adx,
+        "adx": adx_value["adx"],
         "plus_di": plus_di,
         "minus_di": minus_di,
 
-        "atr": atr14,
-
         "structure": structure,
-        "structure_strength": structure_info["strength"],
-
         "breakout": breakout,
-        "breakout_strength": breakout_strength,
-        "breakout_retest": breakout_retest,
-        "breakout_fake": breakout_fake,
-        "breakout_score": breakout_info["score"],
-        "breakout_level": breakout_info["level"],
-
         "liquidity": liquidity,
-        "liquidity_strength": liquidity_strength,
+        "candle": candle,
 
-        "body_ratio": body_ratio,
+        "price_action_points": price_action_points,
+        "strong_price_action": strong_pa,
 
-        "abnormal_candle": abnormal_candle,
-        "volatility_ok": volatility_ok,
-        "extreme_chase": extreme_chase,
-
-        "conflict": bool(conflicts),
-        "conflict_reasons": conflicts,
-
-        "reasons_up": reasons_up,
-        "reasons_down": reasons_down,
-
-        "candle_time": last.get("time"),
-
-        "price": last["close"],
-
-        "cancellation_level": cancellation_level,
+        "cancellation": cancel,
     }
-
-
-# ============================================================
-# DATA FRESHNESS
-# ============================================================
-
-def data_age_seconds(symbol):
-    item = data_store.get(symbol)
-
-    if not item:
-        return None
-
-    received = item.get("received_at")
-
-    if not received:
-        return None
-
-    return max(
-        0,
-        time.time() - received,
-    )
-
-
-def is_data_fresh(symbol):
-    age = data_age_seconds(symbol)
-
-    if age is None:
-        return False
-
-    return age <= MAX_DATA_AGE_SECONDS
 
 
 # ============================================================
 # SIGNAL VALIDATION
 # ============================================================
 
-def validate_signal(analysis):
-    if not analysis:
-        return False, "NO_ANALYSIS"
+def is_fresh_data(symbol):
+    with state_lock:
+        item = latest_market.get(symbol)
 
-    direction = analysis.get(
-        "direction"
+    if not item:
+        return False
+
+    received = item.get("received_at", 0)
+
+    return (
+        time.time() - received
+        <= DATA_FRESH_SECONDS
     )
 
-    if direction not in (
-        "UP",
-        "DOWN",
-    ):
-        return False, "NO_CLEAR_DIRECTION"
 
-    if (
-        analysis.get(
-            "primary_direction"
-        )
-        != direction
-    ):
-        return False, "PRIMARY_CONFLICT"
+def same_setup_allowed(symbol, direction, analysis):
+    now = time.time()
 
-    if analysis.get("conflict"):
-        return False, "MARKET_CONFLICT"
-
-    if analysis.get(
-        "abnormal_candle"
-    ):
-        return False, "ABNORMAL_CANDLE"
-
-    if not analysis.get(
-        "volatility_ok"
-    ):
-        return False, "NO_VOLATILITY"
-
-    if (
-        analysis.get("max_score", 0)
-        < MIN_SCORE
-    ):
-        return False, "SCORE_TOO_LOW"
-
-    if (
-        analysis.get("score_gap", 0)
-        < MIN_SCORE_GAP
-    ):
-        return False, "SCORE_GAP_TOO_SMALL"
-
-    adx = analysis.get("adx")
-
-    if (
-        adx is None
-        or adx < MIN_ADX
-    ):
-        return False, "ADX_TOO_WEAK"
-
-    if analysis.get(
-        "extreme_chase"
-    ):
-        return False, "EXTREME_RSI"
-
-    if analysis.get(
-        "breakout_fake"
-    ):
-        return False, "FAKE_BREAKOUT"
-
-    # Do not accept a weak structure against a very strong
-    # breakout unless the final direction is aligned.
-    structure = analysis.get(
-        "structure"
-    )
-
-    breakout = analysis.get(
-        "breakout"
-    )
-
-    direction = analysis.get(
-        "direction"
-    )
-
-    if (
-        structure is not None
-        and breakout is not None
-        and structure != direction
-        and breakout == direction
-    ):
-        # Not an automatic rejection, but require stronger score.
-        if (
-            analysis.get("max_score", 0)
-            < 16
-        ):
-            return False, "STRUCTURE_BREAKOUT_MISMATCH"
-
-    return True, "VALID"
-
-
-# ============================================================
-# FRESH SETUP
-# ============================================================
-
-def fresh_base_setup(
-    symbol,
-    direction,
-    analysis,
-):
-    key = (
-        f"{symbol}:{direction}"
-    )
-
-    previous = recent_base_setups.get(
-        key
-    )
+    with state_lock:
+        previous = last_base_by_symbol.get(symbol)
 
     if not previous:
         return True
 
-    elapsed = (
-        time.time()
-        - previous.get(
-            "time",
-            0,
-        )
-    )
-
-    if (
-        elapsed
-        >= SETUP_REPEAT_BLOCK_SECONDS
-    ):
+    if previous["direction"] != direction:
         return True
 
-    previous_price = previous.get(
-        "price"
-    )
+    elapsed = now - previous["timestamp"]
 
-    current_price = analysis.get(
-        "price"
-    )
+    if elapsed >= BASE_COOLDOWN_SECONDS:
+        return True
 
-    atr_value = analysis.get(
-        "atr"
-    )
+    previous_price = previous.get("price")
+    previous_atr = previous.get("atr")
+    previous_rsi = previous.get("rsi")
+
+    current_price = analysis["price"]
+    current_atr = analysis["atr"]
+    current_rsi = analysis["rsi"]
 
     if (
         previous_price is not None
-        and current_price is not None
-        and atr_value is not None
-        and atr_value > 0
+        and previous_atr is not None
+        and previous_atr > 0
     ):
-
-        move = abs(
-            current_price
-            - previous_price
-        )
-
-        if move >= (
-            atr_value
-            * FRESH_SETUP_ATR_RATIO
+        if (
+            abs(current_price - previous_price)
+            >= previous_atr * MIN_PRICE_MOVE_ATR
         ):
             return True
-
-    previous_rsi = previous.get(
-        "rsi"
-    )
-
-    current_rsi = analysis.get(
-        "rsi"
-    )
 
     if (
         previous_rsi is not None
         and current_rsi is not None
-        and abs(
-            current_rsi
-            - previous_rsi
-        ) >= 5
     ):
-        return True
+        if (
+            abs(current_rsi - previous_rsi)
+            >= MIN_RSI_CHANGE
+        ):
+            return True
 
     return False
 
 
 # ============================================================
-# SYMBOL EVALUATION
+# RECOVERY VALIDATION
 # ============================================================
 
-def evaluate_symbol(symbol):
-    item = data_store.get(symbol)
-
-    if not item:
-        return None
-
-    if not is_data_fresh(symbol):
-        return None
-
-    candles = item.get(
-        "candles",
-        [],
-    )
-
-    if (
-        len(candles)
-        < REQUIRED_TOTAL_CANDLES
-    ):
-        return None
-
-    closed = get_closed_candles(
-        candles
-    )
-
-    if len(closed) < MIN_CANDLES:
-        return None
-
-    analysis = calculate_analysis(
-        closed
-    )
-
+def recovery_allowed(symbol, analysis):
     if not analysis:
-        return None
-
-    valid, reason = validate_signal(
-        analysis
-    )
-
-    if not valid:
-        return None
-
-    return {
-        "symbol": symbol,
-        "analysis": analysis,
-        "direction": analysis[
-            "direction"
-        ],
-        "validation": reason,
-        "timeframe": normalize_timeframe(
-            item.get(
-                "timeframe",
-                DEFAULT_TIMEFRAME,
-            )
-        ),
-    }
-
-
-# ============================================================
-# BEST BASE
-# ============================================================
-
-def choose_best_base_pair():
-    candidates = []
-
-    with data_lock:
-        symbols = list(
-            data_store.keys()
-        )
-
-    recent_symbols = [
-        x.get("symbol")
-        for x in history[-10:]
-        if x.get("symbol")
-    ]
-
-    for symbol in symbols:
-
-        candidate = evaluate_symbol(
-            symbol
-        )
-
-        if not candidate:
-            continue
-
-        analysis = candidate[
-            "analysis"
-        ]
-
-        direction = candidate[
-            "direction"
-        ]
-
-        if not fresh_base_setup(
-            symbol,
-            direction,
-            analysis,
-        ):
-            continue
-
-        score = analysis.get(
-            "max_score",
-            0,
-        )
-
-        gap = analysis.get(
-            "score_gap",
-            0,
-        )
-
-        adx = analysis.get(
-            "adx"
-        ) or 0
-
-        confidence = analysis.get(
-            "confidence",
-            0,
-        )
-
-        # Base quality ranking.
-        quality = (
-            score * 10
-            + gap * 7
-            + adx
-            + confidence * 0.25
-        )
-
-        if (
-            analysis.get(
-                "primary_direction"
-            )
-            == direction
-        ):
-            quality += 8
-
-        if (
-            analysis.get(
-                "structure"
-            )
-            == direction
-        ):
-            quality += 8
-
-        if (
-            analysis.get(
-                "structure_strength"
-            )
-            == "STRONG"
-        ):
-            quality += 4
-
-        if (
-            analysis.get(
-                "breakout"
-            )
-            == direction
-            and not analysis.get(
-                "breakout_fake"
-            )
-        ):
-
-            if (
-                analysis.get(
-                    "breakout_strength"
-                )
-                == "STRONG"
-            ):
-                quality += 8
-
-            elif (
-                analysis.get(
-                    "breakout_strength"
-                )
-                == "WEAK"
-            ):
-                quality += 3
-
-            if analysis.get(
-                "breakout_retest"
-            ):
-                quality += 6
-
-        if (
-            analysis.get(
-                "liquidity"
-            )
-            == direction
-        ):
-            quality += 4
-
-        if symbol in recent_symbols:
-            quality -= 5
-
-        candidates.append(
-            (
-                quality,
-                candidate,
-            )
-        )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True,
-    )
-
-    return candidates[0][1]
-
-
-# ============================================================
-# BEST RECOVERY
-# ============================================================
-
-def choose_best_recovery_pair():
-    candidates = []
-
-    with data_lock:
-        symbols = list(
-            data_store.keys()
-        )
-
-    base_symbol = cycle.get(
-        "base_symbol"
-    )
-
-    base_direction = cycle.get(
-        "base_direction"
-    )
-
-    for symbol in symbols:
-
-        candidate = evaluate_symbol(
-            symbol
-        )
-
-        if not candidate:
-            continue
-
-        analysis = candidate[
-            "analysis"
-        ]
-
-        direction = candidate[
-            "direction"
-        ]
-
-        score = analysis.get(
-            "max_score",
-            0,
-        )
-
-        gap = analysis.get(
-            "score_gap",
-            0,
-        )
-
-        adx = analysis.get(
-            "adx"
-        )
-
-        structure = analysis.get(
-            "structure"
-        )
-
-        breakout = analysis.get(
-            "breakout"
-        )
-
-        strength = analysis.get(
-            "breakout_strength"
-        )
-
-        retest = bool(
-            analysis.get(
-                "breakout_retest"
-            )
-        )
-
-        fake = bool(
-            analysis.get(
-                "breakout_fake"
-            )
-        )
-
-        # ====================================================
-        # HARD RECOVERY FILTER
-        # ====================================================
-
-        if score < RECOVERY_MIN_SCORE:
-            continue
-
-        if gap < RECOVERY_MIN_GAP:
-            continue
-
-        if (
-            adx is None
-            or adx < RECOVERY_MIN_ADX
-        ):
-            continue
-
-        if structure != direction:
-            continue
-
-        if breakout != direction:
-            continue
-
-        if strength != "STRONG":
-            continue
-
-        if not retest:
-            continue
-
-        if fake:
-            continue
-
-        # Recovery must not chase extreme RSI.
-        if analysis.get(
-            "extreme_chase"
-        ):
-            continue
-
-        quality = (
-            score * 12
-            + gap * 8
-            + adx * 1.2
-        )
-
-        quality += 15  # structure
-        quality += 15  # strong breakout
-        quality += 12  # retest
-
-        if (
-            analysis.get(
-                "liquidity"
-            )
-            == direction
-        ):
-            quality += 5
-
-        if (
-            analysis.get(
-                "primary_direction"
-            )
-            == direction
-        ):
-            quality += 8
-
-        if (
-            analysis.get(
-                "body_ratio",
-                0,
-            )
-            >= 0.55
-        ):
-            quality += 3
-
-        if direction != base_direction:
-            quality += 4
-
-        if symbol == base_symbol:
-            quality -= 5
-
-        quality += (
-            analysis.get(
-                "confidence",
-                0,
-            )
-            * 0.25
-        )
-
-        candidates.append(
-            (
-                quality,
-                candidate,
-            )
-        )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True,
-    )
-
-    return candidates[0][1]
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def add_history(
-    symbol,
-    direction,
-    stage,
-    analysis,
-    result="PENDING",
-    entry_time=None,
-    timeframe="M1",
-):
-    item = {
-        "time": now_string(),
-
-        "symbol": symbol,
-
-        "direction": direction,
-
-        "stage": stage,
-
-        "result": result,
-
-        "timeframe": timeframe,
-
-        "confidence": analysis.get(
-            "confidence"
-        ),
-
-        "up_score": analysis.get(
-            "up_score"
-        ),
-
-        "down_score": analysis.get(
-            "down_score"
-        ),
-
-        "score": analysis.get(
-            "max_score"
-        ),
-
-        "adx": analysis.get(
-            "adx"
-        ),
-
-        "rsi": analysis.get(
-            "rsi"
-        ),
-
-        "structure": analysis.get(
-            "structure"
-        ),
-
-        "breakout": analysis.get(
-            "breakout"
-        ),
-
-        "breakout_strength": analysis.get(
-            "breakout_strength"
-        ),
-
-        "breakout_retest": analysis.get(
-            "breakout_retest"
-        ),
-
-        "breakout_fake": analysis.get(
-            "breakout_fake"
-        ),
-
-        "entry_time": (
-            entry_time.isoformat()
-            if isinstance(
-                entry_time,
-                datetime,
-            )
-            else entry_time
-        ),
-    }
-
-    history.append(item)
-
-    if len(history) > 100:
-        del history[:-100]
-
-    return item
-
-
-# ============================================================
-# TELEGRAM SIGNAL CARD
-# ============================================================
-
-def build_signal_text(
-    symbol,
-    direction,
-    stage,
-    analysis,
-    entry_time,
-    timeframe,
-):
-    confidence = analysis.get(
-        "confidence",
-        0,
-    )
-
-    up_score = analysis.get(
-        "up_score",
-        0,
-    )
-
-    down_score = analysis.get(
-        "down_score",
-        0,
-    )
-
-    price = analysis.get(
-        "price"
-    )
-
-    cancellation = analysis.get(
-        "cancellation_level"
-    )
-
-    structure = analysis.get(
-        "structure"
-    )
-
-    breakout = analysis.get(
-        "breakout"
-    )
-
-    strength = analysis.get(
-        "breakout_strength",
-        "NONE",
-    )
-
-    retest = analysis.get(
-        "breakout_retest",
-        False,
-    )
-
-    adx = analysis.get(
-        "adx"
-    )
-
-    rsi_value = analysis.get(
-        "rsi"
-    )
-
-    if strength == "STRONG":
-        quality_text = "🔥 STRONG"
-
-    elif strength == "WEAK":
-        quality_text = "🟡 WEAK"
-
-    elif strength == "FAKE":
-        quality_text = "⚠️ FAKE"
-
-    else:
-        quality_text = "⚪ NONE"
-
-    stage_text = (
-        "🎯 BASE TRADE"
-        if stage == "BASE"
-        else "♻️ RECOVERY 1/1"
-    )
-
-    delay = entry_delay_for_timeframe(
-        timeframe
-    )
-
-    delay_minutes = max(
-        1,
-        int(round(delay / 60))
-    )
-
-    if direction == "UP":
-
-        cancel_text = (
-            f"🛑 Cancellation: "
-            f"إذا أغلقت شمعة تحت "
-            f"**{fmt_price(cancellation)}**"
-        )
-
-    else:
-
-        cancel_text = (
-            f"🛑 Cancellation: "
-            f"إذا أغلقت شمعة فوق "
-            f"**{fmt_price(cancellation)}**"
-        )
-
-    return (
-        "🎓 ZinoProSignalAI\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {symbol} | {timeframe}\n\n"
-        f"{stage_text}\n"
-        f"{direction_emoji(direction)} "
-        f"**{direction}**\n\n"
-        f"🔥 Confidence: **{confidence}%**\n"
-        f"🟢 UP Score: **{up_score}/{MAX_SCORE}**\n"
-        f"🔴 DOWN Score: **{down_score}/{MAX_SCORE}**\n\n"
-        f"📐 Structure: **"
-        f"{structure or 'NONE'}**\n"
-        f"🚀 Breakout: **"
-        f"{breakout or 'NONE'}**\n"
-        f"💥 Breakout Quality: **"
-        f"{quality_text}**\n"
-        f"🔄 Retest: **"
-        f"{'YES' if retest else 'NO'}**\n\n"
-        f"📈 ADX: **"
-        f"{adx:.1f}**\n"
-        if adx is not None
-        else
-        "📈 ADX: **--**\n"
-    ) + (
-        f"📊 RSI: **"
-        f"{rsi_value:.1f}**\n\n"
-        if rsi_value is not None
-        else
-        "📊 RSI: **--**\n\n"
-    ) + (
-        f"💰 Price: **"
-        f"{fmt_price(price)}**\n"
-        f"{cancel_text}\n\n"
-        f"⏱️ Entry after: **"
-        f"{delay_minutes} minutes**\n"
-        f"🕐 **ENTRY TIME: "
-        f"{time_string(entry_time)} 🇩🇿**\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-
-def build_result_text(
-    signal,
-    result,
-):
-    if not signal:
-        return "❌ No pending signal found."
-
-    symbol = signal.get(
-        "symbol"
-    )
-
-    direction = signal.get(
-        "direction"
-    )
-
-    stage = signal.get(
-        "stage"
-    )
-
-    if result == "WIN":
-
-        if stage == "BASE":
-
-            return (
-                "✅ **BASE WIN**\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                f"📊 {symbol}\n"
-                f"{direction_emoji(direction)} "
-                f"{direction}\n\n"
-                "🎯 Base signal completed successfully.\n"
-                "🔎 Searching for a new BASE setup..."
-            )
-
-        return (
-            "✅ **RECOVERY WIN**\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📊 {symbol}\n"
-            f"{direction_emoji(direction)} "
-            f"{direction}\n\n"
-            "♻️ Recovery won after BASE loss.\n"
-            "🔎 Searching for a new BASE setup..."
-        )
-
-    if result == "LOSS":
-
-        if stage == "BASE":
-
-            return (
-                "❌ **BASE LOSS**\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                f"📊 {symbol}\n"
-                f"{direction_emoji(direction)} "
-                f"{direction}\n\n"
-                "♻️ Recovery **1/1 ALLOWED**\n"
-                "⏳ Waiting 2 minutes..."
-            )
-
-        return (
-            "❌ **RECOVERY LOSS**\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📊 {symbol}\n"
-            f"{direction_emoji(direction)} "
-            f"{direction}\n\n"
-            "⛔ No second martingale.\n"
-            "🔎 Cycle ended."
-        )
-
-    return "Unknown result."
-
-
-# ============================================================
-# TELEGRAM SEND
-# ============================================================
-
-async def send_telegram_message(
-    text_message
-):
-    global telegram_app
-
-    if telegram_app is None:
-        logger.warning(
-            "Telegram application not ready"
-        )
         return False
 
-    try:
+    direction = analysis["direction"]
 
-        await telegram_app.bot.send_message(
-            chat_id=OWNER_ID,
-            text=text_message,
-            parse_mode="Markdown",
-        )
-
-        return True
-
-    except Exception as exc:
-
-        logger.exception(
-            "Telegram send error: %s",
-            exc,
-        )
-
+    if direction == "NONE":
         return False
 
-
-def send_telegram_sync(
-    text_message
-):
-    global telegram_loop
-
-    if telegram_loop is None:
+    if analysis["winning_score"] < 16:
         return False
 
-    try:
-
-        future = (
-            asyncio.run_coroutine_threadsafe(
-                send_telegram_message(
-                    text_message
-                ),
-                telegram_loop,
-            )
-        )
-
-        future.result(
-            timeout=30
-        )
-
-        return True
-
-    except Exception as exc:
-
-        logger.exception(
-            "Telegram sync send error: %s",
-            exc,
-        )
-
+    if analysis["score_gap"] < 4:
         return False
+
+    if analysis["adx"] < STRONG_ADX:
+        return False
+
+    if analysis["structure"]["direction"] != direction:
+        return False
+
+    if analysis["breakout"]["direction"] != direction:
+        return False
+
+    if analysis["breakout"]["quality"] != "STRONG":
+        return False
+
+    if not analysis["breakout"]["retest"]:
+        return False
+
+    if analysis["breakout"]["fake"]:
+        return False
+
+    if analysis["rsi"] >= 75 or analysis["rsi"] <= 25:
+        return False
+
+    if analysis["cancellation"] is None:
+        return False
+
+    return True
 
 
 # ============================================================
 # SIGNAL CREATION
 # ============================================================
 
-def send_one_signal(
-    candidate,
-    stage,
-):
-    global cycle
+def create_signal(symbol, timeframe, analysis, signal_type="BASE"):
+    direction = analysis["direction"]
 
-    if not candidate:
-        return False
+    delay = entry_delay_minutes(timeframe)
 
-    symbol = candidate[
-        "symbol"
-    ]
+    created = now_algiers()
 
-    direction = candidate[
-        "direction"
-    ]
-
-    analysis = candidate[
-        "analysis"
-    ]
-
-    timeframe = candidate.get(
-        "timeframe",
-        DEFAULT_TIMEFRAME,
+    entry_time = created + timedelta(
+        minutes=delay
     )
 
-    valid, reason = validate_signal(
-        analysis
-    )
+    price = analysis["price"]
 
-    if not valid:
+    cancellation = analysis["cancellation"]
 
-        logger.info(
-            "Signal rejected %s %s: %s",
-            symbol,
-            direction,
-            reason,
+    if direction == "UP":
+        cancel_text = (
+            f"إذا أغلقت شمعة تحت "
+            f"{format_price(cancellation)}"
         )
-
-        return False
-
-    with cycle_lock:
-
-        if stage == "BASE":
-
-            if cycle.get(
-                "active"
-            ):
-                return False
-
-            cycle["active"] = True
-            cycle["stage"] = "BASE"
-
-            cycle["base_symbol"] = symbol
-            cycle["base_direction"] = direction
-
-            cycle["base_price"] = analysis.get(
-                "price"
-            )
-
-            cycle["recovery_count"] = 0
-
-        elif stage == "RECOVERY":
-
-            if not cycle.get(
-                "active"
-            ):
-                return False
-
-            if (
-                cycle.get(
-                    "recovery_count",
-                    0,
-                )
-                >= RECOVERY_LIMIT
-            ):
-                return False
-
-            cycle["stage"] = "RECOVERY"
-
-            cycle["recovery_count"] += 1
-
-        else:
-            return False
-
-        delay = entry_delay_for_timeframe(
-            timeframe
-        )
-
-        entry_time = (
-            now_algeria()
-            + timedelta(
-                seconds=delay
-            )
-        )
-
-        cycle["base_entry_time"] = (
-            entry_time
-        )
-
-        cycle["pending_signal"] = {
-            "symbol": symbol,
-            "direction": direction,
-            "stage": stage,
-            "analysis": analysis,
-            "entry_time": entry_time,
-            "created_at": time.time(),
-            "timeframe": timeframe,
-        }
-
-    text_message = build_signal_text(
-        symbol,
-        direction,
-        stage,
-        analysis,
-        entry_time,
-        timeframe,
-    )
-
-    sent = send_telegram_sync(
-        text_message
-    )
-
-    if not sent:
-
-        with cycle_lock:
-
-            cycle["pending_signal"] = None
-
-            if stage == "BASE":
-
-                cycle["active"] = False
-                cycle["stage"] = "IDLE"
-
-        return False
-
-    stats["signals"] += 1
-
-    if stage == "BASE":
-
-        stats["base_signals"] += 1
-
-        recent_base_setups[
-            f"{symbol}:{direction}"
-        ] = {
-            "time": time.time(),
-            "price": analysis.get(
-                "price"
-            ),
-            "rsi": analysis.get(
-                "rsi"
-            ),
-        }
 
     else:
+        cancel_text = (
+            f"إذا أغلقت شمعة فوق "
+            f"{format_price(cancellation)}"
+        )
 
-        stats["recovery_signals"] += 1
+    confidence = analysis["confidence"]
 
-    add_history(
-        symbol,
-        direction,
-        stage,
-        analysis,
-        "PENDING",
-        entry_time,
-        timeframe,
-    )
+    if signal_type == "RECOVERY":
 
-    logger.info(
-        "SIGNAL SENT | %s | %s | %s | "
-        "score=%s/%s gap=%s confidence=%s "
-        "structure=%s breakout=%s/%s retest=%s",
-        stage,
-        symbol,
-        direction,
-        analysis.get("max_score"),
-        MAX_SCORE,
-        analysis.get("score_gap"),
-        analysis.get("confidence"),
-        analysis.get("structure"),
-        analysis.get("breakout"),
-        analysis.get("breakout_strength"),
-        analysis.get("breakout_retest"),
-    )
+        # Recovery must never exceed the same 89 ceiling.
+        confidence = min(
+            confidence + 2,
+            MAX_RECOVERY_CONFIDENCE,
+        )
 
-    return True
-
-
-# ============================================================
-# RESULT MANAGEMENT
-# ============================================================
-
-def mark_history_result(
-    symbol,
-    direction,
-    stage,
-    result,
-):
-    for item in reversed(history):
-
-        if (
-            item.get("symbol")
-            == symbol
-            and item.get("direction")
-            == direction
-            and item.get("stage")
-            == stage
-            and item.get("result")
-            == "PENDING"
+        # Recovery still cannot claim 89 unless breakout+retest.
+        if not (
+            analysis["breakout"]["direction"] == direction
+            and analysis["breakout"]["quality"] == "STRONG"
+            and analysis["breakout"]["retest"]
         ):
+            confidence = min(confidence, 86)
 
-            item["result"] = result
+    return {
+        "id": int(time.time() * 1000),
 
-            return True
+        "symbol": symbol,
+        "timeframe": timeframe,
+
+        "type": signal_type,
+        "direction": direction,
+
+        "confidence": confidence,
+
+        "up_score": analysis["up_score"],
+        "down_score": analysis["down_score"],
+
+        "structure": analysis["structure"]["direction"],
+
+        "breakout": analysis["breakout"]["direction"],
+
+        "breakout_quality": analysis["breakout"]["quality"],
+
+        "retest": analysis["breakout"]["retest"],
+
+        "liquidity": analysis["liquidity"]["direction"],
+
+        "adx": analysis["adx"],
+        "rsi": analysis["rsi"],
+
+        "price": price,
+
+        "cancellation": cancellation,
+
+        "cancel_text": cancel_text,
+
+        "delay": delay,
+
+        "created_at": created.isoformat(),
+
+        "entry_time": entry_time.isoformat(),
+
+        "entry_time_text": entry_time.strftime(
+            "%H:%M:%S"
+        ),
+
+        "created_timestamp": time.time(),
+
+        "analysis": analysis,
+    }
+
+
+# ============================================================
+# SIGNAL MESSAGE
+# ============================================================
+
+def signal_message(signal):
+    symbol = signal["symbol"]
+    timeframe = signal["timeframe"]
+
+    direction = signal["direction"]
+
+    if direction == "UP":
+        direction_line = "🟢 UP"
+    else:
+        direction_line = "🔴 DOWN"
+
+    if signal["type"] == "RECOVERY":
+        trade_line = "♻️ RECOVERY 1/1"
+    else:
+        trade_line = "🎯 BASE TRADE"
+
+    retest_text = (
+        "YES"
+        if signal["retest"]
+        else "NO"
+    )
+
+    breakout = signal["breakout"]
+
+    if breakout == "NONE":
+        breakout_text = "NONE"
+    else:
+        breakout_text = breakout
+
+    quality = signal["breakout_quality"]
+
+    if quality == "NONE":
+        quality_text = "⚪ NONE"
+    elif quality == "STRONG":
+        quality_text = "🟢 STRONG"
+    elif quality == "WEAK":
+        quality_text = "🟡 WEAK"
+    else:
+        quality_text = "🔴 FAKE"
+
+    return (
+        f"🎓 {BOT_NAME}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 {symbol} | {timeframe}\n\n"
+
+        f"{trade_line}\n"
+        f"{direction_line}\n\n"
+
+        f"🔥 Confidence: {signal['confidence']}%\n"
+        f"🟢 UP Score: {signal['up_score']}/20\n"
+        f"🔴 DOWN Score: {signal['down_score']}/20\n\n"
+
+        f"📐 Structure: {signal['structure']}\n"
+        f"🚀 Breakout: {breakout_text}\n"
+        f"💥 Breakout Quality: {quality_text}\n"
+        f"🔄 Retest: {retest_text}\n\n"
+
+        f"📈 ADX: {signal['adx']:.1f}\n"
+        f"📊 RSI: {signal['rsi']:.1f}\n\n"
+
+        f"💰 Price: {format_price(signal['price'])}\n"
+        f"🛑 Cancellation: {signal['cancel_text']}\n\n"
+
+        f"⏱️ Entry after: {signal['delay']} minutes\n"
+        f"🕐 ENTRY TIME: "
+        f"{signal['entry_time_text']} 🇩🇿\n"
+
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def add_history(signal):
+    record = {
+        "id": signal["id"],
+        "symbol": signal["symbol"],
+        "timeframe": signal["timeframe"],
+        "type": signal["type"],
+        "direction": signal["direction"],
+        "confidence": signal["confidence"],
+        "up_score": signal["up_score"],
+        "down_score": signal["down_score"],
+        "price": signal["price"],
+        "entry_time": signal["entry_time_text"],
+        "status": "PENDING",
+        "created_at": signal["created_at"],
+    }
+
+    with state_lock:
+        signal_history.insert(0, record)
+
+        if len(signal_history) > 100:
+            del signal_history[100:]
+
+
+# ============================================================
+# OWNER CHECK
+# ============================================================
+
+def owner_only(update):
+    if not update.effective_user:
+        return False
+
+    if OWNER_ID <= 0:
+        return False
+
+    return update.effective_user.id == OWNER_ID
+
+
+async def deny_if_not_owner(update):
+    if not owner_only(update):
+        try:
+            await update.message.reply_text(
+                "⛔ هذا البوت خاص بالمالك فقط."
+            )
+        except Exception:
+            pass
+
+        return True
 
     return False
 
 
-def handle_win():
-    global cycle
-
-    with cycle_lock:
-
-        pending = cycle.get(
-            "pending_signal"
-        )
-
-        if not pending:
-            return False, "NO_PENDING"
-
-        symbol = pending[
-            "symbol"
-        ]
-
-        direction = pending[
-            "direction"
-        ]
-
-        stage = pending[
-            "stage"
-        ]
-
-        mark_history_result(
-            symbol,
-            direction,
-            stage,
-            "WIN",
-        )
-
-        stats["wins"] += 1
-
-        if stage == "BASE":
-            stats["base_wins"] += 1
-
-        else:
-            stats["recovery_wins"] += 1
-
-        cycle["last_result"] = "WIN"
-
-        cycle["pending_signal"] = None
-
-        cycle["active"] = False
-        cycle["stage"] = "IDLE"
-
-        cycle["base_symbol"] = None
-        cycle["base_direction"] = None
-        cycle["base_price"] = None
-
-        cycle["recovery_count"] = 0
-        cycle["recovery_ready_at"] = None
-
-    return True, "WIN"
-
-
-def handle_loss():
-    global cycle
-
-    with cycle_lock:
-
-        pending = cycle.get(
-            "pending_signal"
-        )
-
-        if not pending:
-            return False, "NO_PENDING"
-
-        symbol = pending[
-            "symbol"
-        ]
-
-        direction = pending[
-            "direction"
-        ]
-
-        stage = pending[
-            "stage"
-        ]
-
-        mark_history_result(
-            symbol,
-            direction,
-            stage,
-            "LOSS",
-        )
-
-        stats["losses"] += 1
-
-        if stage == "BASE":
-
-            stats["base_losses"] += 1
-
-        else:
-
-            stats["recovery_losses"] += 1
-
-        cycle["last_result"] = "LOSS"
-
-        cycle["pending_signal"] = None
-
-        if stage == "BASE":
-
-            if (
-                cycle.get(
-                    "recovery_count",
-                    0,
-                )
-                < RECOVERY_LIMIT
-            ):
-
-                cycle["stage"] = (
-                    "WAIT_RECOVERY"
-                )
-
-                cycle[
-                    "recovery_ready_at"
-                ] = (
-                    time.time()
-                    + RECOVERY_WAIT_SECONDS
-                )
-
-                return True, "BASE_LOSS"
-
-        # Recovery loss or unavailable.
-        cycle["active"] = False
-        cycle["stage"] = "IDLE"
-
-        cycle["base_symbol"] = None
-        cycle["base_direction"] = None
-        cycle["base_price"] = None
-
-        cycle["recovery_count"] = 0
-        cycle["recovery_ready_at"] = None
-
-    return True, "RECOVERY_LOSS"
-
-
 # ============================================================
-# SIGNAL WORKER
+# TELEGRAM COMMANDS
 # ============================================================
 
-def signal_worker():
-    logger.info(
-        "Signal worker started"
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
+        return
+
+    await update.message.reply_text(
+        f"🎓 {BOT_NAME}\n\n"
+        "✅ Bot is online.\n"
+        "📡 MT4 endpoint: /mt4\n"
+        "📊 Technical analysis active.\n\n"
+        "Commands:\n"
+        "/stats\n"
+        "/history\n"
+        "/win\n"
+        "/loss\n"
+        "/reset\n"
+        "/mt4status\n"
+        "/status"
     )
 
-    last_attempt = 0
 
-    while not shutdown_event.is_set():
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
+        return
 
-        try:
+    with state_lock:
+        w = wins
+        l = losses
 
-            current = time.time()
+    total = w + l
 
-            if (
-                current - last_attempt
-                < 10
-            ):
-                time.sleep(1)
-                continue
+    if total > 0:
+        rate = (w / total) * 100
+    else:
+        rate = 0
 
-            last_attempt = current
+    await update.message.reply_text(
+        f"📊 {BOT_NAME} STATS\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Wins: {w}\n"
+        f"🔴 Losses: {l}\n"
+        f"📈 Total: {total}\n"
+        f"🎯 Win Rate: {rate:.1f}%\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
 
-            with cycle_lock:
 
-                current_stage = cycle.get(
-                    "stage"
-                )
+async def win_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global wins
+    global recovery_used
+    global pending_recovery
 
-                active = cycle.get(
-                    "active"
-                )
+    if await deny_if_not_owner(update):
+        return
 
-                pending = cycle.get(
-                    "pending_signal"
-                )
+    with state_lock:
+        wins += 1
 
-                recovery_ready_at = cycle.get(
-                    "recovery_ready_at"
-                )
+        recovery_used = 0
 
-            # ------------------------------------------------
-            # WAIT RECOVERY
-            # ------------------------------------------------
+        pending_recovery = {}
 
-            if (
-                current_stage
-                == "WAIT_RECOVERY"
-                and recovery_ready_at
-                is not None
-            ):
+        if signal_history:
+            signal_history[0]["status"] = "WIN"
 
-                if (
-                    current
-                    >= recovery_ready_at
-                ):
+    await update.message.reply_text(
+        "✅ WIN\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 {wins} Wins / {losses} Losses\n"
+        "♻️ Recovery reset."
+    )
 
-                    candidate = (
-                        choose_best_recovery_pair()
-                    )
 
-                    if candidate:
+async def loss_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global losses
+    global recovery_used
+    global recovery_skips
+    global pending_recovery
 
-                        sent = send_one_signal(
-                            candidate,
-                            "RECOVERY",
-                        )
+    if await deny_if_not_owner(update):
+        return
 
-                        if sent:
-                            continue
+    recovery_signal = None
 
-                    # No strong recovery.
-                    with cycle_lock:
+    with state_lock:
+        losses += 1
 
-                        cycle["active"] = False
-                        cycle["stage"] = "IDLE"
+        if signal_history:
+            signal_history[0]["status"] = "LOSS"
 
-                        cycle[
-                            "last_result"
-                        ] = "RECOVERY_SKIPPED"
+        if last_signal:
+            symbol = last_signal["symbol"]
 
-                        cycle[
-                            "base_symbol"
-                        ] = None
+            recovery_used = 1
 
-                        cycle[
-                            "base_direction"
-                        ] = None
+            analysis = last_signal.get("analysis")
 
-                        cycle[
-                            "base_price"
-                        ] = None
+            if analysis:
+                pending_recovery[symbol] = {
+                    "allowed": True,
+                    "created": time.time(),
+                    "direction": last_signal["direction"],
+                }
 
-                        cycle[
-                            "recovery_count"
-                        ] = 0
+    await update.message.reply_text(
+        "❌ BASE LOSS\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "♻️ Recovery 1/1 ALLOWED\n"
+        "⏳ Waiting for a stronger recovery setup..."
+    )
 
-                        cycle[
-                            "recovery_ready_at"
-                        ] = None
 
-                    stats[
-                        "recovery_skips"
-                    ] += 1
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global wins
+    global losses
+    global recovery_used
+    global recovery_skips
+    global pending_recovery
+    global last_signal
 
-                    send_telegram_sync(
-                        "🛑 **RECOVERY SKIPPED**\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        "❌ BASE خسرت.\n\n"
-                        "لم يتم العثور على Recovery قوي.\n\n"
-                        "الشروط:\n"
-                        "• Score ≥ 16/20\n"
-                        "• Gap ≥ 4\n"
-                        "• ADX ≥ 25\n"
-                        "• Structure مطابق\n"
-                        "• Breakout STRONG\n"
-                        "• Retest YES\n"
-                        "• Fake Breakout NO\n\n"
-                        "⛔ لا توجد مضاعفة ضعيفة.\n"
-                        "🔎 نبدأ دورة BASE جديدة."
-                    )
+    if await deny_if_not_owner(update):
+        return
 
-                    continue
+    with state_lock:
+        wins = 0
+        losses = 0
 
-            # ------------------------------------------------
-            # ACTIVE
-            # ------------------------------------------------
+        recovery_used = 0
+        recovery_skips = 0
 
-            if active and pending:
+        pending_recovery = {}
 
-                time.sleep(2)
-                continue
+        last_signal = None
 
-            # ------------------------------------------------
-            # NEW BASE
-            # ------------------------------------------------
+        signal_history.clear()
 
-            if not active:
+        last_base_by_symbol.clear()
 
-                candidate = (
-                    choose_best_base_pair()
-                )
+    await update.message.reply_text(
+        "♻️ RESET COMPLETE\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🟢 Wins: 0\n"
+        "🔴 Losses: 0\n"
+        "♻️ Recovery: 1/1 available\n"
+        "📚 History cleared."
+    )
 
-                if candidate:
 
-                    sent = send_one_signal(
-                        candidate,
-                        "BASE",
-                    )
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
+        return
 
-                    if sent:
-                        continue
+    with state_lock:
+        history = list(signal_history[:10])
 
-            time.sleep(2)
+    if not history:
+        await update.message.reply_text(
+            "📚 History empty."
+        )
+        return
 
-        except Exception as exc:
+    lines = [
+        f"📚 {BOT_NAME} HISTORY",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
 
-            logger.exception(
-                "Signal worker error: %s",
-                exc,
+    for item in history:
+        if item["direction"] == "UP":
+            direction = "🟢 UP"
+        else:
+            direction = "🔴 DOWN"
+
+        lines.append(
+            f"📊 {item['symbol']} | {item['timeframe']}\n"
+            f"   {item['type']} | {direction}\n"
+            f"   🎯 {item['confidence']}% | "
+            f"📈 {item['up_score']}/20 "
+            f"📉 {item['down_score']}/20\n"
+            f"   💰 {format_price(item['price'])}\n"
+            f"   ⏰ {item['entry_time']}\n"
+            f"   📌 {item['status']}\n"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def mt4status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
+        return
+
+    with state_lock:
+        items = list(latest_market.items())
+
+    if not items:
+        await update.message.reply_text(
+            "📡 MT4 STATUS\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔴 No market data received."
+        )
+        return
+
+    lines = [
+        "📡 MT4 STATUS",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    current_time = time.time()
+
+    for symbol, data in items[:15]:
+        age = current_time - data.get(
+            "received_at",
+            current_time,
+        )
+
+        status = (
+            "🟢 LIVE"
+            if age <= DATA_FRESH_SECONDS
+            else "🔴 STALE"
+        )
+
+        lines.append(
+            f"📊 {symbol} | "
+            f"{data.get('timeframe', 'M1')}\n"
+            f"   {status} | "
+            f"{age:.0f}s ago\n"
+            f"   Candles: {data.get('candle_count', 0)}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
+        return
+
+    with state_lock:
+        current = last_signal
+
+    if not current:
+        await update.message.reply_text(
+            "📡 No active signal."
+        )
+        return
+
+    await update.message.reply_text(
+        signal_message(current)
+    )
+
+
+# ============================================================
+# SIGNAL PROCESSOR
+# ============================================================
+
+async def process_market_data(payload):
+    global last_signal
+    global recovery_used
+    global recovery_skips
+
+    symbol = normalize_symbol(
+        payload.get("symbol")
+        or payload.get("pair")
+        or payload.get("asset")
+    )
+
+    timeframe = normalize_timeframe(
+        payload.get("timeframe")
+        or payload.get("tf")
+        or "M1"
+    )
+
+    candles = extract_candles(payload)
+
+    if not symbol or symbol == "UNKNOWN":
+        return {
+            "ok": False,
+            "error": "missing symbol",
+        }
+
+    if len(candles) < 61:
+        return {
+            "ok": False,
+            "error": (
+                f"not enough candles: {len(candles)}"
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Save latest market data.
+    # --------------------------------------------------------
+
+    with state_lock:
+        latest_market[symbol] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": candles,
+            "candle_count": len(candles),
+            "received_at": time.time(),
+        }
+
+    analysis = analyze_market(candles)
+
+    if not analysis:
+        return {
+            "ok": False,
+            "error": "analysis unavailable",
+        }
+
+    logger.info(
+        "%s %s | direction=%s | UP=%s DOWN=%s "
+        "gap=%s ADX=%.1f PA=%s breakout=%s retest=%s "
+        "valid=%s reason=%s",
+        symbol,
+        timeframe,
+        analysis["direction"],
+        analysis["up_score"],
+        analysis["down_score"],
+        analysis["score_gap"],
+        analysis["adx"],
+        analysis["price_action_points"],
+        analysis["breakout"]["direction"],
+        analysis["breakout"]["retest"],
+        analysis["valid"],
+        analysis["reject_reason"],
+    )
+
+    # --------------------------------------------------------
+    # Recovery
+    # --------------------------------------------------------
+
+    with state_lock:
+        recovery_pending = pending_recovery.get(symbol)
+
+    if recovery_pending:
+        age = time.time() - recovery_pending["created"]
+
+        if age > 900:
+            with state_lock:
+                pending_recovery.pop(symbol, None)
+
+            recovery_pending = None
+
+    if recovery_pending:
+
+        if recovery_allowed(symbol, analysis):
+
+            signal = create_signal(
+                symbol,
+                timeframe,
+                analysis,
+                signal_type="RECOVERY",
             )
 
-            time.sleep(3)
+            with state_lock:
+                last_signal = signal
+                recovery_used = 1
+
+                pending_recovery.pop(
+                    symbol,
+                    None,
+                )
+
+            add_history(signal)
+
+            logger.info(
+                "RECOVERY SIGNAL %s %s %s",
+                symbol,
+                timeframe,
+                signal["direction"],
+            )
+
+            return {
+                "ok": True,
+                "signal": signal,
+                "message": signal_message(signal),
+            }
+
+        else:
+
+            # Recovery is allowed only once.
+            # If the next market setup is not strong enough,
+            # do not force a recovery trade.
+            with state_lock:
+                recovery_skips += 1
+                pending_recovery.pop(
+                    symbol,
+                    None,
+                )
+
+            logger.info(
+                "Recovery rejected for %s: %s",
+                symbol,
+                analysis["reject_reason"],
+            )
+
+            return {
+                "ok": True,
+                "signal": None,
+                "message": (
+                    "Recovery setup rejected: "
+                    + analysis["reject_reason"]
+                ),
+            }
+
+    # --------------------------------------------------------
+    # BASE SIGNAL
+    # --------------------------------------------------------
+
+    if not analysis["valid"]:
+        return {
+            "ok": True,
+            "signal": None,
+            "message": (
+                "No valid BASE setup: "
+                + analysis["reject_reason"]
+            ),
+        }
+
+    direction = analysis["direction"]
+
+    if not is_fresh_data(symbol):
+        return {
+            "ok": True,
+            "signal": None,
+            "message": "Market data is stale.",
+        }
+
+    if not same_setup_allowed(
+        symbol,
+        direction,
+        analysis,
+    ):
+        return {
+            "ok": True,
+            "signal": None,
+            "message": "Same setup cooldown.",
+        }
+
+    signal = create_signal(
+        symbol,
+        timeframe,
+        analysis,
+        signal_type="BASE",
+    )
+
+    with state_lock:
+        last_signal = signal
+
+        last_base_by_symbol[symbol] = {
+            "timestamp": time.time(),
+            "direction": direction,
+            "price": analysis["price"],
+            "atr": analysis["atr"],
+            "rsi": analysis["rsi"],
+        }
+
+        recovery_used = 0
+
+    add_history(signal)
+
+    logger.info(
+        "BASE SIGNAL %s %s %s %s%%",
+        symbol,
+        timeframe,
+        direction,
+        signal["confidence"],
+    )
+
+    return {
+        "ok": True,
+        "signal": signal,
+        "message": signal_message(signal),
+    }
 
 
 # ============================================================
 # HTTP SERVER
 # ============================================================
 
-class RequestHandler(
-    BaseHTTPRequestHandler
-):
+class HealthHandler(BaseHTTPRequestHandler):
 
-    def log_message(
-        self,
-        format_string,
-        *args,
-    ):
+    def log_message(self, format, *args):
         return
 
-    def send_json(
-        self,
-        status,
-        payload,
-    ):
+    def _send_json(self, status_code, data):
         body = json.dumps(
-            payload,
+            data,
             ensure_ascii=False,
         ).encode("utf-8")
 
-        self.send_response(
-            status
-        )
+        self.send_response(status_code)
 
         self.send_header(
             "Content-Type",
@@ -3578,9 +2479,23 @@ class RequestHandler(
             str(len(body)),
         )
 
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def _send_text(self, status_code, text):
+        body = text.encode("utf-8")
+
+        self.send_response(status_code)
+
         self.send_header(
-            "Access-Control-Allow-Origin",
-            "*",
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
         )
 
         self.end_headers()
@@ -3588,1294 +2503,391 @@ class RequestHandler(
         self.wfile.write(body)
 
     def do_GET(self):
-
-        parsed = urlparse(
+        path = urlparse(
             self.path
-        )
+        ).path
 
-        path = parsed.path
-
-        if path in (
-            "/",
-            "/health",
-            "/healthz",
-        ):
-
-            self.send_json(
+        if path in ("/", "/health"):
+            self._send_text(
                 200,
-                {
-                    "status": "ok",
-                    "service": "ZinoProSignalAI",
-                    "time": now_string(),
-                },
+                "ZinoProSignalAI is running",
             )
-
             return
 
-        if path in (
-            "/mt4status",
-            "/status",
-        ):
-
-            with data_lock:
-
-                symbols = {}
-
-                for symbol, item in data_store.items():
-
-                    candles = item.get(
-                        "candles",
-                        [],
-                    )
-
-                    symbols[symbol] = {
-                        "candles": len(
-                            candles
-                        ),
-                        "age_seconds": (
-                            data_age_seconds(
-                                symbol
-                            )
-                        ),
-                        "timeframe": normalize_timeframe(
-                            item.get(
-                                "timeframe",
-                                DEFAULT_TIMEFRAME,
-                            )
-                        ),
-                    }
-
-            with cycle_lock:
-
-                cycle_copy = {
-                    "active": cycle.get(
-                        "active"
+        if path == "/status":
+            with state_lock:
+                data = {
+                    "status": "running",
+                    "bot": BOT_NAME,
+                    "symbols": list(
+                        latest_market.keys()
                     ),
-                    "stage": cycle.get(
-                        "stage"
-                    ),
-                    "base_symbol": cycle.get(
-                        "base_symbol"
-                    ),
-                    "base_direction": cycle.get(
-                        "base_direction"
-                    ),
-                    "recovery_count": cycle.get(
-                        "recovery_count"
-                    ),
-                    "pending": bool(
-                        cycle.get(
-                            "pending_signal"
-                        )
-                    ),
+                    "wins": wins,
+                    "losses": losses,
+                    "recovery_used": recovery_used,
+                    "recovery_skips": recovery_skips,
                 }
 
-            self.send_json(
-                200,
-                {
-                    "status": "ok",
-                    "service": "ZinoProSignalAI",
-                    "time": now_string(),
-                    "symbols": symbols,
-                    "cycle": cycle_copy,
-                    "stats": stats,
-                },
-            )
-
+            self._send_json(200, data)
             return
 
-        self.send_json(
+        if path in ("/mt4", "/api/mt4"):
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "endpoint": path,
+                    "bot": BOT_NAME,
+                },
+            )
+            return
+
+        self._send_text(
             404,
-            {
-                "error": "not found"
-            },
+            "Not Found",
         )
 
     def do_POST(self):
-
-        parsed = urlparse(
+        path = urlparse(
             self.path
-        )
-
-        path = parsed.path
+        ).path
 
         if path not in (
             "/mt4",
             "/api/mt4",
         ):
-
-            self.send_json(
+            self._send_json(
                 404,
                 {
-                    "error": "not found"
+                    "ok": False,
+                    "error": "Not Found",
                 },
             )
-
             return
 
         # ----------------------------------------------------
         # API KEY
         # ----------------------------------------------------
 
-        header_key = (
-            self.headers.get(
-                "X-MT4-API-Key"
+        if MT4_API_KEY:
+
+            provided_key = (
+                self.headers.get("X-API-Key")
+                or self.headers.get("Authorization")
+                or ""
             )
-            or self.headers.get(
-                "X-API-Key"
-            )
-            or ""
-        ).strip()
+
+            if provided_key.startswith("Bearer "):
+                provided_key = (
+                    provided_key[7:].strip()
+                )
+
+            if provided_key != MT4_API_KEY:
+                self._send_json(
+                    401,
+                    {
+                        "ok": False,
+                        "error": "Unauthorized",
+                    },
+                )
+                return
+
+        # ----------------------------------------------------
+        # BODY
+        # ----------------------------------------------------
 
         try:
-
             content_length = int(
                 self.headers.get(
                     "Content-Length",
                     "0",
                 )
             )
-
         except Exception:
-
             content_length = 0
 
         if content_length <= 0:
-            self.send_json(
+            self._send_json(
                 400,
                 {
-                    "error": "empty body"
+                    "ok": False,
+                    "error": "Empty body",
                 },
             )
-
             return
 
-        raw_body = self.rfile.read(
-            content_length
-        )
-
         try:
+            body = self.rfile.read(
+                content_length
+            )
 
             payload = json.loads(
-                raw_body.decode(
-                    "utf-8"
-                )
+                body.decode("utf-8")
             )
 
         except Exception as exc:
-
-            self.send_json(
+            self._send_json(
                 400,
                 {
-                    "error": "invalid json",
-                    "details": str(exc),
+                    "ok": False,
+                    "error": (
+                        "Invalid JSON: "
+                        + str(exc)
+                    ),
                 },
             )
-
             return
 
-        if not isinstance(
-            payload,
-            dict,
-        ):
-
-            self.send_json(
+        if not isinstance(payload, dict):
+            self._send_json(
                 400,
                 {
-                    "error": "json must be object"
+                    "ok": False,
+                    "error": "JSON object required",
                 },
             )
-
             return
 
-        body_key = str(
-            payload.get(
-                "api_key",
-                ""
+        # ----------------------------------------------------
+        # PROCESS
+        # ----------------------------------------------------
+
+        try:
+            result = asyncio.run(
+                process_market_data(payload)
             )
-        ).strip()
 
-        supplied_key = (
-            header_key
-            or body_key
-        )
+        except Exception as exc:
+            logger.exception(
+                "MT4 processing error"
+            )
 
-        if MT4_API_KEY:
+            self._send_json(
+                500,
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
+            return
 
-            if (
-                supplied_key
-                != MT4_API_KEY
-            ):
+        # ----------------------------------------------------
+        # SEND TELEGRAM SIGNAL IF CREATED
+        # ----------------------------------------------------
 
-                self.send_json(
-                    401,
-                    {
-                        "error": "unauthorized"
-                    },
+        signal = result.get("signal")
+
+        if signal:
+            try:
+                schedule_telegram_signal(
+                    signal
+                )
+            except Exception:
+                logger.exception(
+                    "Failed scheduling Telegram signal"
                 )
 
-                return
-
-        # ----------------------------------------------------
-        # SYMBOL
-        # ----------------------------------------------------
-
-        symbol = (
-            payload.get("symbol")
-            or payload.get("Symbol")
-            or payload.get("pair")
-            or payload.get("Pair")
-        )
-
-        if not symbol:
-
-            self.send_json(
-                400,
-                {
-                    "error": "symbol missing"
-                },
-            )
-
-            return
-
-        symbol = str(
-            symbol
-        ).strip().upper()
-
-        # ----------------------------------------------------
-        # TIMEFRAME
-        # ----------------------------------------------------
-
-        timeframe = normalize_timeframe(
-            payload.get(
-                "timeframe"
-            )
-            or payload.get(
-                "Timeframe"
-            )
-            or payload.get(
-                "tf"
-            )
-        )
-
-        # ----------------------------------------------------
-        # CANDLES
-        # ----------------------------------------------------
-
-        raw_candles = (
-            payload.get("candles")
-            or payload.get("data")
-            or payload.get("bars")
-            or []
-        )
-
-        candles = normalize_candles(
-            raw_candles
-        )
-
-        if (
-            len(candles)
-            < REQUIRED_TOTAL_CANDLES
-        ):
-
-            self.send_json(
-                400,
-                {
-                    "error": "not enough candles",
-                    "symbol": symbol,
-                    "candles": len(candles),
-                    "required": REQUIRED_TOTAL_CANDLES,
-                },
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # STORE
-        # ----------------------------------------------------
-
-        with data_lock:
-
-            data_store[symbol] = {
-                "candles": candles,
-                "received_at": time.time(),
-                "updated": now_string(),
-                "timeframe": timeframe,
-            }
-
-        batch_id = (
-            f"{symbol}_"
-            f"{int(time.time())}"
-        )
-
-        logger.info(
-            "MT4 DATA | %s | %s | candles=%s",
-            symbol,
-            timeframe,
-            len(candles),
-        )
-
-        self.send_json(
+        self._send_json(
             200,
-            {
-                "status": "accepted",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "batch_id": batch_id,
-                "batch_complete": True,
-            },
+            result,
         )
 
 
 # ============================================================
-# HTTP SERVER START
+# TELEGRAM SIGNAL SENDER
 # ============================================================
+
+telegram_application = None
+
+
+def schedule_telegram_signal(signal):
+    """
+    Send signal to OWNER using the already-running
+    Telegram application event loop.
+    """
+
+    global telegram_application
+
+    if telegram_application is None:
+        logger.warning(
+            "Telegram application not ready."
+        )
+        return
+
+    async def sender():
+        try:
+            await telegram_application.bot.send_message(
+                chat_id=OWNER_ID,
+                text=signal_message(signal),
+            )
+
+        except Exception:
+            logger.exception(
+                "Telegram send failed"
+            )
+
+    loop = telegram_application._loop
+
+    if loop and loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            sender(),
+            loop,
+        )
+
 
 def start_http_server():
-
     server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT,
-        ),
-        RequestHandler,
+        ("0.0.0.0", PORT),
+        HealthHandler,
     )
 
     logger.info(
-        "HTTP server started on port %s",
+        "HTTP server listening on port %s",
         PORT,
     )
 
-    try:
-
-        server.serve_forever()
-
-    except Exception as exc:
-
-        logger.exception(
-            "HTTP server error: %s",
-            exc,
-        )
-
-    finally:
-
-        server.server_close()
+    server.serve_forever()
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# BOT STARTUP
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    await update.message.reply_text(
-        "🎓 ZinoProSignalAI\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "✅ Bot is online.\n\n"
-        "📡 MT4 data feed: ACTIVE\n"
-        "📊 Default timeframe: M1\n"
-        "🎯 Automatic signals: ON\n"
-        "♻️ Recovery: 1/1\n\n"
-        "Commands:\n"
-        "/stats\n"
-        "/history\n"
-        "/mt4status\n"
-        "/analyze SYMBOL\n"
-        "/win\n"
-        "/loss\n"
-        "/reset\n"
-        "/breakoutstats"
+async def post_init(application):
+    logger.info(
+        "%s Telegram application initialized.",
+        BOT_NAME,
     )
 
 
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    total = stats["signals"]
-    wins = stats["wins"]
-    losses = stats["losses"]
-
-    if wins + losses > 0:
-
-        winrate = (
-            wins
-            / (wins + losses)
-        ) * 100
-
-    else:
-
-        winrate = 0.0
-
-    with cycle_lock:
-
-        stage = cycle.get(
-            "stage"
-        )
-
-        active = cycle.get(
-            "active"
-        )
-
-        recovery_count = cycle.get(
-            "recovery_count"
-        )
-
-    text_message = (
-        "📊 **ZinoProSignalAI STATS**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Signals: **{total}**\n"
-        f"✅ Wins: **{wins}**\n"
-        f"❌ Losses: **{losses}**\n"
-        f"🎯 Winrate: **{winrate:.1f}%**\n\n"
-
-        f"🟢 BASE Signals: "
-        f"**{stats['base_signals']}**\n"
-
-        f"🟢 BASE Wins: "
-        f"**{stats['base_wins']}**\n"
-
-        f"🔴 BASE Losses: "
-        f"**{stats['base_losses']}**\n\n"
-
-        f"♻️ Recovery Signals: "
-        f"**{stats['recovery_signals']}**\n"
-
-        f"♻️ Recovery Wins: "
-        f"**{stats['recovery_wins']}**\n"
-
-        f"♻️ Recovery Losses: "
-        f"**{stats['recovery_losses']}**\n"
-
-        f"🛑 Recovery Skips: "
-        f"**{stats['recovery_skips']}**\n\n"
-
-        f"⚙️ Cycle: **{stage}**\n"
-        f"Active: **{active}**\n"
-        f"Recovery: "
-        f"**{recovery_count}/1**"
-    )
-
-    await update.message.reply_text(
-        text_message,
-        parse_mode="Markdown",
-    )
-
-
-async def history_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    if not history:
-
-        await update.message.reply_text(
-            "📚 History is empty."
-        )
-
-        return
-
-    lines = [
-        "📚 **ZinoProSignalAI HISTORY**",
-        "━━━━━━━━━━━━━━━━━━",
-    ]
-
-    for item in history[-15:][::-1]:
-
-        result = item.get(
-            "result",
-            "PENDING",
-        )
-
-        if result == "WIN":
-            icon = "🟢"
-
-        elif result == "LOSS":
-            icon = "🔴"
-
-        else:
-            icon = "🟡"
-
-        breakout = item.get(
-            "breakout"
-        )
-
-        strength = item.get(
-            "breakout_strength",
-            "NONE",
-        )
-
-        retest = (
-            "YES"
-            if item.get(
-                "breakout_retest"
-            )
-            else "NO"
-        )
-
-        lines.append(
-            f"{icon} "
-            f"{item.get('symbol')} "
-            f"{item.get('stage')}\n"
-
-            f"   {item.get('direction')} "
-            f"| {result}\n"
-
-            f"   Score "
-            f"{item.get('score')}/{MAX_SCORE} "
-            f"| Conf "
-            f"{item.get('confidence')}%\n"
-
-            f"   Structure: "
-            f"{item.get('structure') or 'NONE'}\n"
-
-            f"   Breakout: "
-            f"{breakout or 'NONE'} "
-            f"{strength} "
-            f"| Retest {retest}\n"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-async def breakoutstats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    categories = {
-        "UP": {
-            "wins": 0,
-            "losses": 0,
-        },
-        "DOWN": {
-            "wins": 0,
-            "losses": 0,
-        },
-        "NONE": {
-            "wins": 0,
-            "losses": 0,
-        },
-        "FAKE": {
-            "wins": 0,
-            "losses": 0,
-        },
-    }
-
-    for item in history:
-
-        result = item.get(
-            "result"
-        )
-
-        if result not in (
-            "WIN",
-            "LOSS",
-        ):
-            continue
-
-        if item.get(
-            "breakout_fake"
-        ):
-
-            category = "FAKE"
-
-        else:
-
-            category = (
-                item.get(
-                    "breakout"
-                )
-                or "NONE"
-            )
-
-            if category not in categories:
-                category = "NONE"
-
-        if result == "WIN":
-            categories[
-                category
-            ]["wins"] += 1
-
-        else:
-            categories[
-                category
-            ]["losses"] += 1
-
-    lines = [
-        "🚀 **BREAKOUT STATISTICS**",
-        "━━━━━━━━━━━━━━━━━━",
-    ]
-
-    for category, values in categories.items():
-
-        wins = values[
-            "wins"
-        ]
-
-        losses = values[
-            "losses"
-        ]
-
-        total = wins + losses
-
-        rate = (
-            (
-                wins
-                / total
-            )
-            * 100
-            if total > 0
-            else 0
-        )
-
-        lines.append(
-            f"\n**{category}**\n"
-            f"🟢 Wins: {wins}\n"
-            f"🔴 Losses: {losses}\n"
-            f"🎯 Winrate: {rate:.1f}%"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-async def mt4status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    with data_lock:
-
-        if not data_store:
-
-            await update.message.reply_text(
-                "📡 MT4 STATUS\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "❌ No MT4 data received."
-            )
-
-            return
-
-        lines = [
-            "📡 **MT4 STATUS**",
-            "━━━━━━━━━━━━━━━━━━",
-        ]
-
-        for symbol, item in data_store.items():
-
-            candles = len(
-                item.get(
-                    "candles",
-                    [],
-                )
-            )
-
-            age = data_age_seconds(
-                symbol
-            )
-
-            age_text = (
-                "--"
-                if age is None
-                else f"{age:.0f}s"
-            )
-
-            timeframe = normalize_timeframe(
-                item.get(
-                    "timeframe",
-                    DEFAULT_TIMEFRAME,
-                )
-            )
-
-            lines.append(
-                f"📊 {symbol} | "
-                f"{timeframe} | "
-                f"candles={candles} | "
-                f"age={age_text}"
-            )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-async def analyze_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "/analyze EURUSD"
-        )
-
-        return
-
-    symbol = (
-        context.args[0]
-        .strip()
-        .upper()
-    )
-
-    with data_lock:
-
-        item = data_store.get(
-            symbol
-        )
-
-    if not item:
-
-        await update.message.reply_text(
-            f"❌ No data for {symbol}"
-        )
-
-        return
-
-    candles = get_closed_candles(
-        item.get(
-            "candles",
-            [],
-        )
-    )
-
-    analysis = calculate_analysis(
-        candles
-    )
-
-    if not analysis:
-
-        await update.message.reply_text(
-            "❌ Not enough data."
-        )
-
-        return
-
-    direction = (
-        analysis.get(
-            "direction"
-        )
-        or "NONE"
-    )
-
-    valid, reason = validate_signal(
-        analysis
-    )
-
-    timeframe = normalize_timeframe(
-        item.get(
-            "timeframe",
-            DEFAULT_TIMEFRAME,
-        )
-    )
-
-    text_message = (
-        "🔬 **ANALYSIS**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {symbol} | {timeframe}\n\n"
-
-        f"🎯 Direction: **"
-        f"{direction}**\n"
-
-        f"🟢 UP: **"
-        f"{analysis['up_score']}/{MAX_SCORE}**\n"
-
-        f"🔴 DOWN: **"
-        f"{analysis['down_score']}/{MAX_SCORE}**\n"
-
-        f"📊 Gap: **"
-        f"{analysis['score_gap']}**\n"
-
-        f"🔥 Confidence: **"
-        f"{analysis['confidence']}%**\n\n"
-
-        f"📐 Structure: **"
-        f"{analysis.get('structure') or 'NONE'}**\n"
-
-        f"🚀 Breakout: **"
-        f"{analysis.get('breakout') or 'NONE'}**\n"
-
-        f"💥 Quality: **"
-        f"{analysis.get('breakout_strength', 'NONE')}**\n"
-
-        f"🔄 Retest: **"
-        f"{'YES' if analysis.get('breakout_retest') else 'NO'}**\n"
-
-        f"⚠️ Fake: **"
-        f"{'YES' if analysis.get('breakout_fake') else 'NO'}**\n\n"
-
-        f"📈 ADX: **"
-        f"{analysis.get('adx'):.1f}**\n"
-        if analysis.get("adx") is not None
-        else
-        "📈 ADX: **--**\n"
-    ) + (
-        f"📊 RSI: **"
-        f"{analysis.get('rsi'):.1f}**\n\n"
-        if analysis.get("rsi") is not None
-        else
-        "📊 RSI: **--**\n\n"
-    ) + (
-        f"🟢 Primary: **"
-        f"{analysis.get('primary_direction') or 'NONE'}**\n"
-        f"💰 Price: **"
-        f"{fmt_price(analysis.get('price'))}**\n\n"
-        f"✅ Validation: **"
-        f"{valid}**\n"
-        f"Reason: `{reason}`"
-    )
-
-    await update.message.reply_text(
-        text_message,
-        parse_mode="Markdown",
-    )
-
-
-async def win_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    with cycle_lock:
-
-        pending = cycle.get(
-            "pending_signal"
-        )
-
-    if not pending:
-
-        await update.message.reply_text(
-            "⚠️ No pending signal."
-        )
-
-        return
-
-    success, _ = handle_win()
-
-    if not success:
-
-        await update.message.reply_text(
-            "⚠️ Could not register WIN."
-        )
-
-        return
-
-    text_message = build_result_text(
-        pending,
-        "WIN",
-    )
-
-    await update.message.reply_text(
-        text_message,
-        parse_mode="Markdown",
-    )
-
-
-async def loss_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    with cycle_lock:
-
-        pending = cycle.get(
-            "pending_signal"
-        )
-
-    if not pending:
-
-        await update.message.reply_text(
-            "⚠️ No pending signal."
-        )
-
-        return
-
-    success, _ = handle_loss()
-
-    if not success:
-
-        await update.message.reply_text(
-            "⚠️ Could not register LOSS."
-        )
-
-        return
-
-    text_message = build_result_text(
-        pending,
-        "LOSS",
-    )
-
-    await update.message.reply_text(
-        text_message,
-        parse_mode="Markdown",
-    )
-
-
-async def reset_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update):
-        return
-
-    global cycle
-
-    with cycle_lock:
-
-        cycle = {
-            "active": False,
-            "stage": "IDLE",
-
-            "base_symbol": None,
-            "base_direction": None,
-            "base_price": None,
-            "base_entry_time": None,
-
-            "recovery_count": 0,
-
-            "pending_signal": None,
-
-            "last_result": None,
-            "recovery_ready_at": None,
-        }
-
-    stats.update(
-        {
-            "signals": 0,
-            "wins": 0,
-            "losses": 0,
-
-            "base_signals": 0,
-            "base_wins": 0,
-            "base_losses": 0,
-
-            "recovery_signals": 0,
-            "recovery_wins": 0,
-            "recovery_losses": 0,
-
-            "recovery_skips": 0,
-        }
-    )
-
-    history.clear()
-    recent_base_setups.clear()
-
-    await update.message.reply_text(
-        "♻️ **ZinoProSignalAI RESET**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "✅ Cycle reset\n"
-        "✅ Statistics reset\n"
-        "✅ History reset\n"
-        "✅ Recovery reset\n"
-        "✅ Recovery skips reset\n\n"
-        "🔎 Ready for a new BASE setup.",
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update,
-    context,
-):
-
-    logger.exception(
-        "Telegram error: %s",
-        context.error,
-    )
-
-
-# ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
-
-async def run_telegram():
-    global telegram_app
-    global telegram_loop
-
-    telegram_loop = (
-        asyncio.get_running_loop()
-    )
+def build_application():
+    global telegram_application
 
     if not BOT_TOKEN:
-
         raise RuntimeError(
-            "BOT_TOKEN is missing"
+            "BOT_TOKEN environment variable is missing."
         )
 
-    telegram_app = (
+    if OWNER_ID <= 0:
+        raise RuntimeError(
+            "OWNER_ID environment variable is missing or invalid."
+        )
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler(
             "start",
             start_command,
         )
     )
 
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler(
             "stats",
             stats_command,
         )
     )
 
-    telegram_app.add_handler(
-        CommandHandler(
-            "history",
-            history_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "breakoutstats",
-            breakoutstats_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "mt4status",
-            mt4status_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "status",
-            mt4status_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "analyze",
-            analyze_command,
-        )
-    )
-
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler(
             "win",
             win_command,
         )
     )
 
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler(
             "loss",
             loss_command,
         )
     )
 
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler(
             "reset",
             reset_command,
         )
     )
 
-    telegram_app.add_error_handler(
-        error_handler
+    application.add_handler(
+        CommandHandler(
+            "history",
+            history_command,
+        )
     )
 
-    logger.info(
-        "Telegram bot starting..."
+    application.add_handler(
+        CommandHandler(
+            "mt4status",
+            mt4status_command,
+        )
     )
 
-    await telegram_app.initialize()
-
-    await telegram_app.start()
-
-    await telegram_app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=[
-            "message"
-        ],
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status_command,
+        )
     )
 
-    logger.info(
-        "Telegram polling started"
-    )
+    telegram_application = application
 
-    while not shutdown_event.is_set():
+    return application
 
-        await asyncio.sleep(1)
-
-    try:
-        await telegram_app.updater.stop()
-    except Exception:
-        pass
-
-    try:
-        await telegram_app.stop()
-    except Exception:
-        pass
-
-    try:
-        await telegram_app.shutdown()
-    except Exception:
-        pass
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-
     logger.info(
-        "=========================================="
+        "Starting %s...",
+        BOT_NAME,
     )
 
     logger.info(
-        "ZinoProSignalAI starting..."
+        "OWNER_ID=%s",
+        OWNER_ID,
     )
 
     logger.info(
-        "DEFAULT_TIMEFRAME=%s",
-        DEFAULT_TIMEFRAME,
+        "MT4 API key configured=%s",
+        bool(MT4_API_KEY),
     )
-
-    logger.info(
-        "SCORE=%s/%s",
-        MIN_SCORE,
-        MAX_SCORE,
-    )
-
-    logger.info(
-        "MIN_GAP=%s",
-        MIN_SCORE_GAP,
-    )
-
-    logger.info(
-        "MAX_DATA_AGE=%ss",
-        MAX_DATA_AGE_SECONDS,
-    )
-
-    logger.info(
-        "RECOVERY_LIMIT=%s",
-        RECOVERY_LIMIT,
-    )
-
-    if not BOT_TOKEN:
-
-        logger.error(
-            "BOT_TOKEN is missing"
-        )
-
-    if not OWNER_ID:
-
-        logger.warning(
-            "OWNER_ID is missing or 0"
-        )
-
-    if not MT4_API_KEY:
-
-        logger.warning(
-            "MT4_API_KEY is missing"
-        )
 
     # --------------------------------------------------------
-    # HTTP
+    # HTTP health server
     # --------------------------------------------------------
 
     http_thread = threading.Thread(
         target=start_http_server,
-        name="HTTPServer",
         daemon=True,
     )
 
     http_thread.start()
 
     # --------------------------------------------------------
-    # SIGNAL WORKER
+    # Telegram
     # --------------------------------------------------------
 
-    worker_thread = threading.Thread(
-        target=signal_worker,
-        name="SignalWorker",
-        daemon=True,
+    application = build_application()
+
+    logger.info(
+        "Telegram polling starting..."
     )
 
-    worker_thread.start()
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
 
-    try:
-
-        asyncio.run(
-            run_telegram()
-        )
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "Shutdown requested"
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Fatal Telegram error: %s",
-            exc,
-        )
-
-    finally:
-
-        shutdown_event.set()
-
-        logger.info(
-            "ZinoProSignalAI stopped"
-        )
-
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
+```
