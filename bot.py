@@ -62,6 +62,10 @@ MAX_DATA_AGE_SECONDS = 180
 
 RECOVERY_LIMIT = 1
 
+# Recovery is allowed only when ALL of these conditions are met.
+RECOVERY_MIN_SCORE = 16
+RECOVERY_MIN_ADX = 25.0
+
 SETUP_REPEAT_BLOCK_SECONDS = 300
 
 FRESH_SETUP_ATR_RATIO = 0.35
@@ -120,6 +124,7 @@ stats = {
     "recovery_signals": 0,
     "recovery_wins": 0,
     "recovery_losses": 0,
+    "recovery_skips": 0,
 }
 
 history = []
@@ -1986,6 +1991,21 @@ def choose_best_base_pair():
 
 
 def choose_best_recovery_pair():
+    """
+    Recovery is intentionally MUCH stricter than BASE.
+
+    A candidate is eligible only if ALL conditions are true:
+      - score >= 16/20
+      - ADX >= 25
+      - Structure matches direction
+      - Breakout matches direction
+      - Breakout quality is STRONG
+      - Retest is YES
+      - Fake breakout is false
+
+    If no candidate passes, recovery must be skipped.
+    """
+
     candidates = []
 
     with data_lock:
@@ -2004,63 +2024,68 @@ def choose_best_recovery_pair():
         analysis = candidate["analysis"]
         direction = candidate["direction"]
 
-        quality = (
-            analysis["max_score"] * 10
-            + analysis["score_gap"] * 5
-        )
+        # ====================================================
+        # HARD RECOVERY FILTERS
+        # ====================================================
 
-        adx = analysis.get("adx") or 0
+        score = analysis.get("max_score", 0) or 0
+        adx = analysis.get("adx")
+        structure = analysis.get("structure")
+        breakout = analysis.get("breakout")
+        breakout_strength = analysis.get("breakout_strength")
+        retest = bool(analysis.get("breakout_retest"))
+        fake = bool(analysis.get("breakout_fake"))
 
+        if score < RECOVERY_MIN_SCORE:
+            continue
+
+        if adx is None or adx < RECOVERY_MIN_ADX:
+            continue
+
+        if structure != direction:
+            continue
+
+        if breakout != direction:
+            continue
+
+        if breakout_strength != "STRONG":
+            continue
+
+        if not retest:
+            continue
+
+        if fake:
+            continue
+
+        # ====================================================
+        # RANK ONLY ALREADY-QUALIFIED RECOVERY SETUPS
+        # ====================================================
+
+        quality = score * 10
+        quality += (analysis.get("score_gap", 0) or 0) * 5
         quality += adx
-
-        if (
-            analysis.get("primary_direction")
-            == direction
-        ):
-            quality += 8
-
-        if analysis.get("structure") == direction:
-            quality += 5
-
-        if (
-            analysis.get("breakout") == direction
-            and not analysis.get("breakout_fake")
-        ):
-
-            if analysis.get("breakout_strength") == "STRONG":
-                quality += 8
-
-            elif analysis.get("breakout_strength") == "WEAK":
-                quality += 3
-
-            if analysis.get("breakout_retest"):
-                quality += 5
-
-        if analysis.get("breakout_fake"):
-            quality -= 20
+        quality += 10  # structure aligned
+        quality += 12  # strong breakout
+        quality += 8   # retest confirmed
 
         if analysis.get("liquidity") == direction:
             quality += 2
 
-        if symbol == base_symbol:
-            quality -= 18
+        if analysis.get("body_ratio", 0) >= 0.55:
+            quality += 2
 
-        if direction == base_direction:
-            quality -= 6
-        else:
+        # Prefer a fresh direction change after BASE loss, but do not
+        # require the opposite direction if the same direction is the
+        # only genuinely strong setup.
+        if direction != base_direction:
             quality += 4
 
-        quality += (
-            analysis.get("confidence", 0)
-            * 0.25
-        )
+        if symbol == base_symbol:
+            quality -= 5
 
-        candidates.append(
-            (
-                quality,
-                candidate,
-            )
-        )
+        quality += (analysis.get("confidence", 0) or 0) * 0.25
+
+        candidates.append((quality, candidate))
 
     if not candidates:
         return None
@@ -2756,7 +2781,36 @@ def signal_worker():
                         if sent:
                             continue
 
-                    time.sleep(2)
+                    # No setup passed the HARD recovery filter.
+                    # Do not enter a weak martingale trade. End the cycle.
+                    with cycle_lock:
+                        cycle["active"] = False
+                        cycle["stage"] = "IDLE"
+                        cycle["last_result"] = "RECOVERY_SKIPPED"
+                        cycle["base_symbol"] = None
+                        cycle["base_direction"] = None
+                        cycle["base_price"] = None
+                        cycle["recovery_count"] = 0
+                        cycle["recovery_ready_at"] = None
+
+                    stats["recovery_skips"] += 1
+
+                    send_telegram_sync(
+                        "🛑 **RECOVERY SKIPPED**\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        "❌ BASE خسرت.\n"
+                        "🔎 تم فحص الأزواج كاملة.\n\n"
+                        "⚠️ ما لقيتش Setup Recovery قوي يحقق كل الشروط:\n"
+                        "• Score ≥ 16/20\n"
+                        "• ADX ≥ 25\n"
+                        "• Structure مطابق للاتجاه\n"
+                        "• Breakout STRONG\n"
+                        "• Retest YES\n"
+                        "• Fake Breakout = NO\n\n"
+                        "⛔ لا توجد مضاعفة. الدورة انتهت.\n"
+                        "━━━━━━━━━━━━━━━━━━"
+                    )
+
                     continue
 
             # ------------------------------------------------
@@ -3247,7 +3301,9 @@ async def stats_command(
         f"♻️ Recovery Wins: "
         f"**{stats['recovery_wins']}**\n"
         f"♻️ Recovery Losses: "
-        f"**{stats['recovery_losses']}**\n\n"
+        f"**{stats['recovery_losses']}**\n"
+        f"🛑 Recovery Skips: "
+        f"**{stats['recovery_skips']}**\n\n"
         f"⚙️ Cycle: "
         f"**{stage}**\n"
         f"Active: **{active}**\n"
