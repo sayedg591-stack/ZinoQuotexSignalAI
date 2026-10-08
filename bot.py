@@ -1,11 +1,9 @@
- 
-import os
+ import os
 import json
 import logging
 import threading
 import asyncio
 import time
-import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -38,52 +36,36 @@ PORT = int(os.getenv("PORT", "10000"))
 
 TIMEZONE = ZoneInfo("Africa/Algiers")
 
-# MT4 feed
 TIMEFRAME = "M1"
 
-# Data
-MIN_CANDLES = 60
-REQUIRED_TOTAL_CANDLES = 61
-MAX_DATA_AGE_SECONDS = 180
+MIN_CANDLES = 50
+REQUIRED_TOTAL_CANDLES = 51
 
-# Entry
-ENTRY_DELAY_SECONDS = 120
-
-# Base quality
-MIN_SCORE = 14
-MAX_SCORE = 20
-MIN_SCORE_GAP = 3
-
-# Confidence
-MIN_CONFIDENCE = 78
-MAX_CONFIDENCE = 89
-
-# Trend
-MIN_ADX = 21.0
-STRONG_ADX = 26.0
-
-# Candle filters
-MIN_CANDLE_RANGE_RATIO = 0.30
-MAX_CANDLE_RANGE_RATIO = 2.30
-
-# Price extension filter
-MAX_EMA21_DISTANCE_ATR = 1.25
-MAX_EMA50_DISTANCE_ATR = 2.00
-
-# Recovery
-RECOVERY_LIMIT = 1
+# Entry is calculated from the actual incoming timeframe:
+# M1 = 1 minute, M2 = 2 minutes, M3 = 3 minutes.
 RECOVERY_WAIT_SECONDS = 120
 
-RECOVERY_MIN_SCORE = 17
-RECOVERY_MIN_GAP = 4
-RECOVERY_MIN_ADX = 26.0
+MIN_SCORE = 13
+MAX_SCORE = 20
 
-# Repeated setup protection
+MIN_CONFIDENCE = 70
+MAX_CONFIDENCE = 89
+
+MIN_SCORE_GAP = 3
+
+MIN_ADX = 18.0
+STRONG_ADX = 25.0
+
+MIN_CANDLE_RANGE_RATIO = 0.25
+MAX_CANDLE_RANGE_RATIO = 2.8
+
+MAX_DATA_AGE_SECONDS = 180
+
+RECOVERY_LIMIT = 1
+
 SETUP_REPEAT_BLOCK_SECONDS = 300
-FRESH_SETUP_ATR_RATIO = 0.40
 
-# Signal quality
-MIN_TREND_CANDLES = 3
+FRESH_SETUP_ATR_RATIO = 0.35
 
 # ============================================================
 # LOGGING
@@ -139,7 +121,6 @@ stats = {
     "recovery_signals": 0,
     "recovery_wins": 0,
     "recovery_losses": 0,
-    "recovery_skips": 0,
 }
 
 history = []
@@ -211,7 +192,13 @@ def direction_emoji(direction):
 
 
 def opposite_direction(direction):
-    return "DOWN" if direction == "UP" else "UP"
+    if direction == "UP":
+        return "DOWN"
+
+    if direction == "DOWN":
+        return "UP"
+
+    return None
 
 
 def is_owner(update):
@@ -227,6 +214,18 @@ def is_owner(update):
 
 
 def normalize_candle(c):
+    """
+    Accepts common MT4/MT5 candle formats.
+
+    Expected fields:
+        time / timestamp
+        open
+        high
+        low
+        close
+        volume
+    """
+
     if not isinstance(c, dict):
         return None
 
@@ -272,11 +271,9 @@ def normalize_candles(raw):
             result.append(n)
 
     result.sort(
-        key=lambda x: (
-            safe_float(x.get("time"), 0)
-            if isinstance(x.get("time"), (int, float))
-            else str(x.get("time", ""))
-        )
+        key=lambda x: safe_float(x.get("time"), 0)
+        if isinstance(x.get("time"), (int, float))
+        else str(x.get("time", ""))
     )
 
     return result
@@ -284,8 +281,8 @@ def normalize_candles(raw):
 
 def get_closed_candles(candles):
     """
-    MT4 can send the currently forming candle as the last candle.
-    We intentionally remove it.
+    MT4 sends candles where the last candle can still be forming.
+    We intentionally remove the last candle.
     """
 
     if len(candles) < 3:
@@ -313,16 +310,13 @@ def ema_series(values, period):
     multiplier = 2.0 / (period + 1.0)
 
     first = sum(values[:period]) / period
+
     result = [first]
 
     previous = first
 
     for value in values[period:]:
-        current = (
-            (value - previous) * multiplier
-            + previous
-        )
-
+        current = (value - previous) * multiplier + previous
         result.append(current)
         previous = current
 
@@ -343,6 +337,7 @@ def true_ranges(candles):
         return []
 
     result = []
+
     previous_close = None
 
     for c in candles:
@@ -359,6 +354,7 @@ def true_ranges(candles):
             )
 
         result.append(tr)
+
         previous_close = c["close"]
 
     return result
@@ -393,13 +389,11 @@ def rsi(candles, period=14):
 
     for i in range(period, len(gains)):
         avg_gain = (
-            (avg_gain * (period - 1))
-            + gains[i]
+            (avg_gain * (period - 1)) + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
-            + losses[i]
+            (avg_loss * (period - 1)) + losses[i]
         ) / period
 
     if avg_loss == 0:
@@ -407,9 +401,7 @@ def rsi(candles, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100.0 - (
-        100.0 / (1.0 + rs)
-    )
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def stochastic(candles, period=14):
@@ -431,13 +423,8 @@ def stochastic(candles, period=14):
 
     recent_k = []
 
-    for i in range(
-        max(0, len(candles) - 3),
-        len(candles),
-    ):
-        sub = candles[
-            max(0, i - period + 1): i + 1
-        ]
+    for i in range(max(0, len(candles) - 3), len(candles)):
+        sub = candles[max(0, i - period + 1): i + 1]
 
         hi = max(x["high"] for x in sub)
         lo = min(x["low"] for x in sub)
@@ -446,17 +433,10 @@ def stochastic(candles, period=14):
             recent_k.append(50.0)
         else:
             recent_k.append(
-                (
-                    (candles[i]["close"] - lo)
-                    / (hi - lo)
-                ) * 100.0
+                ((candles[i]["close"] - lo) / (hi - lo)) * 100
             )
 
-    d = (
-        sum(recent_k) / len(recent_k)
-        if recent_k
-        else 50.0
-    )
+    d = sum(recent_k) / len(recent_k)
 
     return k, d
 
@@ -471,30 +451,22 @@ def cci(candles, period=20):
     ]
 
     window = typical[-period:]
+
     mean = sum(window) / period
 
-    deviation = (
-        sum(abs(x - mean) for x in window)
-        / period
-    )
+    deviation = sum(abs(x - mean) for x in window) / period
 
     if deviation == 0:
         return 0.0
 
-    return (
-        (typical[-1] - mean)
-        / (0.015 * deviation)
-    )
+    return (typical[-1] - mean) / (0.015 * deviation)
 
 
 def momentum(candles, period=10):
     if len(candles) <= period:
         return None
 
-    return (
-        candles[-1]["close"]
-        - candles[-1 - period]["close"]
-    )
+    return candles[-1]["close"] - candles[-1 - period]["close"]
 
 
 def macd(candles):
@@ -511,10 +483,7 @@ def macd(candles):
     series_fast = ema_series(closes, 12)
     series_slow = ema_series(closes, 26)
 
-    length = min(
-        len(series_fast),
-        len(series_slow),
-    )
+    length = min(len(series_fast), len(series_slow))
 
     if length < 9:
         return macd_line, None
@@ -550,11 +519,72 @@ def williams_r(candles, period=14):
     ) * -100.0
 
 
-def adx_di(candles, period=14):
-    """
-    Wilder-style directional movement calculation.
-    """
+def ultimate_oscillator(candles):
+    if len(candles) < 30:
+        return None
 
+    bp = []
+    tr = []
+
+    for i in range(1, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]
+
+        buying_pressure = (
+            c["close"]
+            - min(c["low"], prev["close"])
+        )
+
+        true_range = (
+            max(c["high"], prev["close"])
+            - min(c["low"], prev["close"])
+        )
+
+        bp.append(buying_pressure)
+        tr.append(true_range)
+
+    def avg(period):
+        if len(bp) < period:
+            return None
+
+        b = sum(bp[-period:])
+        t = sum(tr[-period:])
+
+        if t == 0:
+            return 0
+
+        return b / t
+
+    a7 = avg(7)
+    a14 = avg(14)
+    a28 = avg(28)
+
+    if a7 is None or a14 is None or a28 is None:
+        return None
+
+    return 100 * (
+        (4 * a7) +
+        (2 * a14) +
+        a28
+    ) / 7
+
+
+def awesome_oscillator(candles):
+    median = [
+        (c["high"] + c["low"]) / 2
+        for c in candles
+    ]
+
+    if len(median) < 34:
+        return None
+
+    fast = sum(median[-5:]) / 5
+    slow = sum(median[-34:]) / 34
+
+    return fast - slow
+
+
+def adx_di(candles, period=14):
     if len(candles) < period * 2 + 2:
         return None, None, None
 
@@ -566,114 +596,124 @@ def adx_di(candles, period=14):
         current = candles[i]
         previous = candles[i - 1]
 
-        up_move = (
-            current["high"]
-            - previous["high"]
-        )
-
-        down_move = (
-            previous["low"]
-            - current["low"]
-        )
+        up_move = current["high"] - previous["high"]
+        down_move = previous["low"] - current["low"]
 
         plus = (
             up_move
             if up_move > down_move and up_move > 0
-            else 0.0
+            else 0
         )
 
         minus = (
             down_move
             if down_move > up_move and down_move > 0
-            else 0.0
+            else 0
         )
 
         tr = max(
             current["high"] - current["low"],
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
         )
 
         trs.append(tr)
         plus_dm.append(plus)
         minus_dm.append(minus)
 
-    if len(trs) < period * 2:
+    if len(trs) < period:
         return None, None, None
 
-    # Wilder smoothing
-    tr14 = sum(trs[:period])
-    plus14 = sum(plus_dm[:period])
-    minus14 = sum(minus_dm[:period])
+    atr_values = []
+    plus_di_values = []
+    minus_di_values = []
 
-    dx_values = []
-    plus_di_last = 0.0
-    minus_di_last = 0.0
+    for i in range(period, len(trs) + 1):
+        tr_sum = sum(trs[i - period:i])
+        plus_sum = sum(plus_dm[i - period:i])
+        minus_sum = sum(minus_dm[i - period:i])
 
-    for i in range(period, len(trs)):
-
-        if i > period:
-            tr14 = (
-                tr14
-                - (tr14 / period)
-                + trs[i]
-            )
-
-            plus14 = (
-                plus14
-                - (plus14 / period)
-                + plus_dm[i]
-            )
-
-            minus14 = (
-                minus14
-                - (minus14 / period)
-                + minus_dm[i]
-            )
-
-        if tr14 <= 0:
-            plus_di = 0.0
-            minus_di = 0.0
+        if tr_sum == 0:
+            plus_di = 0
+            minus_di = 0
         else:
-            plus_di = (
-                100.0 * plus14 / tr14
-            )
+            plus_di = 100 * plus_sum / tr_sum
+            minus_di = 100 * minus_sum / tr_sum
 
-            minus_di = (
-                100.0 * minus14 / tr14
-            )
+        dx_den = plus_di + minus_di
 
-        denominator = plus_di + minus_di
-
-        if denominator <= 0:
-            dx = 0.0
+        if dx_den == 0:
+            dx = 0
         else:
             dx = (
                 abs(plus_di - minus_di)
-                / denominator
-            ) * 100.0
+                / dx_den
+            ) * 100
 
-        dx_values.append(dx)
+        atr_values.append(dx)
+        plus_di_values.append(plus_di)
+        minus_di_values.append(minus_di)
 
-        plus_di_last = plus_di
-        minus_di_last = minus_di
-
-    if len(dx_values) < period:
+    if len(atr_values) < period:
         return None, None, None
 
-    adx = sum(dx_values[-period:]) / period
+    adx = sum(atr_values[-period:]) / period
 
     return (
         adx,
-        plus_di_last,
-        minus_di_last,
+        plus_di_values[-1],
+        minus_di_values[-1],
     )
+
+
+def stoch_rsi(candles, period=14):
+    if len(candles) < period * 2:
+        return None
+
+    rsi_values = []
+
+    for i in range(period, len(candles)):
+        sub = candles[:i + 1]
+
+        value = rsi(sub, period)
+
+        if value is not None:
+            rsi_values.append(value)
+
+    if len(rsi_values) < period:
+        return None
+
+    window = rsi_values[-period:]
+
+    low = min(window)
+    high = max(window)
+
+    if high == low:
+        return 50.0
+
+    return (
+        (rsi_values[-1] - low)
+        / (high - low)
+    ) * 100
+
+
+def bull_bear_power(candles, period=13):
+    if len(candles) < period:
+        return None, None
+
+    closes = [c["close"] for c in candles]
+
+    ema_value = ema(closes, period)
+
+    if ema_value is None:
+        return None, None
+
+    current = candles[-1]
+
+    bull = current["high"] - ema_value
+    bear = current["low"] - ema_value
+
+    return bull, bear
 
 
 # ============================================================
@@ -687,39 +727,24 @@ def candle_metrics(candles):
 
     c = candles[-1]
 
-    body = abs(
-        c["close"] - c["open"]
+    body = abs(c["close"] - c["open"])
+
+    upper_wick = c["high"] - max(
+        c["open"],
+        c["close"],
     )
 
-    upper_wick = (
-        c["high"]
-        - max(c["open"], c["close"])
-    )
+    lower_wick = min(
+        c["open"],
+        c["close"],
+    ) - c["low"]
 
-    lower_wick = (
-        min(c["open"], c["close"])
-        - c["low"]
-    )
+    total_range = c["high"] - c["low"]
 
-    total_range = (
-        c["high"] - c["low"]
-    )
-
-    body_ratio = (
-        body / total_range
-        if total_range > 0
-        else 0.0
-    )
-
-    close_position = (
-        (
-            c["close"]
-            - c["low"]
-        )
-        / total_range
-        if total_range > 0
-        else 0.5
-    )
+    if total_range <= 0:
+        body_ratio = 0
+    else:
+        body_ratio = body / total_range
 
     return {
         "body": body,
@@ -729,219 +754,60 @@ def candle_metrics(candles):
         "body_ratio": body_ratio,
         "bullish": c["close"] > c["open"],
         "bearish": c["close"] < c["open"],
-        "close_position": close_position,
     }
 
 
 def structure_direction(candles):
-    """
-    Stronger structure detector.
-
-    UP:
-      - recent swing highs rising
-      - recent swing lows rising
-
-    DOWN:
-      - recent swing highs falling
-      - recent swing lows falling
-    """
-
-    if len(candles) < 12:
+    if len(candles) < 8:
         return None
 
-    recent = candles[-8:]
+    recent = candles[-6:]
 
-    highs = [
-        c["high"]
-        for c in recent
-    ]
-
-    lows = [
-        c["low"]
-        for c in recent
-    ]
-
-    # Compare first half against second half.
-    first_high = max(highs[:4])
-    second_high = max(highs[4:])
-
-    first_low = min(lows[:4])
-    second_low = min(lows[4:])
+    highs = [c["high"] for c in recent]
+    lows = [c["low"] for c in recent]
 
     if (
-        second_high > first_high
-        and second_low > first_low
+        highs[-1] > highs[-2]
+        and lows[-1] > lows[-2]
     ):
         return "UP"
 
     if (
-        second_high < first_high
-        and second_low < first_low
+        highs[-1] < highs[-2]
+        and lows[-1] < lows[-2]
     ):
         return "DOWN"
 
     return None
 
 
-def recent_trend_direction(candles, count=4):
-    if len(candles) < count + 1:
-        return None
-
-    recent = candles[-count:]
-
-    bullish = sum(
-        1
-        for c in recent
-        if c["close"] > c["open"]
-    )
-
-    bearish = sum(
-        1
-        for c in recent
-        if c["close"] < c["open"]
-    )
-
-    if bullish >= 3:
-        return "UP"
-
-    if bearish >= 3:
-        return "DOWN"
-
-    return None
-
-
-def candle_confirmation(candles, direction):
-    """
-    Last candle must show directional acceptance.
-    """
-
-    if len(candles) < 2:
-        return False
-
-    metrics = candle_metrics(candles)
-
-    if not metrics:
-        return False
-
-    body_ratio = metrics["body_ratio"]
-    close_position = metrics["close_position"]
-
-    if direction == "UP":
-        return (
-            metrics["bullish"]
-            and body_ratio >= 0.50
-            and close_position >= 0.65
-        )
-
-    if direction == "DOWN":
-        return (
-            metrics["bearish"]
-            and body_ratio >= 0.50
-            and close_position <= 0.35
-        )
-
-    return False
-
-
 # ============================================================
-# LIQUIDITY
-# ============================================================
-
-
-def liquidity_analysis(candles):
-    """
-    Detects a meaningful liquidity sweep.
-
-    Returns:
-        direction
-        strength
-    """
-
-    result = {
-        "direction": None,
-        "strength": 0,
-    }
-
-    if len(candles) < 15:
-        return result
-
-    last = candles[-1]
-    previous = candles[-11:-1]
-
-    highest = max(
-        c["high"]
-        for c in previous
-    )
-
-    lowest = min(
-        c["low"]
-        for c in previous
-    )
-
-    atr_value = atr(candles, 14)
-
-    if atr_value is None or atr_value <= 0:
-        return result
-
-    # Sweep above resistance -> bearish rejection
-    if (
-        last["high"] > highest
-        and last["close"] < highest
-    ):
-        rejection = (
-            last["high"]
-            - last["close"]
-        )
-
-        if rejection >= atr_value * 0.15:
-            result["direction"] = "DOWN"
-            result["strength"] = 2
-        else:
-            result["direction"] = "DOWN"
-            result["strength"] = 1
-
-    # Sweep below support -> bullish rejection
-    elif (
-        last["low"] < lowest
-        and last["close"] > lowest
-    ):
-        rejection = (
-            last["close"]
-            - last["low"]
-        )
-
-        if rejection >= atr_value * 0.15:
-            result["direction"] = "UP"
-            result["strength"] = 2
-        else:
-            result["direction"] = "UP"
-            result["strength"] = 1
-
-    return result
-
-
-def liquidity_direction(candles):
-    return liquidity_analysis(candles)["direction"]
-
-
-# ============================================================
-# BREAKOUT
+# ADVANCED BREAKOUT
 # ============================================================
 
 
 def breakout_analysis(candles):
     """
-    Strict breakout detector.
+    Advanced breakout detector.
 
-    A valid breakout needs:
-      - close outside a real previous range
-      - meaningful distance from level
-      - acceptable candle body
-      - optional retest confirmation
+    Returns:
+        direction:
+            UP / DOWN / None
 
-    Fake breakout:
-      - wick crosses level
-      - candle closes back inside
+        strength:
+            STRONG / WEAK / NONE
+
+        retest:
+            True / False
+
+        fake:
+            True / False
+
+        level:
+            breakout level
+
+        score:
+            internal breakout score
     """
 
     result = {
@@ -953,7 +819,7 @@ def breakout_analysis(candles):
         "score": 0,
     }
 
-    if len(candles) < 30:
+    if len(candles) < 25:
         return result
 
     last = candles[-1]
@@ -963,89 +829,73 @@ def breakout_analysis(candles):
     if len(previous) < 15:
         return result
 
-    highest = max(
-        c["high"]
-        for c in previous
-    )
+    highest = max(c["high"] for c in previous)
+    lowest = min(c["low"] for c in previous)
 
-    lowest = min(
-        c["low"]
-        for c in previous
+    result["level"] = (
+        highest
+        if last["close"] > highest
+        else lowest
+        if last["close"] < lowest
+        else None
     )
 
     atr_value = atr(candles, 14)
 
     if atr_value is None or atr_value <= 0:
-        return result
+        atr_value = (
+            sum(
+                c["high"] - c["low"]
+                for c in candles[-14:]
+            )
+            / 14
+        )
 
-    candle_range = (
-        last["high"] - last["low"]
-    )
+    close = last["close"]
+    candle_range = last["high"] - last["low"]
 
     if candle_range <= 0:
         return result
 
-    body_ratio = (
-        abs(last["close"] - last["open"])
-        / candle_range
-    )
-
     # --------------------------------------------------------
-    # UP BREAKOUT
+    # REAL UP BREAKOUT
     # --------------------------------------------------------
 
-    if last["close"] > highest:
-
-        distance = (
-            last["close"] - highest
-        )
+    if close > highest:
 
         result["direction"] = "UP"
-        result["level"] = highest
 
-        if (
-            distance >= atr_value * 0.25
-            and body_ratio >= 0.55
-        ):
+        distance = close - highest
+
+        if distance >= atr_value * 0.30:
             result["strength"] = "STRONG"
             result["score"] = 2
-
-        elif distance >= atr_value * 0.12:
+        else:
             result["strength"] = "WEAK"
             result["score"] = 1
 
     # --------------------------------------------------------
-    # DOWN BREAKOUT
+    # REAL DOWN BREAKOUT
     # --------------------------------------------------------
 
-    elif last["close"] < lowest:
-
-        distance = (
-            lowest - last["close"]
-        )
+    elif close < lowest:
 
         result["direction"] = "DOWN"
-        result["level"] = lowest
 
-        if (
-            distance >= atr_value * 0.25
-            and body_ratio >= 0.55
-        ):
+        distance = lowest - close
+
+        if distance >= atr_value * 0.30:
             result["strength"] = "STRONG"
             result["score"] = 2
-
-        elif distance >= atr_value * 0.12:
+        else:
             result["strength"] = "WEAK"
             result["score"] = 1
 
     # --------------------------------------------------------
-    # FAKE UP
+    # FAKE UP BREAKOUT
     # --------------------------------------------------------
 
-    elif (
-        last["high"] > highest
-        and last["close"] <= highest
-    ):
+    elif last["high"] > highest and close <= highest:
 
         result["direction"] = "UP"
         result["strength"] = "FAKE"
@@ -1054,13 +904,10 @@ def breakout_analysis(candles):
         result["score"] = -2
 
     # --------------------------------------------------------
-    # FAKE DOWN
+    # FAKE DOWN BREAKOUT
     # --------------------------------------------------------
 
-    elif (
-        last["low"] < lowest
-        and last["close"] >= lowest
-    ):
+    elif last["low"] < lowest and close >= lowest:
 
         result["direction"] = "DOWN"
         result["strength"] = "FAKE"
@@ -1069,57 +916,66 @@ def breakout_analysis(candles):
         result["score"] = -2
 
     # --------------------------------------------------------
-    # RETEST
+    # RETEST DETECTION
     # --------------------------------------------------------
 
-    if (
-        result["direction"] in ("UP", "DOWN")
-        and not result["fake"]
-        and result["level"] is not None
-    ):
+    if result["direction"] in ("UP", "DOWN") and not result["fake"]:
 
         direction = result["direction"]
         level = result["level"]
 
-        tolerance = atr_value * 0.12
+        if level is not None:
 
-        # Search previous 5 closed candles for a touch.
-        for i in range(
-            max(0, len(candles) - 7),
-            len(candles) - 1,
-        ):
+            scan_start = max(
+                2,
+                len(candles) - 7,
+            )
 
-            c = candles[i]
+            for i in range(scan_start, len(candles) - 1):
 
-            if direction == "UP":
+                current = candles[i]
 
-                touched = (
-                    c["low"] <= level + tolerance
-                    and c["high"] >= level - tolerance
+                local_start = max(
+                    0,
+                    i - 20,
                 )
 
-                rejected = (
-                    c["close"] > level
+                local_window = candles[local_start:i]
+
+                if len(local_window) < 10:
+                    continue
+
+                local_high = max(
+                    x["high"]
+                    for x in local_window
                 )
 
-                if touched and rejected:
-                    result["retest"] = True
-                    break
-
-            else:
-
-                touched = (
-                    c["high"] >= level - tolerance
-                    and c["low"] <= level + tolerance
+                local_low = min(
+                    x["low"]
+                    for x in local_window
                 )
 
-                rejected = (
-                    c["close"] < level
-                )
+                tolerance = atr_value * 0.18
 
-                if touched and rejected:
-                    result["retest"] = True
-                    break
+                if direction == "UP":
+
+                    if (
+                        current["high"] > local_high
+                        and abs(current["low"] - local_high)
+                        <= tolerance
+                    ):
+                        result["retest"] = True
+                        break
+
+                elif direction == "DOWN":
+
+                    if (
+                        current["low"] < local_low
+                        and abs(current["high"] - local_low)
+                        <= tolerance
+                    ):
+                        result["retest"] = True
+                        break
 
     if result["retest"]:
         result["score"] += 1
@@ -1128,7 +984,38 @@ def breakout_analysis(candles):
 
 
 def breakout_direction(candles):
+    """
+    Compatibility helper.
+    """
+
     return breakout_analysis(candles)["direction"]
+
+
+def liquidity_direction(candles):
+    if len(candles) < 12:
+        return None
+
+    previous = candles[-11:-1]
+    last = candles[-1]
+
+    highest = max(c["high"] for c in previous)
+    lowest = min(c["low"] for c in previous)
+
+    # Sweep above liquidity and close back below
+    if (
+        last["high"] > highest
+        and last["close"] < highest
+    ):
+        return "DOWN"
+
+    # Sweep below liquidity and close back above
+    if (
+        last["low"] < lowest
+        and last["close"] > lowest
+    ):
+        return "UP"
+
+    return None
 
 
 # ============================================================
@@ -1136,773 +1023,476 @@ def breakout_direction(candles):
 # ============================================================
 
 
-def calculate_analysis(candles):
+def normalize_timeframe(value, candles=None):
+    """Normalize M1/M2/M3 timeframe from MT4/MT5 payload or candle spacing."""
+    if value is not None:
+        text = str(value).strip().upper().replace(" ", "")
+        if text in {"1", "1M", "M1", "60", "60S"}:
+            return "M1"
+        if text in {"2", "2M", "M2", "120", "120S"}:
+            return "M2"
+        if text in {"3", "3M", "M3", "180", "180S"}:
+            return "M3"
+
+    if candles and len(candles) >= 3:
+        times = []
+        for c in candles[-20:]:
+            t = safe_float(c.get("time"))
+            if t is not None:
+                times.append(t)
+        diffs = []
+        for a, b in zip(times, times[1:]):
+            d = b - a
+            if 30 <= d <= 600:
+                diffs.append(d)
+        if diffs:
+            median = sorted(diffs)[len(diffs)//2]
+            if 90 <= median < 150:
+                return "M2"
+            if 150 <= median < 240:
+                return "M3"
+            if 45 <= median < 90:
+                return "M1"
+
+    return TIMEFRAME
+
+
+def timeframe_minutes(timeframe):
+    tf = normalize_timeframe(timeframe)
+    return {"M1": 1, "M2": 2, "M3": 3}.get(tf, 1)
+
+
+def calculate_entry_time(timeframe, created_at=None):
+    """Return an Algiers entry time based on M1/M2/M3, not a fixed delay."""
+    minutes = timeframe_minutes(timeframe)
+    base = now_algeria() if created_at is None else created_at
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=TIMEZONE)
+    return base.astimezone(TIMEZONE) + timedelta(minutes=minutes)
+
+
+def _sign(value, eps=0.0):
+    if value is None:
+        return 0
+    if value > eps:
+        return 1
+    if value < -eps:
+        return -1
+    return 0
+
+
+def calculate_analysis(candles, timeframe="M1"):
+    """
+    Accuracy-focused analysis.
+
+    The 20 points are deliberately balanced so one indicator cannot dominate:
+      Trend/EMA      3
+      Structure      3
+      Price action   3
+      Momentum/ADX   3
+      Breakout       3
+      RSI/W%R        2
+      Liquidity      1
+      Context        2
+    """
     if len(candles) < MIN_CANDLES:
         return None
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    timeframe = normalize_timeframe(timeframe, candles)
+    closes = [c["close"] for c in candles]
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     ema50 = ema(closes, 50)
-
     rsi14 = rsi(candles, 14)
-
-    adx, plus_di, minus_di = adx_di(
-        candles,
-        14,
-    )
-
+    adx, plus_di, minus_di = adx_di(candles, 14)
     atr14 = atr(candles, 14)
-
-    stoch_k, stoch_d = stochastic(
-        candles,
-        14,
-    )
-
-    cci20 = cci(
-        candles,
-        20,
-    )
-
-    mom10 = momentum(
-        candles,
-        10,
-    )
-
-    macd_line, macd_signal = macd(
-        candles
-    )
-
-    williams = williams_r(
-        candles,
-        14,
-    )
-
-    structure = structure_direction(
-        candles
-    )
-
-    recent_trend = recent_trend_direction(
-        candles,
-        MIN_TREND_CANDLES,
-    )
-
-    breakout_info = breakout_analysis(
-        candles
-    )
+    williams = williams_r(candles, 14)
+    structure = structure_direction(candles)
+    breakout_info = breakout_analysis(candles)
+    liquidity = liquidity_direction(candles)
+    metrics = candle_metrics(candles)
+    last = candles[-1]
 
     breakout = breakout_info["direction"]
     breakout_strength = breakout_info["strength"]
     breakout_retest = breakout_info["retest"]
     breakout_fake = breakout_info["fake"]
-    breakout_score = breakout_info["score"]
     breakout_level = breakout_info["level"]
-
-    liquidity_info = liquidity_analysis(
-        candles
-    )
-
-    liquidity = liquidity_info["direction"]
-    liquidity_strength = liquidity_info["strength"]
-
-    last = candles[-1]
-
-    metrics = candle_metrics(
-        candles
-    )
+    breakout_score = breakout_info["score"]
 
     up_score = 0
     down_score = 0
-
     reasons_up = []
     reasons_down = []
-    rejection_reasons = []
+    conflict_reasons = []
 
-    # ========================================================
-    # 1. STRUCTURE — 4 POINTS
-    # ========================================================
+    # -------------------------
+    # 1) TREND / EMA (3)
+    # -------------------------
+    trend_direction = None
+    trend_up = 0
+    trend_down = 0
+
+    if ema9 is not None and ema21 is not None:
+        if ema9 > ema21:
+            trend_up += 1
+        elif ema9 < ema21:
+            trend_down += 1
+
+    if ema21 is not None and ema50 is not None:
+        if ema21 > ema50:
+            trend_up += 1
+        elif ema21 < ema50:
+            trend_down += 1
+
+    if ema21 is not None:
+        if last["close"] > ema21:
+            trend_up += 1
+        elif last["close"] < ema21:
+            trend_down += 1
+
+    if trend_up > trend_down:
+        trend_direction = "UP"
+        up_score += min(3, trend_up)
+        reasons_up.append("EMA trend UP")
+    elif trend_down > trend_up:
+        trend_direction = "DOWN"
+        down_score += min(3, trend_down)
+        reasons_down.append("EMA trend DOWN")
+
+    # -------------------------
+    # 2) STRUCTURE (3)
+    # -------------------------
+    structure_score = 0
+    if len(candles) >= 6:
+        a, b, c = candles[-3:]
+        higher_highs = c["high"] > b["high"] > a["high"]
+        higher_lows = c["low"] > b["low"] > a["low"]
+        lower_highs = c["high"] < b["high"] < a["high"]
+        lower_lows = c["low"] < b["low"] < a["low"]
+        close_up = c["close"] > b["close"] > a["close"]
+        close_down = c["close"] < b["close"] < a["close"]
+
+        if higher_highs and higher_lows:
+            structure = "UP"
+            structure_score = 3 if close_up else 2
+        elif lower_highs and lower_lows:
+            structure = "DOWN"
+            structure_score = 3 if close_down else 2
 
     if structure == "UP":
-        up_score += 4
-        reasons_up.append("Structure UP")
-
+        up_score += structure_score
+        reasons_up.append("3-candle structure UP")
     elif structure == "DOWN":
-        down_score += 4
-        reasons_down.append("Structure DOWN")
+        down_score += structure_score
+        reasons_down.append("3-candle structure DOWN")
 
-    # ========================================================
-    # 2. BREAKOUT / RETEST — 4 POINTS
-    # ========================================================
+    # -------------------------
+    # 3) PRICE ACTION (3)
+    # -------------------------
+    body_ratio = metrics.get("body_ratio", 0)
+    candle_dir = "UP" if metrics.get("bullish") else "DOWN" if metrics.get("bearish") else None
+    pa_score = 0
 
-    if breakout == "UP" and not breakout_fake:
+    if candle_dir:
+        if body_ratio >= 0.60:
+            pa_score += 2
+        elif body_ratio >= 0.45:
+            pa_score += 1
 
-        if breakout_strength == "STRONG":
-            up_score += 2
-            reasons_up.append("Strong Breakout UP")
+        previous = candles[-2]
+        previous_dir = "UP" if previous["close"] > previous["open"] else "DOWN" if previous["close"] < previous["open"] else None
+        if previous_dir == candle_dir:
+            pa_score += 1
 
-        elif breakout_strength == "WEAK":
-            up_score += 1
-            reasons_up.append("Weak Breakout UP")
+        if candle_dir == "UP":
+            up_score += pa_score
+            reasons_up.append("Price action UP")
+        else:
+            down_score += pa_score
+            reasons_down.append("Price action DOWN")
 
-        if breakout_retest:
-            up_score += 2
-            reasons_up.append("Retest UP")
+    # -------------------------
+    # 4) MOMENTUM / ADX / DI (3)
+    # -------------------------
+    momentum_score = 0
+    momentum_direction = None
 
-    elif breakout == "DOWN" and not breakout_fake:
-
-        if breakout_strength == "STRONG":
-            down_score += 2
-            reasons_down.append("Strong Breakout DOWN")
-
-        elif breakout_strength == "WEAK":
-            down_score += 1
-            reasons_down.append("Weak Breakout DOWN")
-
-        if breakout_retest:
-            down_score += 2
-            reasons_down.append("Retest DOWN")
-
-    # ========================================================
-    # 3. EMA TREND — 3 POINTS
-    # ========================================================
-
-    if (
-        ema9 is not None
-        and ema21 is not None
-    ):
-
-        if ema9 > ema21:
-            up_score += 2
-            reasons_up.append("EMA 9>21")
-
-        elif ema9 < ema21:
-            down_score += 2
-            reasons_down.append("EMA 9<21")
-
-    if (
-        ema21 is not None
-        and ema50 is not None
-    ):
-
-        if ema21 > ema50:
-            up_score += 1
-
-        elif ema21 < ema50:
-            down_score += 1
-
-    # ========================================================
-    # 4. ADX / DI — 3 POINTS
-    # ========================================================
-
-    if (
-        adx is not None
-        and plus_di is not None
-        and minus_di is not None
-    ):
-
-        di_gap = abs(
-            plus_di - minus_di
-        )
-
+    if plus_di is not None and minus_di is not None:
         if plus_di > minus_di:
-
-            if adx >= STRONG_ADX:
-                up_score += 3
-            else:
-                up_score += 2
-
-            reasons_up.append(
-                f"DI+ {plus_di:.1f}"
-            )
-
+            momentum_direction = "UP"
         elif minus_di > plus_di:
+            momentum_direction = "DOWN"
 
-            if adx >= STRONG_ADX:
-                down_score += 3
-            else:
-                down_score += 2
+    if adx is not None and momentum_direction:
+        if adx >= STRONG_ADX:
+            momentum_score += 2
+        elif adx >= MIN_ADX:
+            momentum_score += 1
 
-            reasons_down.append(
-                f"DI- {minus_di:.1f}"
-            )
+        if momentum_direction == "UP":
+            momentum_score += 1 if plus_di > minus_di + 2 else 0
+            up_score += momentum_score
+            reasons_up.append(f"Momentum UP ADX {adx:.1f}")
+        else:
+            momentum_score += 1 if minus_di > plus_di + 2 else 0
+            down_score += momentum_score
+            reasons_down.append(f"Momentum DOWN ADX {adx:.1f}")
 
-    # ========================================================
-    # 5. MOMENTUM / RSI — 2 POINTS
-    # ========================================================
+    # -------------------------
+    # 5) BREAKOUT / RETEST (3)
+    # -------------------------
+    if breakout_fake:
+        if breakout == "UP":
+            down_score += 2
+            reasons_down.append("Failed UP breakout")
+        elif breakout == "DOWN":
+            up_score += 2
+            reasons_up.append("Failed DOWN breakout")
+    elif breakout == "UP":
+        add = 2 if breakout_strength == "STRONG" else 1
+        if breakout_retest:
+            add += 1
+        up_score += min(3, add)
+        reasons_up.append("Breakout UP" + (" + retest" if breakout_retest else ""))
+    elif breakout == "DOWN":
+        add = 2 if breakout_strength == "STRONG" else 1
+        if breakout_retest:
+            add += 1
+        down_score += min(3, add)
+        reasons_down.append("Breakout DOWN" + (" + retest" if breakout_retest else ""))
 
+    # -------------------------
+    # 6) RSI + WILLIAMS %R (2)
+    # -------------------------
+    osc_up = 0
+    osc_down = 0
+
+    # Do not chase extreme RSI. In a trend, mid-zone confirmation is safer.
     if rsi14 is not None:
+        if 52 <= rsi14 <= 68:
+            osc_up += 1
+        elif 32 <= rsi14 <= 48:
+            osc_down += 1
 
-        if 52 <= rsi14 < 70:
-            up_score += 2
-            reasons_up.append(
-                f"RSI {rsi14:.1f}"
-            )
+    if williams is not None:
+        if -50 < williams < -15:
+            osc_up += 1
+        elif -85 < williams < -50:
+            osc_down += 1
 
-        elif 30 < rsi14 <= 48:
-            down_score += 2
-            reasons_down.append(
-                f"RSI {rsi14:.1f}"
-            )
+    if osc_up > osc_down:
+        up_score += min(2, osc_up)
+        reasons_up.append("RSI/W%R confirm UP")
+    elif osc_down > osc_up:
+        down_score += min(2, osc_down)
+        reasons_down.append("RSI/W%R confirm DOWN")
 
-        # Neutral 48-52 gives no point.
-        # Extreme RSI does NOT add score.
-
-    # ========================================================
-    # 6. LIQUIDITY — 2 POINTS
-    # ========================================================
-
+    # -------------------------
+    # 7) LIQUIDITY (1)
+    # -------------------------
     if liquidity == "UP":
-
-        if liquidity_strength >= 2:
-            up_score += 2
-        else:
-            up_score += 1
-
-        reasons_up.append("Liquidity Sweep UP")
-
+        up_score += 1
+        reasons_up.append("Liquidity sweep UP")
     elif liquidity == "DOWN":
+        down_score += 1
+        reasons_down.append("Liquidity sweep DOWN")
 
-        if liquidity_strength >= 2:
-            down_score += 2
-        else:
-            down_score += 1
+    # -------------------------
+    # 8) CONTEXT / EXTENSION (2)
+    # -------------------------
+    extension = 0.0
+    if atr14 and atr14 > 0 and ema9 is not None:
+        extension = abs(last["close"] - ema9) / atr14
 
-        reasons_down.append(
-            "Liquidity Sweep DOWN"
-        )
+    # One point for healthy location relative to EMA9; one for trend agreement.
+    context_up = 0
+    context_down = 0
+    if ema9 is not None:
+        if last["close"] > ema9 and extension <= 1.15:
+            context_up += 1
+        elif last["close"] < ema9 and extension <= 1.15:
+            context_down += 1
 
-    # ========================================================
-    # 7. CANDLE CONFIRMATION — 2 POINTS
-    # ========================================================
+    if trend_direction == "UP" and structure == "UP":
+        context_up += 1
+    elif trend_direction == "DOWN" and structure == "DOWN":
+        context_down += 1
 
-    candle_up = candle_confirmation(
-        candles,
-        "UP",
-    )
+    up_score += min(2, context_up)
+    down_score += min(2, context_down)
 
-    candle_down = candle_confirmation(
-        candles,
-        "DOWN",
-    )
-
-    if candle_up:
-        up_score += 2
-        reasons_up.append("Bull Candle")
-
-    elif candle_down:
-        down_score += 2
-        reasons_down.append("Bear Candle")
-
-    # ========================================================
-    # CAP
-    # ========================================================
-
-    up_score = int(
-        clamp(
-            up_score,
-            0,
-            MAX_SCORE,
-        )
-    )
-
-    down_score = int(
-        clamp(
-            down_score,
-            0,
-            MAX_SCORE,
-        )
-    )
+    # -------------------------
+    # Symmetric conflict / anti-chase logic
+    # -------------------------
+    up_score = clamp(int(round(up_score)), 0, MAX_SCORE)
+    down_score = clamp(int(round(down_score)), 0, MAX_SCORE)
 
     if up_score > down_score:
         direction = "UP"
-
     elif down_score > up_score:
         direction = "DOWN"
-
     else:
-        direction = None
+        # User wants an actual direction, never WAIT/NEUTRAL.
+        # Use the strongest structural/trend side only when scores tie.
+        direction = trend_direction or structure or candle_dir or "UP"
 
-    max_score = max(
-        up_score,
-        down_score,
-    )
+    max_score = max(up_score, down_score)
+    score_gap = abs(up_score - down_score)
 
-    score_gap = abs(
-        up_score - down_score
-    )
-
-    # ========================================================
-    # PRIMARY TREND
-    # ========================================================
-
+    # Primary direction is intentionally price/trend based, not RSI based.
     primary_votes = 0
-
-    if (
-        ema9 is not None
-        and ema21 is not None
-    ):
-
-        if ema9 > ema21:
-            primary_votes += 1
-
-        elif ema9 < ema21:
-            primary_votes -= 1
-
-    if (
-        plus_di is not None
-        and minus_di is not None
-    ):
-
-        if plus_di > minus_di:
-            primary_votes += 1
-
-        elif minus_di > plus_di:
-            primary_votes -= 1
+    if trend_direction == "UP":
+        primary_votes += 2
+    elif trend_direction == "DOWN":
+        primary_votes -= 2
 
     if structure == "UP":
-        primary_votes += 1
-
+        primary_votes += 2
     elif structure == "DOWN":
-        primary_votes -= 1
+        primary_votes -= 2
 
-    if recent_trend == "UP":
+    if momentum_direction == "UP" and adx is not None and adx >= MIN_ADX:
         primary_votes += 1
-
-    elif recent_trend == "DOWN":
+    elif momentum_direction == "DOWN" and adx is not None and adx >= MIN_ADX:
         primary_votes -= 1
 
-    if primary_votes > 0:
-        primary_direction = "UP"
+    if candle_dir == "UP":
+        primary_votes += 1
+    elif candle_dir == "DOWN":
+        primary_votes -= 1
 
-    elif primary_votes < 0:
-        primary_direction = "DOWN"
+    primary_direction = "UP" if primary_votes > 0 else "DOWN" if primary_votes < 0 else None
 
-    else:
-        primary_direction = None
+    if primary_direction and direction != primary_direction:
+        conflict_reasons.append("Trend/structure conflict")
 
-    # ========================================================
-    # TREND ALIGNMENT
-    # ========================================================
+    if trend_direction and structure and trend_direction != structure:
+        conflict_reasons.append("EMA structure disagreement")
 
-    trend_alignment = 0
+    if momentum_direction and trend_direction and momentum_direction != trend_direction and (adx or 0) >= STRONG_ADX:
+        conflict_reasons.append("Strong momentum against trend")
 
+    # Two previous closed candles should not strongly oppose the selected side.
+    last3 = candles[-3:]
     if direction == "UP":
-
-        if structure == "UP":
-            trend_alignment += 1
-
-        if recent_trend == "UP":
-            trend_alignment += 1
-
-        if ema9 is not None and ema21 is not None:
-            if ema9 > ema21:
-                trend_alignment += 1
-
-        if (
-            plus_di is not None
-            and minus_di is not None
-            and plus_di > minus_di
-        ):
-            trend_alignment += 1
-
-    elif direction == "DOWN":
-
-        if structure == "DOWN":
-            trend_alignment += 1
-
-        if recent_trend == "DOWN":
-            trend_alignment += 1
-
-        if ema9 is not None and ema21 is not None:
-            if ema9 < ema21:
-                trend_alignment += 1
-
-        if (
-            plus_di is not None
-            and minus_di is not None
-            and minus_di > plus_di
-        ):
-            trend_alignment += 1
-
-    # ========================================================
-    # PRICE EXTENSION
-    # ========================================================
-
-    price_extended = False
-
-    distance_ema21_atr = None
-    distance_ema50_atr = None
-
-    if (
-        atr14 is not None
-        and atr14 > 0
-        and ema21 is not None
-    ):
-
-        distance_ema21_atr = (
-            abs(last["close"] - ema21)
-            / atr14
-        )
-
-        if (
-            distance_ema21_atr
-            > MAX_EMA21_DISTANCE_ATR
-        ):
-            price_extended = True
-            rejection_reasons.append(
-                "Price too far from EMA21"
-            )
-
-    if (
-        atr14 is not None
-        and atr14 > 0
-        and ema50 is not None
-    ):
-
-        distance_ema50_atr = (
-            abs(last["close"] - ema50)
-            / atr14
-        )
-
-        if (
-            distance_ema50_atr
-            > MAX_EMA50_DISTANCE_ATR
-        ):
-            rejection_reasons.append(
-                "Price extended from EMA50"
-            )
-
-    # ========================================================
-    # ABNORMAL CANDLE
-    # ========================================================
+        same_dir = sum(1 for c in last3 if c["close"] > c["open"])
+        opposite_dir = sum(1 for c in last3 if c["close"] < c["open"])
+    else:
+        same_dir = sum(1 for c in last3 if c["close"] < c["open"])
+        opposite_dir = sum(1 for c in last3 if c["close"] > c["open"])
+    if opposite_dir >= 2 and same_dir <= 1:
+        conflict_reasons.append("Recent candles oppose direction")
 
     abnormal_candle = False
-
     average_range = None
-    range_ratio = None
-
     if len(candles) >= 21:
+        recent_ranges = [c["high"] - c["low"] for c in candles[-21:-1]]
+        average_range = sum(recent_ranges) / len(recent_ranges) if recent_ranges else None
+        current_range = last["high"] - last["low"]
+        if average_range and average_range > 0:
+            ratio = current_range / average_range
+            if ratio > MAX_CANDLE_RANGE_RATIO:
+                abnormal_candle = True
+                conflict_reasons.append("Abnormal candle")
+            elif ratio < MIN_CANDLE_RANGE_RATIO:
+                conflict_reasons.append("Very low volatility")
 
-        recent_ranges = [
-            c["high"] - c["low"]
-            for c in candles[-21:-1]
-        ]
-
-        if recent_ranges:
-
-            average_range = (
-                sum(recent_ranges)
-                / len(recent_ranges)
-            )
-
-            current_range = (
-                last["high"] - last["low"]
-            )
-
-            if average_range > 0:
-
-                range_ratio = (
-                    current_range
-                    / average_range
-                )
-
-                if (
-                    range_ratio
-                    > MAX_CANDLE_RANGE_RATIO
-                ):
-                    abnormal_candle = True
-                    rejection_reasons.append(
-                        "Abnormal candle"
-                    )
-
-                if (
-                    range_ratio
-                    < MIN_CANDLE_RANGE_RATIO
-                ):
-                    rejection_reasons.append(
-                        "Very weak candle"
-                    )
-
-    # ========================================================
-    # RSI EXTREME
-    # ========================================================
-
-    extreme_chase = False
-
-    if rsi14 is not None:
-
-        if (
-            direction == "UP"
-            and rsi14 >= 76
-        ):
-            extreme_chase = True
-            rejection_reasons.append(
-                "RSI overbought chase"
-            )
-
-        elif (
-            direction == "DOWN"
-            and rsi14 <= 24
-        ):
-            extreme_chase = True
-            rejection_reasons.append(
-                "RSI oversold chase"
-            )
-
-    # ========================================================
-    # CONFLICT DETECTION
-    # ========================================================
-
-    conflict_reasons = []
-
-    if (
-        direction is not None
-        and primary_direction is not None
-        and direction != primary_direction
-    ):
-        conflict_reasons.append(
-            "Primary direction conflict"
-        )
-
-    if (
-        direction is not None
-        and structure is not None
-        and structure != direction
-    ):
-        conflict_reasons.append(
-            "Structure conflict"
-        )
-
-    if (
-        direction is not None
-        and recent_trend is not None
-        and recent_trend != direction
-    ):
-        conflict_reasons.append(
-            "Recent candle trend conflict"
-        )
-
-    if (
-        direction == "UP"
-        and adx is not None
-        and adx >= STRONG_ADX
-        and minus_di is not None
-        and plus_di is not None
-        and minus_di > plus_di
-    ):
-        conflict_reasons.append(
-            "Strong bearish DI"
-        )
-
-    if (
-        direction == "DOWN"
-        and adx is not None
-        and adx >= STRONG_ADX
-        and plus_di is not None
-        and minus_di is not None
-        and plus_di > minus_di
-    ):
-        conflict_reasons.append(
-            "Strong bullish DI"
-        )
-
-    # ========================================================
-    # SCORE QUALITY
-    # ========================================================
-
-    score_quality = "WEAK"
-
-    if (
-        max_score >= 17
-        and score_gap >= 5
-    ):
-        score_quality = "VERY_STRONG"
-
-    elif (
-        max_score >= 15
-        and score_gap >= 4
-    ):
-        score_quality = "STRONG"
-
-    elif max_score >= 14:
-        score_quality = "VALID"
-
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    confidence = 70
-
-    confidence += min(
-        10,
-        score_gap * 2,
+    volatility_ok = atr14 is not None and atr14 > 0
+    extreme_chase = (
+        (direction == "UP" and rsi14 is not None and rsi14 >= 76)
+        or (direction == "DOWN" and rsi14 is not None and rsi14 <= 24)
     )
+    if extreme_chase:
+        conflict_reasons.append("RSI extreme chase")
 
-    confidence += min(
-        5,
-        abs(primary_votes),
-    )
+    overextended = extension > 1.35 if atr14 and atr14 > 0 else False
+    if overextended:
+        conflict_reasons.append("Price overextended from EMA9")
 
-    if adx is not None:
-
-        if adx >= 30:
-            confidence += 5
-
-        elif adx >= 26:
-            confidence += 4
-
-        elif adx >= 21:
-            confidence += 2
-
-    if (
-        direction is not None
-        and structure == direction
-    ):
+    # Confidence is calibrated from independent confluence, not score alone.
+    confidence = 64
+    confidence += min(8, score_gap * 2)
+    if trend_direction == direction:
         confidence += 4
-
-    if (
-        direction is not None
-        and recent_trend == direction
-    ):
-        confidence += 3
-
-    if (
-        direction is not None
-        and breakout == direction
-        and not breakout_fake
-    ):
-
-        if breakout_strength == "STRONG":
-            confidence += 4
-
-        elif breakout_strength == "WEAK":
-            confidence += 1
-
-        if breakout_retest:
-            confidence += 4
-
-    if (
-        direction is not None
-        and liquidity == direction
-    ):
+    if structure == direction:
+        confidence += 5
+    if momentum_direction == direction and (adx or 0) >= STRONG_ADX:
+        confidence += 4
+    elif momentum_direction == direction and (adx or 0) >= MIN_ADX:
         confidence += 2
-
-    if trend_alignment >= 4:
-        confidence += 3
-
+    if breakout == direction and not breakout_fake:
+        confidence += 2 if breakout_strength == "STRONG" else 1
+        if breakout_retest:
+            confidence += 3
+    if candle_dir == direction and body_ratio >= 0.60:
+        confidence += 2
+    if osc_up == 2 or osc_down == 2:
+        confidence += 2
     if conflict_reasons:
-        confidence -= 10
-
-    if price_extended:
-        confidence -= 6
-
+        confidence -= min(12, len(conflict_reasons) * 4)
     if extreme_chase:
         confidence -= 6
-
+    if overextended:
+        confidence -= 5
     if abnormal_candle:
-        confidence -= 7
-
-    if breakout_fake:
         confidence -= 8
 
-    confidence = int(
-        clamp(
-            confidence,
-            MIN_CONFIDENCE,
-            MAX_CONFIDENCE,
-        )
-    )
+    confidence = int(clamp(confidence, MIN_CONFIDENCE, MAX_CONFIDENCE))
+
+    # Quality flags used by validation/selection.
+    strong_confluence = sum([
+        trend_direction == direction,
+        structure == direction,
+        momentum_direction == direction and (adx or 0) >= MIN_ADX,
+        breakout == direction and not breakout_fake,
+        candle_dir == direction,
+        (osc_up >= 1 if direction == "UP" else osc_down >= 1),
+    ])
 
     return {
         "direction": direction,
-
         "up_score": up_score,
         "down_score": down_score,
-
         "max_score": max_score,
         "score_gap": score_gap,
-
         "confidence": confidence,
-
-        "score_quality": score_quality,
-
         "primary_direction": primary_direction,
-
-        "primary_votes": primary_votes,
-
-        "trend_alignment": trend_alignment,
-
-        "recent_trend": recent_trend,
-
+        "trend_direction": trend_direction,
+        "momentum_direction": momentum_direction,
+        "strong_confluence": strong_confluence,
         "ema9": ema9,
         "ema21": ema21,
         "ema50": ema50,
-
         "rsi": rsi14,
-
         "adx": adx,
         "plus_di": plus_di,
         "minus_di": minus_di,
-
         "atr": atr14,
-
-        "stoch_k": stoch_k,
-        "stoch_d": stoch_d,
-
-        "cci": cci20,
-        "momentum": mom10,
-
-        "macd": macd_line,
-        "macd_signal": macd_signal,
-
         "williams": williams,
-
         "structure": structure,
-
         "breakout": breakout,
         "breakout_strength": breakout_strength,
         "breakout_retest": breakout_retest,
         "breakout_fake": breakout_fake,
         "breakout_score": breakout_score,
         "breakout_level": breakout_level,
-
         "liquidity": liquidity,
-        "liquidity_strength": liquidity_strength,
-
-        "body_ratio": metrics.get(
-            "body_ratio",
-            0,
-        ),
-
-        "close_position": metrics.get(
-            "close_position",
-            0.5,
-        ),
-
+        "body_ratio": body_ratio,
+        "candle_direction": candle_dir,
         "abnormal_candle": abnormal_candle,
-
-        "price_extended": price_extended,
-
-        "distance_ema21_atr": distance_ema21_atr,
-        "distance_ema50_atr": distance_ema50_atr,
-
+        "volatility_ok": volatility_ok,
         "extreme_chase": extreme_chase,
-
+        "overextended": overextended,
+        "extension_atr": extension,
         "conflict": bool(conflict_reasons),
         "conflict_reasons": conflict_reasons,
-
-        "rejection_reasons": rejection_reasons,
-
         "reasons_up": reasons_up,
         "reasons_down": reasons_down,
-
         "candle_time": last.get("time"),
-
         "price": last["close"],
+        "timeframe": timeframe,
     }
 
 
@@ -1938,7 +1528,7 @@ def is_data_fresh(symbol):
 
 
 # ============================================================
-# VALIDATION
+# SIGNAL VALIDATION
 # ============================================================
 
 
@@ -1947,9 +1537,8 @@ def validate_signal(analysis):
         return False, "no analysis"
 
     direction = analysis.get("direction")
-
     if direction not in ("UP", "DOWN"):
-        return False, "no clear direction"
+        return False, "no direction"
 
     if analysis.get("max_score", 0) < MIN_SCORE:
         return False, "score too low"
@@ -1958,25 +1547,20 @@ def validate_signal(analysis):
         return False, "score gap too small"
 
     if analysis.get("primary_direction") != direction:
-        return False, "primary direction conflict"
-
-    if analysis.get("structure") != direction:
-        return False, "structure conflict"
-
-    if analysis.get("recent_trend") != direction:
-        return False, "recent trend conflict"
-
-    if analysis.get("trend_alignment", 0) < 3:
-        return False, "trend alignment too weak"
-
-    if analysis.get("conflict"):
-        return False, "market conflict"
+        return False, "trend/structure conflict"
 
     if analysis.get("abnormal_candle"):
         return False, "abnormal candle"
 
-    if analysis.get("price_extended"):
-        return False, "price too extended"
+    if analysis.get("overextended"):
+        return False, "price overextended"
+
+    if not analysis.get("volatility_ok"):
+        return False, "volatility unavailable"
+
+    adx = analysis.get("adx")
+    if adx is None or adx < MIN_ADX:
+        return False, "ADX too weak"
 
     if analysis.get("extreme_chase"):
         return False, "extreme RSI chase"
@@ -1984,54 +1568,22 @@ def validate_signal(analysis):
     if analysis.get("breakout_fake"):
         return False, "fake breakout"
 
-    if analysis.get("breakout") == direction:
-
-        if analysis.get("breakout_strength") != "STRONG":
-            return False, "breakout not strong"
-
-        # A strong breakout without retest can still be valid
-        # only if the complete trend is exceptionally strong.
-        if not analysis.get("breakout_retest"):
-
-            adx = analysis.get("adx") or 0
-
-            if (
-                adx < 30
-                or analysis.get("max_score", 0) < 16
-                or analysis.get("score_gap", 0) < 4
-            ):
-                return False, "breakout needs retest"
-
-    adx = analysis.get("adx")
-
-    if adx is None or adx < MIN_ADX:
-        return False, "ADX too weak"
-
-    # Avoid entering when RSI is almost neutral.
-    rsi_value = analysis.get("rsi")
-
-    if rsi_value is not None:
-
-        if (
-            direction == "UP"
-            and rsi_value < 52
-        ):
-            return False, "RSI not bullish"
-
-        if (
-            direction == "DOWN"
-            and rsi_value > 48
-        ):
-            return False, "RSI not bearish"
-
-    # Candle confirmation
-    body_ratio = analysis.get(
-        "body_ratio",
-        0,
+    # Precision gate: either clean structure or a strong confirmed breakout.
+    structure_ok = analysis.get("structure") == direction
+    breakout_ok = (
+        analysis.get("breakout") == direction
+        and analysis.get("breakout_strength") == "STRONG"
+        and analysis.get("breakout_retest")
     )
+    if not structure_ok and not breakout_ok:
+        return False, "no structural confirmation"
 
-    if body_ratio < 0.40:
-        return False, "weak candle body"
+    if analysis.get("strong_confluence", 0) < 4:
+        return False, "insufficient confluence"
+
+    # Never let a marginal 13/20 signal through with a tiny directional edge.
+    if analysis.get("confidence", 0) < MIN_CONFIDENCE:
+        return False, "confidence too low"
 
     return True, "valid"
 
@@ -2041,11 +1593,7 @@ def validate_signal(analysis):
 # ============================================================
 
 
-def fresh_base_setup(
-    symbol,
-    direction,
-    analysis,
-):
+def fresh_base_setup(symbol, direction, analysis):
     key = f"{symbol}:{direction}"
 
     previous = recent_base_setups.get(key)
@@ -2053,16 +1601,17 @@ def fresh_base_setup(
     if not previous:
         return True
 
-    elapsed = (
-        time.time()
-        - previous.get("time", 0)
-    )
+    previous_time = previous.get("time", 0)
+
+    elapsed = time.time() - previous_time
 
     if elapsed >= SETUP_REPEAT_BLOCK_SECONDS:
         return True
 
     previous_price = previous.get("price")
+
     current_price = analysis.get("price")
+
     atr_value = analysis.get("atr")
 
     if (
@@ -2088,9 +1637,7 @@ def fresh_base_setup(
     if (
         previous_rsi is not None
         and current_rsi is not None
-        and abs(
-            current_rsi - previous_rsi
-        ) >= 5
+        and abs(current_rsi - previous_rsi) >= 5
     ):
         return True
 
@@ -2111,31 +1658,27 @@ def evaluate_symbol(symbol):
     if not is_data_fresh(symbol):
         return None
 
-    candles = item.get(
-        "candles",
-        [],
-    )
+    candles = item.get("candles", [])
 
     if len(candles) < REQUIRED_TOTAL_CANDLES:
         return None
 
-    closed = get_closed_candles(
-        candles
-    )
+    closed = get_closed_candles(candles)
 
     if len(closed) < MIN_CANDLES:
         return None
 
+    timeframe = normalize_timeframe(item.get("timeframe"), candles)
+
     analysis = calculate_analysis(
-        closed
+        closed,
+        timeframe,
     )
 
     if not analysis:
         return None
 
-    valid, reason = validate_signal(
-        analysis
-    )
+    valid, reason = validate_signal(analysis)
 
     if not valid:
         return None
@@ -2151,7 +1694,7 @@ def evaluate_symbol(symbol):
 
 
 # ============================================================
-# BEST BASE
+# BEST BASE PAIR
 # ============================================================
 
 
@@ -2159,17 +1702,10 @@ def choose_best_base_pair():
     candidates = []
 
     with data_lock:
-        symbols = list(
-            data_store.keys()
-        )
+        symbols = list(data_store.keys())
 
-    current_symbol = cycle.get(
-        "base_symbol"
-    )
-
-    current_direction = cycle.get(
-        "base_direction"
-    )
+    current_symbol = cycle.get("base_symbol")
+    current_direction = cycle.get("base_direction")
 
     recent_symbols = [
         x.get("symbol")
@@ -2179,9 +1715,7 @@ def choose_best_base_pair():
 
     for symbol in symbols:
 
-        candidate = evaluate_symbol(
-            symbol
-        )
+        candidate = evaluate_symbol(symbol)
 
         if not candidate:
             continue
@@ -2196,110 +1730,62 @@ def choose_best_base_pair():
         ):
             continue
 
-        quality = 0.0
-
-        # Core score
-        quality += (
-            analysis["max_score"]
-            * 12
+        # Quality is driven by confluence, not by a single indicator.
+        quality = (
+            analysis.get("max_score", 0) * 8
+            + analysis.get("score_gap", 0) * 7
         )
 
-        quality += (
-            analysis["score_gap"]
-            * 8
-        )
-
-        # Trend
-        quality += (
-            analysis.get(
-                "trend_alignment",
-                0
-            )
-            * 8
-        )
-
-        # ADX
         adx = analysis.get("adx") or 0
-        quality += adx * 1.2
+        quality += min(20, adx * 0.55)
 
-        # Structure
-        if analysis.get("structure") == direction:
-            quality += 12
-
-        # Recent trend
-        if analysis.get("recent_trend") == direction:
+        if analysis.get("primary_direction") == direction:
             quality += 10
 
-        # Breakout
-        if (
-            analysis.get("breakout")
-            == direction
-            and not analysis.get(
-                "breakout_fake"
-            )
-        ):
+        if analysis.get("trend_direction") == direction:
+            quality += 8
 
-            if (
-                analysis.get(
-                    "breakout_strength"
-                )
-                == "STRONG"
-            ):
-                quality += 15
+        if analysis.get("structure") == direction:
+            quality += 10
 
-            if analysis.get(
-                "breakout_retest"
-            ):
-                quality += 15
+        if analysis.get("strong_confluence", 0) >= 5:
+            quality += 8
+        elif analysis.get("strong_confluence", 0) >= 4:
+            quality += 4
 
-        # Liquidity
-        if (
-            analysis.get("liquidity")
-            == direction
-        ):
-            quality += (
-                analysis.get(
-                    "liquidity_strength",
-                    0
-                )
-                * 5
-            )
+        if analysis.get("breakout") == direction and not analysis.get("breakout_fake"):
+            quality += 5
+            if analysis.get("breakout_strength") == "STRONG":
+                quality += 4
+            if analysis.get("breakout_retest"):
+                quality += 7
 
-        # Candle
-        if analysis.get(
-            "body_ratio",
-            0
-        ) >= 0.55:
-            quality += 6
-
-        # Confidence
-        quality += (
-            analysis.get(
-                "confidence",
-                0
-            )
-            * 0.5
-        )
-
-        # Penalties
-        if current_symbol == symbol:
-            quality -= 20
-
-        if current_direction == direction:
-            quality -= 8
-
-        if symbol in recent_symbols:
-            quality -= 5
-
-        if analysis.get(
-            "price_extended"
-        ):
+        if analysis.get("breakout_fake"):
             quality -= 30
 
-        if analysis.get(
-            "breakout_fake"
-        ):
-            quality -= 50
+        if analysis.get("overextended"):
+            quality -= 25
+
+        if analysis.get("liquidity") == direction:
+            quality += 2
+
+        if analysis.get("body_ratio", 0) >= 0.60:
+            quality += 3
+
+        if current_symbol == symbol:
+            quality -= 15
+
+        if current_direction == direction:
+            quality -= 5
+
+        if symbol in recent_symbols:
+            quality -= 4
+
+        # Prefer stronger confidence
+        quality += (
+            analysis.get("confidence", 0)
+            * 0.25
+        )
 
         candidates.append(
             (
@@ -2320,46 +1806,22 @@ def choose_best_base_pair():
 
 
 # ============================================================
-# BEST RECOVERY
+# BEST RECOVERY PAIR
 # ============================================================
 
 
 def choose_best_recovery_pair():
-    """
-    Recovery is intentionally much stricter.
-
-    Requirements:
-      score >= 17
-      gap >= 4
-      ADX >= 26
-      structure aligned
-      recent trend aligned
-      strong breakout
-      retest
-      no fake breakout
-      no extended price
-    """
-
     candidates = []
 
     with data_lock:
-        symbols = list(
-            data_store.keys()
-        )
+        symbols = list(data_store.keys())
 
-    base_symbol = cycle.get(
-        "base_symbol"
-    )
-
-    base_direction = cycle.get(
-        "base_direction"
-    )
+    base_symbol = cycle.get("base_symbol")
+    base_direction = cycle.get("base_direction")
 
     for symbol in symbols:
 
-        candidate = evaluate_symbol(
-            symbol
-        )
+        candidate = evaluate_symbol(symbol)
 
         if not candidate:
             continue
@@ -2367,107 +1829,55 @@ def choose_best_recovery_pair():
         analysis = candidate["analysis"]
         direction = candidate["direction"]
 
-        score = (
-            analysis.get(
-                "max_score",
-                0
-            )
-            or 0
-        )
-
-        gap = (
-            analysis.get(
-                "score_gap",
-                0
-            )
-            or 0
-        )
-
-        adx = (
-            analysis.get(
-                "adx"
-            )
-        )
-
-        if score < RECOVERY_MIN_SCORE:
-            continue
-
-        if gap < RECOVERY_MIN_GAP:
-            continue
-
-        if adx is None or adx < RECOVERY_MIN_ADX:
-            continue
-
-        if analysis.get(
-            "structure"
-        ) != direction:
-            continue
-
-        if analysis.get(
-            "recent_trend"
-        ) != direction:
-            continue
-
-        if analysis.get(
-            "breakout"
-        ) != direction:
-            continue
-
-        if analysis.get(
-            "breakout_strength"
-        ) != "STRONG":
-            continue
-
-        if not analysis.get(
-            "breakout_retest"
-        ):
-            continue
-
-        if analysis.get(
-            "breakout_fake"
-        ):
-            continue
-
-        if analysis.get(
-            "price_extended"
-        ):
-            continue
-
         quality = (
-            score * 15
+            analysis["max_score"] * 10
+            + analysis["score_gap"] * 5
         )
 
-        quality += (
-            gap * 10
-        )
+        adx = analysis.get("adx") or 0
 
-        quality += (
-            adx * 2
-        )
-
-        quality += 20  # structure
-        quality += 20  # trend
-        quality += 20  # strong breakout
-        quality += 20  # retest
+        quality += adx
 
         if (
-            analysis.get("liquidity")
+            analysis.get("primary_direction")
             == direction
         ):
-            quality += 10
+            quality += 8
 
-        if direction != base_direction:
+        if analysis.get("structure") == direction:
             quality += 5
 
+        if (
+            analysis.get("breakout") == direction
+            and not analysis.get("breakout_fake")
+        ):
+
+            if analysis.get("breakout_strength") == "STRONG":
+                quality += 8
+
+            elif analysis.get("breakout_strength") == "WEAK":
+                quality += 3
+
+            if analysis.get("breakout_retest"):
+                quality += 5
+
+        if analysis.get("breakout_fake"):
+            quality -= 20
+
+        if analysis.get("liquidity") == direction:
+            quality += 2
+
         if symbol == base_symbol:
-            quality -= 5
+            quality -= 18
+
+        if direction == base_direction:
+            quality -= 6
+        else:
+            quality += 4
 
         quality += (
-            analysis.get(
-                "confidence",
-                0
-            )
-            * 0.5
+            analysis.get("confidence", 0)
+            * 0.25
         )
 
         candidates.append(
@@ -2500,13 +1910,8 @@ def add_history(
     analysis,
     result="PENDING",
     entry_time=None,
-    signal_id=None,
 ):
     item = {
-        "id": signal_id or str(
-            uuid.uuid4()
-        ),
-
         "time": now_string(),
 
         "symbol": symbol,
@@ -2533,10 +1938,6 @@ def add_history(
             "max_score"
         ),
 
-        "score_gap": analysis.get(
-            "score_gap"
-        ),
-
         "adx": analysis.get(
             "adx"
         ),
@@ -2547,10 +1948,6 @@ def add_history(
 
         "structure": analysis.get(
             "structure"
-        ),
-
-        "recent_trend": analysis.get(
-            "recent_trend"
         ),
 
         "breakout": analysis.get(
@@ -2569,12 +1966,11 @@ def add_history(
             "breakout_fake"
         ),
 
+        "timeframe": analysis.get("timeframe", TIMEFRAME),
+
         "entry_time": (
             entry_time.isoformat()
-            if isinstance(
-                entry_time,
-                datetime
-            )
+            if isinstance(entry_time, datetime)
             else entry_time
         ),
     }
@@ -2618,9 +2014,8 @@ def build_signal_text(
         "price"
     )
 
-    breakout = (
-        analysis.get("breakout")
-        or "NONE"
+    breakout = analysis.get(
+        "breakout"
     )
 
     breakout_strength = analysis.get(
@@ -2637,10 +2032,6 @@ def build_signal_text(
         "structure"
     )
 
-    recent_trend = analysis.get(
-        "recent_trend"
-    )
-
     adx = analysis.get(
         "adx"
     )
@@ -2649,12 +2040,24 @@ def build_signal_text(
         "rsi"
     )
 
+    timeframe = normalize_timeframe(
+        analysis.get("timeframe", TIMEFRAME)
+    )
+
+    if breakout is None:
+        breakout_text = "NONE"
+    else:
+        breakout_text = breakout
+
     if breakout_strength == "STRONG":
         quality_text = "🔥 STRONG"
+
     elif breakout_strength == "WEAK":
         quality_text = "🟡 WEAK"
+
     elif breakout_strength == "FAKE":
         quality_text = "⚠️ FAKE"
+
     else:
         quality_text = "⚪ NONE"
 
@@ -2664,33 +2067,39 @@ def build_signal_text(
         else "❌ NO"
     )
 
+    atr_value = analysis.get("atr") or 0
+    cancel_buffer = atr_value * 0.35 if atr_value > 0 else 0
+    cancel_price = None
+    if price is not None and cancel_buffer > 0:
+        if direction == "UP":
+            cancel_price = price - cancel_buffer
+        else:
+            cancel_price = price + cancel_buffer
+
     stage_text = (
         "🎯 BASE TRADE"
         if stage == "BASE"
         else "♻️ RECOVERY 1/1"
     )
 
-    cancel_word = (
-        "below"
-        if direction == "UP"
-        else "above"
-    )
-
     return (
         "🎓 ZinoProSignalAI\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {symbol} | {TIMEFRAME}\n\n"
+        f"📊 {symbol} | {analysis.get('timeframe', TIMEFRAME)}\n\n"
         f"{stage_text}\n"
         f"{direction_emoji(direction)} "
         f"**{direction}**\n\n"
         f"🔥 Confidence: **{confidence}%**\n"
         f"🟢 UP Score: **{up_score}/{MAX_SCORE}**\n"
         f"🔴 DOWN Score: **{down_score}/{MAX_SCORE}**\n\n"
-        f"📐 Structure: **{structure or 'NONE'}**\n"
-        f"📈 Recent Trend: **{recent_trend or 'NONE'}**\n"
-        f"🚀 Breakout: **{breakout}**\n"
-        f"💥 Breakout Quality: **{quality_text}**\n"
-        f"🔄 Retest: **{retest_text}**\n\n"
+        f"📐 Structure: "
+        f"**{structure or 'NONE'}**\n"
+        f"🚀 Breakout: "
+        f"**{breakout_text}**\n"
+        f"💥 Breakout Quality: "
+        f"**{quality_text}**\n"
+        f"🔄 Retest: "
+        f"**{retest_text}**\n\n"
         f"📈 ADX: "
         f"**{adx:.1f}**\n"
         if adx is not None
@@ -2703,13 +2112,12 @@ def build_signal_text(
         "📊 RSI: **--**\n"
     ) + (
         "\n"
-        f"💰 Price: **{fmt_price(price)}**\n\n"
-        f"⏱️ Entry after: **2 minutes**\n"
+        f"💰 Price: **{fmt_price(price)}**\n"
+        f"🛑 Cancellation: **{fmt_price(cancel_price)}**\n"
+        f"   {'إلغاء إذا أغلقت شمعة تحت' if direction == 'UP' else 'إلغاء إذا أغلقت شمعة فوق'} **{fmt_price(cancel_price)}**\n\n"
+        f"⏱️ Entry after: **{timeframe_minutes(timeframe)} minute(s)**\n"
         f"🕐 **ENTRY TIME: "
         f"{time_string(entry_time)} 🇩🇿**\n\n"
-        f"🛑 Cancellation: "
-        f"إلغاء إذا أغلقت شمعة "
-        f"{cancel_word} السعر المرجعي\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -2719,7 +2127,9 @@ def build_result_text(
     result,
 ):
     if not signal:
-        return "❌ No pending signal found."
+        return (
+            "❌ No pending signal found."
+        )
 
     symbol = signal.get("symbol")
     direction = signal.get("direction")
@@ -2728,10 +2138,11 @@ def build_result_text(
     if result == "WIN":
 
         if stage == "BASE":
+
             return (
                 "✅ **BASE WIN**\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"📊 {symbol} | {TIMEFRAME}\n"
+                f"📊 {symbol} | {signal.get('analysis', {}).get('timeframe', TIMEFRAME)}\n"
                 f"{direction_emoji(direction)} "
                 f"{direction}\n\n"
                 "🎯 Base signal completed successfully.\n"
@@ -2741,7 +2152,7 @@ def build_result_text(
         return (
             "✅ **RECOVERY WIN**\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"📊 {symbol} | {TIMEFRAME}\n"
+            f"📊 {symbol} | {signal.get('analysis', {}).get('timeframe', TIMEFRAME)}\n"
             f"{direction_emoji(direction)} "
             f"{direction}\n\n"
             "♻️ Recovery compensated the BASE loss.\n"
@@ -2751,10 +2162,11 @@ def build_result_text(
     if result == "LOSS":
 
         if stage == "BASE":
+
             return (
                 "❌ **BASE LOSS**\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"📊 {symbol} | {TIMEFRAME}\n"
+                f"📊 {symbol} | {signal.get('analysis', {}).get('timeframe', TIMEFRAME)}\n"
                 f"{direction_emoji(direction)} "
                 f"{direction}\n\n"
                 "♻️ Recovery **1/1 ALLOWED**\n"
@@ -2764,7 +2176,7 @@ def build_result_text(
         return (
             "❌ **RECOVERY LOSS**\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"📊 {symbol} | {TIMEFRAME}\n"
+            f"📊 {symbol} | {signal.get('analysis', {}).get('timeframe', TIMEFRAME)}\n"
             f"{direction_emoji(direction)} "
             f"{direction}\n\n"
             "⛔ No second martingale.\n"
@@ -2775,13 +2187,11 @@ def build_result_text(
 
 
 # ============================================================
-# TELEGRAM SEND
+# SEND TELEGRAM
 # ============================================================
 
 
-async def send_telegram_message(
-    text_message
-):
+async def send_telegram_message(text_message):
     global telegram_app
 
     if telegram_app is None:
@@ -2808,22 +2218,16 @@ async def send_telegram_message(
         return False
 
 
-def send_telegram_sync(
-    text_message
-):
+def send_telegram_sync(text_message):
     global telegram_loop
 
     if telegram_loop is None:
         return False
 
     try:
-        future = (
-            asyncio.run_coroutine_threadsafe(
-                send_telegram_message(
-                    text_message
-                ),
-                telegram_loop,
-            )
+        future = asyncio.run_coroutine_threadsafe(
+            send_telegram_message(text_message),
+            telegram_loop,
         )
 
         future.result(
@@ -2846,10 +2250,7 @@ def send_telegram_sync(
 # ============================================================
 
 
-def send_one_signal(
-    candidate,
-    stage,
-):
+def send_one_signal(candidate, stage):
     global cycle
 
     if not candidate:
@@ -2895,13 +2296,7 @@ def send_one_signal(
             if not cycle.get("active"):
                 return False
 
-            if (
-                cycle.get(
-                    "recovery_count",
-                    0
-                )
-                >= RECOVERY_LIMIT
-            ):
+            if cycle.get("recovery_count", 0) >= RECOVERY_LIMIT:
                 return False
 
             cycle["stage"] = "RECOVERY"
@@ -2911,23 +2306,18 @@ def send_one_signal(
         else:
             return False
 
-        entry_time = (
-            now_algeria()
-            + timedelta(
-                seconds=ENTRY_DELAY_SECONDS
-            )
+        timeframe = normalize_timeframe(
+            analysis.get("timeframe"),
         )
 
-        signal_id = str(
-            uuid.uuid4()
+        entry_time = calculate_entry_time(
+            timeframe,
+            now_algeria(),
         )
 
-        cycle["base_entry_time"] = (
-            entry_time
-        )
+        cycle["base_entry_time"] = entry_time
 
         cycle["pending_signal"] = {
-            "id": signal_id,
             "symbol": symbol,
             "direction": direction,
             "stage": stage,
@@ -2949,9 +2339,7 @@ def send_one_signal(
     )
 
     if not sent:
-
         with cycle_lock:
-
             cycle["pending_signal"] = None
 
             if stage == "BASE":
@@ -2963,7 +2351,6 @@ def send_one_signal(
     stats["signals"] += 1
 
     if stage == "BASE":
-
         stats["base_signals"] += 1
 
         recent_base_setups[
@@ -2988,24 +2375,16 @@ def send_one_signal(
         analysis,
         "PENDING",
         entry_time,
-        signal_id,
     )
 
     logger.info(
-        "SIGNAL SENT | %s | %s | %s | "
-        "score=%s/%s gap=%s conf=%s "
-        "adx=%s structure=%s breakout=%s retest=%s",
+        "Signal sent | %s | %s | %s | score=%s/%s confidence=%s",
         stage,
         symbol,
         direction,
         analysis.get("max_score"),
         MAX_SCORE,
-        analysis.get("score_gap"),
         analysis.get("confidence"),
-        analysis.get("adx"),
-        analysis.get("structure"),
-        analysis.get("breakout"),
-        analysis.get("breakout_retest"),
     )
 
     return True
@@ -3017,18 +2396,22 @@ def send_one_signal(
 
 
 def mark_history_result(
-    signal_id,
+    symbol,
+    direction,
+    stage,
     result,
 ):
     for item in reversed(history):
 
         if (
-            item.get("id") == signal_id
-            and item.get("result")
-            == "PENDING"
+            item.get("symbol") == symbol
+            and item.get("direction") == direction
+            and item.get("stage") == stage
+            and item.get("result") == "PENDING"
         ):
 
             item["result"] = result
+
             return True
 
     return False
@@ -3046,11 +2429,14 @@ def handle_win():
         if not pending:
             return False, "NO_PENDING"
 
-        signal_id = pending.get("id")
+        symbol = pending["symbol"]
+        direction = pending["direction"]
         stage = pending["stage"]
 
         mark_history_result(
-            signal_id,
+            symbol,
+            direction,
+            stage,
             "WIN",
         )
 
@@ -3058,10 +2444,12 @@ def handle_win():
 
         if stage == "BASE":
             stats["base_wins"] += 1
+
         else:
             stats["recovery_wins"] += 1
 
         cycle["last_result"] = "WIN"
+
         cycle["pending_signal"] = None
 
         cycle["active"] = False
@@ -3088,11 +2476,14 @@ def handle_loss():
         if not pending:
             return False, "NO_PENDING"
 
-        signal_id = pending.get("id")
+        symbol = pending["symbol"]
+        direction = pending["direction"]
         stage = pending["stage"]
 
         mark_history_result(
-            signal_id,
+            symbol,
+            direction,
+            stage,
             "LOSS",
         )
 
@@ -3100,25 +2491,22 @@ def handle_loss():
 
         if stage == "BASE":
             stats["base_losses"] += 1
+
         else:
             stats["recovery_losses"] += 1
 
         cycle["last_result"] = "LOSS"
+
         cycle["pending_signal"] = None
 
         if stage == "BASE":
 
             if (
-                cycle.get(
-                    "recovery_count",
-                    0
-                )
+                cycle.get("recovery_count", 0)
                 < RECOVERY_LIMIT
             ):
 
-                cycle["stage"] = (
-                    "WAIT_RECOVERY"
-                )
+                cycle["stage"] = "WAIT_RECOVERY"
 
                 cycle["recovery_ready_at"] = (
                     time.time()
@@ -3127,6 +2515,7 @@ def handle_loss():
 
                 return True, "BASE_LOSS"
 
+        # Recovery loss or recovery unavailable
         cycle["active"] = False
         cycle["stage"] = "IDLE"
 
@@ -3141,7 +2530,7 @@ def handle_loss():
 
 
 # ============================================================
-# SIGNAL WORKER
+# AUTO SIGNAL WORKER
 # ============================================================
 
 
@@ -3168,7 +2557,6 @@ def signal_worker():
             last_attempt = current
 
             with cycle_lock:
-
                 current_stage = cycle.get(
                     "stage"
                 )
@@ -3186,14 +2574,12 @@ def signal_worker():
                 )
 
             # ------------------------------------------------
-            # RECOVERY
+            # WAITING RECOVERY
             # ------------------------------------------------
 
             if (
-                current_stage
-                == "WAIT_RECOVERY"
-                and recovery_ready_at
-                is not None
+                current_stage == "WAIT_RECOVERY"
+                and recovery_ready_at is not None
             ):
 
                 if current >= recovery_ready_at:
@@ -3212,50 +2598,15 @@ def signal_worker():
                         if sent:
                             continue
 
-                    with cycle_lock:
-
-                        cycle["active"] = False
-                        cycle["stage"] = "IDLE"
-                        cycle["last_result"] = (
-                            "RECOVERY_SKIPPED"
-                        )
-
-                        cycle["base_symbol"] = None
-                        cycle["base_direction"] = None
-                        cycle["base_price"] = None
-
-                        cycle["recovery_count"] = 0
-                        cycle["recovery_ready_at"] = None
-
-                    stats["recovery_skips"] += 1
-
-                    send_telegram_sync(
-                        "🛑 **RECOVERY SKIPPED**\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        "❌ BASE خسرت.\n"
-                        "🔎 تم فحص الـ setups المتاحة.\n\n"
-                        "⚠️ لم يتم الدخول لأن Recovery "
-                        "لم يحقق الشروط الصارمة.\n\n"
-                        "• Score ≥ 17/20\n"
-                        "• Gap ≥ 4\n"
-                        "• ADX ≥ 26\n"
-                        "• Structure مطابق\n"
-                        "• Recent Trend مطابق\n"
-                        "• Breakout STRONG\n"
-                        "• Retest YES\n"
-                        "• Fake Breakout = NO\n"
-                        "• Price extension = NO\n\n"
-                        "⛔ لا توجد مضاعفة.\n"
-                        "🔎 دورة جديدة BASE."
-                    )
-
+                    time.sleep(2)
                     continue
 
             # ------------------------------------------------
-            # ACTIVE
+            # ACTIVE SIGNAL
             # ------------------------------------------------
 
             if active and pending:
+
                 time.sleep(2)
                 continue
 
@@ -3296,9 +2647,7 @@ def signal_worker():
 # ============================================================
 
 
-class RequestHandler(
-    BaseHTTPRequestHandler
-):
+class RequestHandler(BaseHTTPRequestHandler):
 
     def log_message(
         self,
@@ -3427,7 +2776,9 @@ class RequestHandler(
 
         self.send_json(
             404,
-            {"error": "not found"},
+            {
+                "error": "not found"
+            },
         )
 
     def do_POST(self):
@@ -3441,14 +2792,22 @@ class RequestHandler(
         if path not in (
             "/mt4",
             "/api/mt4",
+            "/mt5",
+            "/api/mt5",
         ):
 
             self.send_json(
                 404,
-                {"error": "not found"},
+                {
+                    "error": "not found"
+                },
             )
 
             return
+
+        # ----------------------------------------------------
+        # API KEY
+        # ----------------------------------------------------
 
         header_key = (
             self.headers.get(
@@ -3515,10 +2874,16 @@ class RequestHandler(
 
                 self.send_json(
                     401,
-                    {"error": "unauthorized"},
+                    {
+                        "error": "unauthorized"
+                    },
                 )
 
                 return
+
+        # ----------------------------------------------------
+        # SYMBOL
+        # ----------------------------------------------------
 
         symbol = (
             payload.get("symbol")
@@ -3531,7 +2896,9 @@ class RequestHandler(
 
             self.send_json(
                 400,
-                {"error": "symbol missing"},
+                {
+                    "error": "symbol missing"
+                },
             )
 
             return
@@ -3539,6 +2906,10 @@ class RequestHandler(
         symbol = str(
             symbol
         ).strip().upper()
+
+        # ----------------------------------------------------
+        # CANDLES
+        # ----------------------------------------------------
 
         raw_candles = (
             payload.get("candles")
@@ -3565,13 +2936,28 @@ class RequestHandler(
 
             return
 
+        # ----------------------------------------------------
+        # STORE
+        # ----------------------------------------------------
+
+        payload_timeframe = (
+            payload.get("timeframe")
+            or payload.get("Timeframe")
+            or payload.get("tf")
+            or payload.get("TF")
+        )
+        detected_timeframe = normalize_timeframe(
+            payload_timeframe,
+            candles,
+        )
+
         with data_lock:
 
             data_store[symbol] = {
                 "candles": candles,
                 "received_at": time.time(),
                 "updated": now_string(),
-                "timeframe": TIMEFRAME,
+                "timeframe": detected_timeframe,
             }
 
         batch_id = (
@@ -3580,8 +2966,9 @@ class RequestHandler(
         )
 
         logger.info(
-            "MT4 data accepted | %s | candles=%s",
+            "MT data accepted | %s | %s | candles=%s",
             symbol,
+            detected_timeframe,
             len(candles),
         )
 
@@ -3591,6 +2978,7 @@ class RequestHandler(
                 "status": "accepted",
                 "symbol": symbol,
                 "candles": len(candles),
+                "timeframe": detected_timeframe,
                 "batch_id": batch_id,
                 "batch_complete": True,
             },
@@ -3603,7 +2991,6 @@ class RequestHandler(
 
 
 def start_http_server():
-
     server = ThreadingHTTPServer(
         (
             "0.0.0.0",
@@ -3649,11 +3036,10 @@ async def start_command(
         "🎓 ZinoProSignalAI\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "✅ Bot is online.\n\n"
-        "📡 MT4 data feed: active\n"
-        "📊 Timeframe: M1\n"
+        "📡 MT4/MT5 data feed: active\n"
+        "📊 Timeframe: M1 / M2 / M3\n"
         "🎯 Automatic signals: ON\n"
-        "♻️ Recovery: 1/1\n"
-        "🛡️ Accuracy filters: ON\n\n"
+        "♻️ Recovery: 1/1\n\n"
         "Commands:\n"
         "/stats\n"
         "/history\n"
@@ -3707,16 +3093,23 @@ async def stats_command(
         f"✅ Wins: **{wins}**\n"
         f"❌ Losses: **{losses}**\n"
         f"🎯 Winrate: **{winrate:.1f}%**\n\n"
-        f"🟢 BASE Signals: **{stats['base_signals']}**\n"
-        f"🟢 BASE Wins: **{stats['base_wins']}**\n"
-        f"🔴 BASE Losses: **{stats['base_losses']}**\n\n"
-        f"♻️ Recovery Signals: **{stats['recovery_signals']}**\n"
-        f"♻️ Recovery Wins: **{stats['recovery_wins']}**\n"
-        f"♻️ Recovery Losses: **{stats['recovery_losses']}**\n"
-        f"🛑 Recovery Skips: **{stats['recovery_skips']}**\n\n"
-        f"⚙️ Cycle: **{stage}**\n"
+        f"🟢 BASE Signals: "
+        f"**{stats['base_signals']}**\n"
+        f"🟢 BASE Wins: "
+        f"**{stats['base_wins']}**\n"
+        f"🔴 BASE Losses: "
+        f"**{stats['base_losses']}**\n\n"
+        f"♻️ Recovery Signals: "
+        f"**{stats['recovery_signals']}**\n"
+        f"♻️ Recovery Wins: "
+        f"**{stats['recovery_wins']}**\n"
+        f"♻️ Recovery Losses: "
+        f"**{stats['recovery_losses']}**\n\n"
+        f"⚙️ Cycle: "
+        f"**{stage}**\n"
         f"Active: **{active}**\n"
-        f"Recovery count: **{recovery_count}/1**"
+        f"Recovery count: "
+        f"**{recovery_count}/1**"
     )
 
     await update.message.reply_text(
@@ -3785,14 +3178,8 @@ async def history_command(
             f"| {result}\n"
             f"   Score "
             f"{item.get('score')}/{MAX_SCORE} "
-            f"| Gap "
-            f"{item.get('score_gap')}\n"
-            f"   Conf "
+            f"| Conf "
             f"{item.get('confidence')}%\n"
-            f"   Structure: "
-            f"{item.get('structure') or 'NONE'} "
-            f"| Trend: "
-            f"{item.get('recent_trend') or 'NONE'}\n"
             f"   Breakout: "
             f"{breakout or 'NONE'} "
             f"{strength} "
@@ -3862,6 +3249,7 @@ async def breakoutstats_command(
 
         if result == "WIN":
             categories[category]["wins"] += 1
+
         else:
             categories[category]["losses"] += 1
 
@@ -3889,6 +3277,11 @@ async def breakoutstats_command(
             f"🔴 Losses: {losses}\n"
             f"🎯 Winrate: {rate:.1f}%"
         )
+
+    lines.append(
+        "\n📌 كلما زاد عدد الإشارات، "
+        "الإحصائية تولي أكثر فائدة."
+    )
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -3934,15 +3327,17 @@ async def mt4status_command(
                 symbol
             )
 
-            age_text = (
-                "--"
-                if age is None
-                else f"{age:.0f}s"
-            )
+            if age is None:
+                age_text = "--"
+            else:
+                age_text = (
+                    f"{age:.0f}s"
+                )
 
             lines.append(
                 f"📊 {symbol} "
                 f"| candles={candles} "
+                f"| TF={item.get('timeframe', TIMEFRAME)} "
                 f"| age={age_text}"
             )
 
@@ -3996,7 +3391,8 @@ async def analyze_command(
     )
 
     analysis = calculate_analysis(
-        candles
+        candles,
+        normalize_timeframe(item.get("timeframe"), item.get("candles", [])),
     )
 
     if not analysis:
@@ -4045,16 +3441,16 @@ async def analyze_command(
     text_message = (
         "🔬 **ANALYSIS**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {symbol} | {TIMEFRAME}\n\n"
+        f"📊 {symbol} | {analysis.get('timeframe', TIMEFRAME)}\n\n"
         f"🎯 Direction: **{direction}**\n"
-        f"🟢 UP: **{analysis['up_score']}/{MAX_SCORE}**\n"
-        f"🔴 DOWN: **{analysis['down_score']}/{MAX_SCORE}**\n"
-        f"📏 Gap: **{analysis['score_gap']}**\n"
-        f"🔥 Confidence: **{analysis['confidence']}%**\n\n"
-        f"📐 Structure: **{analysis.get('structure') or 'NONE'}**\n"
-        f"📈 Recent Trend: **{analysis.get('recent_trend') or 'NONE'}**\n"
-        f"🎯 Primary: **{analysis.get('primary_direction') or 'NONE'}**\n"
-        f"🧭 Alignment: **{analysis.get('trend_alignment', 0)}/4**\n"
+        f"🟢 UP: "
+        f"**{analysis['up_score']}/{MAX_SCORE}**\n"
+        f"🔴 DOWN: "
+        f"**{analysis['down_score']}/{MAX_SCORE}**\n"
+        f"🔥 Confidence: "
+        f"**{analysis['confidence']}%**\n\n"
+        f"📐 Structure: "
+        f"**{analysis.get('structure') or 'NONE'}**\n"
         f"🚀 Breakout: **{breakout}**\n"
         f"💥 Quality: **{strength}**\n"
         f"🔄 Retest: **{retest}**\n"
@@ -4066,16 +3462,11 @@ async def analyze_command(
         "📈 ADX: **--**\n"
     ) + (
         f"📊 RSI: "
-        f"**{analysis.get('rsi'):.1f}**\n"
-        if analysis.get('rsi') is not None
+        f"**{analysis.get('rsi'):.1f}**\n\n"
+        if analysis.get("rsi") is not None
         else
-        "📊 RSI: **--**\n"
+        "📊 RSI: **--**\n\n"
     ) + (
-        f"💰 Price: **{fmt_price(analysis.get('price'))}**\n\n"
-        f"🔎 Extended: "
-        f"**{analysis.get('price_extended')}**\n"
-        f"⚠️ Conflict: "
-        f"**{analysis.get('conflict')}**\n\n"
         f"✅ Validation: **{valid}**\n"
         f"Reason: `{reason}`"
     )
@@ -4095,6 +3486,7 @@ async def win_command(
         return
 
     with cycle_lock:
+
         pending = cycle.get(
             "pending_signal"
         )
@@ -4106,6 +3498,8 @@ async def win_command(
         )
 
         return
+
+    stage = pending["stage"]
 
     success, result = handle_win()
 
@@ -4137,6 +3531,7 @@ async def loss_command(
         return
 
     with cycle_lock:
+
         pending = cycle.get(
             "pending_signal"
         )
@@ -4212,7 +3607,6 @@ async def reset_command(
             "recovery_signals": 0,
             "recovery_wins": 0,
             "recovery_losses": 0,
-            "recovery_skips": 0,
         }
     )
 
@@ -4253,15 +3647,13 @@ async def error_handler(
 
 
 async def run_telegram():
-
     global telegram_app
     global telegram_loop
 
-    telegram_loop = (
-        asyncio.get_running_loop()
-    )
+    telegram_loop = asyncio.get_running_loop()
 
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN is missing"
         )
@@ -4364,10 +3756,13 @@ async def run_telegram():
     )
 
     while not shutdown_event.is_set():
+
         await asyncio.sleep(1)
 
     await telegram_app.updater.stop()
+
     await telegram_app.stop()
+
     await telegram_app.shutdown()
 
 
@@ -4383,7 +3778,7 @@ def main():
     )
 
     logger.info(
-        "ZinoProSignalAI Accuracy Edition starting..."
+        "ZinoProSignalAI starting..."
     )
 
     logger.info(
@@ -4398,13 +3793,7 @@ def main():
     )
 
     logger.info(
-        "MIN_SCORE_GAP=%s",
-        MIN_SCORE_GAP,
-    )
-
-    logger.info(
-        "ENTRY_DELAY=%ss",
-        ENTRY_DELAY_SECONDS,
+        "ENTRY_DELAY=M1:60s M2:120s M3:180s",
     )
 
     logger.info(
@@ -4413,22 +3802,25 @@ def main():
     )
 
     if not BOT_TOKEN:
+
         logger.error(
             "BOT_TOKEN is missing"
         )
 
     if not OWNER_ID:
+
         logger.warning(
             "OWNER_ID is missing or 0"
         )
 
     if not MT4_API_KEY:
+
         logger.warning(
             "MT4_API_KEY is missing"
         )
 
     # --------------------------------------------------------
-    # HTTP
+    # HTTP SERVER
     # --------------------------------------------------------
 
     http_thread = threading.Thread(
@@ -4485,4 +3877,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
