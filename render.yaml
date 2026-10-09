@@ -1,7 +1,9 @@
+
 services:
   - type: web
-    name: zinoprosignalai-mt4
-    env: python
+    name: zinoprosignalai
+    runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -9,7 +11,9 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
-      - key: ZINO_API_KEY
+      - key: MT4_API_KEY
         sync: false
-      - key: PORT
-        value: 10000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
